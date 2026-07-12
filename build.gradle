@@ -1,0 +1,98 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        maven {
+            name = "forge"
+            url = "https://maven.minecraftforge.net/"
+        }
+        maven {
+            name = "sonatype"
+            url = "https://oss.sonatype.org/content/repositories/snapshots/"
+        }
+        maven {
+            name = "sponge"
+            url = "https://repo.spongepowered.org/maven/"
+        }
+    }
+    dependencies {
+        classpath "net.minecraftforge.gradle:ForgeGradle:2.1-SNAPSHOT"
+        classpath "org.spongepowered:mixingradle:0.6-SNAPSHOT"
+    }
+}
+
+apply plugin: "java"
+apply plugin: "net.minecraftforge.gradle.forge"
+apply plugin: "org.spongepowered.mixin"
+
+version = "1.1.1"
+group = "com.razorclient"
+archivesBaseName = "RazorClient"
+
+sourceCompatibility = targetCompatibility = "1.8"
+
+minecraft {
+    version = "1.8.9-11.15.1.2318-1.8.9"
+    runDir = "run"
+    mappings = "stable_22"
+    makeObfSourceJar = false
+    clientRunArgs += ["--tweakClass", "org.spongepowered.asm.launch.MixinTweaker", "--mixin", "mixins.razorclient.json"]
+    serverRunArgs += ["--tweakClass", "org.spongepowered.asm.launch.MixinTweaker", "--mixin", "mixins.razorclient.json"]
+}
+
+repositories {
+    maven {
+        name = "sponge"
+        url = "https://repo.spongepowered.org/maven/"
+    }
+}
+
+configurations {
+    shade
+    compile.extendsFrom(shade)
+}
+
+dependencies {
+    shade("org.spongepowered:mixin:0.7.11-SNAPSHOT") {
+        exclude module: "launchwrapper"
+        exclude module: "guava"
+        exclude module: "gson"
+        exclude module: "commons-io"
+        exclude module: "log4j-core"
+    }
+}
+
+processResources {
+    inputs.property "version", project.version
+    inputs.property "mcversion", project.minecraft.version
+
+    from(sourceSets.main.resources.srcDirs) {
+        include "mcmod.info"
+        expand "version": project.version, "mcversion": project.minecraft.version
+    }
+
+    from(sourceSets.main.resources.srcDirs) {
+        exclude "mcmod.info"
+    }
+}
+
+sourceSets {
+    main {
+        ext.refMap = "mixins.razorclient.refmap.json"
+    }
+}
+
+jar {
+    from(configurations.shade.collect { it.isDirectory() ? it : zipTree(it) }) {
+        exclude "META-INF/*.RSA", "META-INF/*.SF", "META-INF/MANIFEST.MF"
+        exclude "META-INF/maven/**", "LICENSE.txt"
+    }
+
+    manifest.attributes(
+        "FMLCorePlugin": "com.razorclient.mixin.MixinLoader",
+        "ForceLoadAsMod": true,
+        "FMLCorePluginContainsFMLMod": true,
+        "TweakClass": "org.spongepowered.asm.launch.MixinTweaker",
+        "TweakOrder": 0,
+        "MixinConfigs": "mixins.razorclient.json"
+    )
+}

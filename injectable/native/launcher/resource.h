@@ -1,0 +1,2 @@
+#define IDR_BOOTSTRAP 101
+#define IDR_AGENT 102

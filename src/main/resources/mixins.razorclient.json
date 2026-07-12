@@ -1,0 +1,20 @@
+{
+  "required": true,
+  "minVersion": "0.7",
+  "package": "com.razorclient.mixin",
+  "refmap": "mixins.razorclient.refmap.json",
+  "compatibilityLevel": "JAVA_8",
+  "client": [
+    "accessor.NetworkManagerInvoker",
+    "MixinEntity",
+    "MixinEntityLivingBase",
+    "MixinNetworkManager",
+    "MixinMinecraft",
+    "MixinEntityRenderer",
+    "MixinEntityPlayerSP",
+    "MixinMovementInputFromOptions"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "adapterVersion": 1,
+  "minecraftVersion": "1.8.9",
+  "configHash": "72c13d03",
+  "fileHash": "a1efafdf",
+  "javaMajor": 17,
+  "architecture": "x64",
+  "artifacts": {
+    "bake.zip": "0F013D8D1160D32DFA1A92C8DB05C3A3AC460C7F295C482CC4238B2DC202019B",
+    "lunar-platform-mappings-v1_8.jar": "D72270ADBD6386CC6F18C96C4EA2FC1382F315139EDDB80C74B295E5644946C8",
+    "OptiFine_v1_8.jar": "D57B7FD7BD519BBE4FDBF36CCEEBFB64D459B7713E1AFB0BF6549C21B476A028",
+    "legacy-0.1.0-SNAPSHOT-all-nomappings.jar": "F9CAE03D9ABB722130E0D143591F7E98700E3569C6EE5AC17BCC7B6B5829BD82",
+    "jvm.dll": "0C6EEE8D311939A4AA2A5F622E3D27346627D9FF930EF621065CF4C2B4BAC9E3"
+  },
+  "classes": [
+    "net/minecraft/client/Minecraft",
+    "net/minecraft/client/entity/EntityPlayerSP",
+    "net/minecraft/client/renderer/EntityRenderer",
+    "net/minecraft/client/gui/GuiIngame",
+    "net/minecraft/network/NetworkManager",
+    "net/minecraft/util/MovementInputFromOptions",
+    "net/minecraft/entity/Entity",
+    "net/minecraft/entity/EntityLivingBase"
+  ]
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "modid": "razorclient",
+    "name": "\u00AE\uFE0FazorClient",
+    "description": "\u00AE\uFE0FazorClient Minecraft utility client",
+    "version": "${version}",
+    "mcversion": "${mcversion}",
+    "url": "",
+    "updateUrl": "",
+    "authorList": [""],
+    "credits": "",
+    "logoFile": "",
+    "screenshots": [],
+    "dependencies": []
+  }
+]
