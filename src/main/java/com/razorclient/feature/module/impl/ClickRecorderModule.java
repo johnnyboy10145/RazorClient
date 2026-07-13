@@ -41,6 +41,21 @@ public final class ClickRecorderModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        lastClickAt = 0L;
+    }
+
+    @Override
+    public void onInputContextLost() {
+        lastClickAt = 0L;
+    }
+
+    @Override
+    public String getHudInfo() {
+        return ClickPatternStore.size() + " clicks";
+    }
+
+    @Override
     public void onMouseEvent(MouseEvent event) {
         Minecraft minecraft = Minecraft.getMinecraft();
         if (minecraft.thePlayer == null || minecraft.currentScreen != null) {

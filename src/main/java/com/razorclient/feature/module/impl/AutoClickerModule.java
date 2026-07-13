@@ -5,11 +5,12 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import com.razorclient.RazorClient;
+import com.razorclient.combat.CombatActionCoordinator;
+import com.razorclient.util.MouseButtonHelper;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.nio.ByteBuffer;
-import java.util.List;
 import java.util.Random;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiScreen;
@@ -18,9 +19,6 @@ import net.minecraft.client.gui.inventory.GuiInventory;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.util.ChatComponentText;
 import net.minecraft.util.MovingObjectPosition;
-import net.minecraftforge.client.event.MouseEvent;
-import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.fml.common.ObfuscationReflectionHelper;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 import net.minecraftforge.fml.relauncher.ReflectionHelper;
 import org.lwjgl.input.Keyboard;
@@ -38,6 +36,11 @@ public final class AutoClickerModule extends Module {
     private final NumberSetting minCps = new NumberSetting("Min CPS", 1, 25, 1, 17);
     private final NumberSetting maxCps = new NumberSetting("Max CPS", 1, 25, 1, 22);
     private final NumberSetting jitterStrength = new NumberSetting("Jitter", 0, 10, 1, 0);
+    private final EnumSetting<ClickPattern> clickPattern = new EnumSetting<ClickPattern>("Click Pattern", ClickPattern.values(), ClickPattern.NORMAL);
+    private final BooleanSetting randomizeSpeed = new BooleanSetting("Randomization", true);
+    private final BooleanSetting simulateFatigue = new BooleanSetting("Simulated Fatigue", false);
+    private final BooleanSetting notUsingItem = new BooleanSetting("Not Using Item", false);
+    private final NumberSetting inventoryCps = new NumberSetting("Inventory CPS", 1, 20, 1, 10);
 
     private long lastClick;
     private long holdUntil;
@@ -71,6 +74,11 @@ public final class AutoClickerModule extends Module {
         addSetting(minCps);
         addSetting(maxCps);
         addSetting(jitterStrength);
+        addSetting(clickPattern);
+        addSetting(randomizeSpeed);
+        addSetting(simulateFatigue);
+        addSetting(notUsingItem);
+        addSetting(inventoryCps);
     }
 
     @Override
@@ -84,9 +92,20 @@ public final class AutoClickerModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        resetClickState();
+    }
+
+    @Override
+    public void onInputContextLost() {
+        resetClickState();
+    }
+
+    @Override
     public void onRenderTick(TickEvent.RenderTickEvent event) {
         Minecraft minecraft = Minecraft.getMinecraft();
         if (minecraft.thePlayer == null || minecraft.theWorld == null) {
+            resetClickState();
             return;
         }
 
@@ -113,6 +132,14 @@ public final class AutoClickerModule extends Module {
             resetPhysicalState();
             return;
         }
+        if (notUsingItem.isEnabled() && minecraft.thePlayer.isUsingItem()) {
+            resetPhysicalState();
+            return;
+        }
+        if (isKillAuraAttacking()) {
+            resetPhysicalState();
+            return;
+        }
 
         if (breakBlock(minecraft)) {
             return;
@@ -129,24 +156,30 @@ public final class AutoClickerModule extends Module {
     }
 
     private void normalClick() {
-        long delay = computeDelayMillis();
-        long holdLength = Math.max(1L, delay / 2L);
-        long now = System.currentTimeMillis();
+        long delay = computeDelayNanos();
+        long holdLength = Math.max(1000000L, delay / (clickPattern.getValue() == ClickPattern.BUTTERFLY ? 4L : 2L));
+        long now = System.nanoTime();
+
+        if (leftDown) {
+            if (now >= holdUntil) {
+                sendClick(false);
+                leftDown = false;
+            }
+            return;
+        }
 
         if (now - lastClick >= delay) {
+            if (!CombatActionCoordinator.tryAcquire("LeftClicker")) return;
             lastClick = now;
             holdUntil = now + holdLength;
             sendClick(true);
             leftDown = true;
-        } else if (leftDown && now >= holdUntil) {
-            sendClick(false);
-            leftDown = false;
         }
     }
 
     private void recordClick() {
-        List<Integer> delays = ClickPatternStore.getDelays();
-        if (delays.isEmpty()) {
+        int delayCount = ClickPatternStore.size();
+        if (delayCount == 0) {
             if (!recordNoticeShown) {
                 sendChat("No recorded pattern. Use ClickRecorder in CLIENT first.");
                 recordNoticeShown = true;
@@ -154,7 +187,7 @@ public final class AutoClickerModule extends Module {
             return;
         }
 
-        long now = System.currentTimeMillis();
+        long now = System.nanoTime();
         if (recordNextClickTime < 0L) {
             recordNextClickTime = now;
         }
@@ -163,15 +196,16 @@ public final class AutoClickerModule extends Module {
             return;
         }
 
+        if (!CombatActionCoordinator.tryAcquire("LeftClicker")) return;
         sendClick(true);
         sendClick(false);
 
         recordIndex++;
-        if (recordIndex >= delays.size()) {
+        if (recordIndex >= delayCount) {
             recordIndex = 0;
         }
 
-        recordNextClickTime = now + Math.max(0, delays.get(recordIndex).intValue());
+        recordNextClickTime = now + (Math.max(0, ClickPatternStore.getDelay(recordIndex)) * 1000000L);
         recordNoticeShown = false;
     }
 
@@ -212,8 +246,8 @@ public final class AutoClickerModule extends Module {
             return;
         }
 
-        long now = System.currentTimeMillis();
-        long delay = computeDelayMillis();
+        long now = System.nanoTime();
+        long delay = Math.max(1L, 1000000000L / Math.max(1, inventoryCps.getValue()));
         if (now - lastClick < delay) {
             return;
         }
@@ -223,6 +257,9 @@ public final class AutoClickerModule extends Module {
     }
 
     private void inInventoryClick(GuiScreen guiScreen, Minecraft minecraft) {
+        if (guiClickMethod == null || minecraft.displayWidth <= 0 || minecraft.displayHeight <= 0) {
+            return;
+        }
         int mouseX = Mouse.getX() * guiScreen.width / minecraft.displayWidth;
         int mouseY = guiScreen.height - Mouse.getY() * guiScreen.height / minecraft.displayHeight - 1;
 
@@ -253,7 +290,7 @@ public final class AutoClickerModule extends Module {
         return name != null && (name.contains("sword") || name.contains("axe"));
     }
 
-    private long computeDelayMillis() {
+    private long computeDelayNanos() {
         int min = minCps.getValue();
         int max = Math.max(min, maxCps.getValue());
         double cps = min + (random.nextDouble() * (max - min + 1));
@@ -261,30 +298,31 @@ public final class AutoClickerModule extends Module {
             burstTicks = 3 + random.nextInt(9);
         }
         burstTicks--;
-        cps += Math.sin(System.nanoTime() / 65000000.0D) * 0.95D;
-        cps += random.nextGaussian() * 0.55D;
-        cps += burstTicks % 4 == 0 ? -0.85D : 0.35D;
-        if (random.nextDouble() < 0.08D) {
-            cps -= 0.6D + (random.nextDouble() * 0.9D);
+        if (randomizeSpeed.isEnabled()) {
+            cps += random.nextGaussian() * 0.55D;
+            cps += clickPattern.getValue() == ClickPattern.JITTER ? 0.35D : 0.0D;
         }
-        if (random.nextDouble() < 0.05D) {
-            cps += 0.4D + (random.nextDouble() * 0.8D);
+        if (simulateFatigue.isEnabled() && random.nextDouble() < 0.06D) {
+            cps -= 0.8D + random.nextDouble();
         }
         cps = Math.max(1.0D, cps);
-        return Math.max(1L, Math.round(1000.0D / cps));
+        long delay = Math.max(1000000L, Math.round(1000000000.0D / cps));
+        return clickPattern.getValue() == ClickPattern.BUTTERFLY ? Math.max(10000000L, delay / 2L) : delay;
+    }
+
+    private boolean isKillAuraAttacking() {
+        RazorClient client = RazorClient.getInstance();
+        KillAuraModule aura = client == null ? null : client.getModuleManager().getModule(KillAuraModule.class);
+        return aura != null && aura.isActivelyAttacking();
+    }
+
+    @Override
+    public String getHudInfo() {
+        return clickPattern.getValue().getDisplayName() + " " + minCps.getValue() + "-" + maxCps.getValue() + " CPS";
     }
 
     private void setMouseButtonState(int mouseButton, boolean held) {
-        MouseEvent event = new MouseEvent();
-        ObfuscationReflectionHelper.setPrivateValue(MouseEvent.class, event, Integer.valueOf(mouseButton), "button");
-        ObfuscationReflectionHelper.setPrivateValue(MouseEvent.class, event, Boolean.valueOf(held), "buttonstate");
-        MinecraftForge.EVENT_BUS.post(event);
-
-        ByteBuffer buttons = ObfuscationReflectionHelper.getPrivateValue(Mouse.class, null, "buttons");
-        if (buttons != null && buttons.capacity() > mouseButton) {
-            buttons.put(mouseButton, (byte) (held ? 1 : 0));
-            ObfuscationReflectionHelper.setPrivateValue(Mouse.class, null, buttons, "buttons");
-        }
+        MouseButtonHelper.setButton(mouseButton, held);
     }
 
     private void removeClickDelay(Minecraft minecraft) {
@@ -361,5 +399,12 @@ public final class AutoClickerModule extends Module {
     private enum Mode {
         NORMAL,
         RECORD
+    }
+
+    private enum ClickPattern {
+        NORMAL("Normal"), JITTER("Jitter"), BUTTERFLY("Butterfly");
+        private final String displayName;
+        ClickPattern(String displayName) { this.displayName = displayName; }
+        public String getDisplayName() { return displayName; }
     }
 }

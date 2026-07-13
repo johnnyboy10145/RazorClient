@@ -76,6 +76,11 @@ public final class BedPlatesModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        resetCache();
+    }
+
+    @Override
     public void onClientTick() {
         Minecraft mc = Minecraft.getMinecraft();
         EntityPlayerSP player = mc.thePlayer;
@@ -111,6 +116,11 @@ public final class BedPlatesModule extends Module {
         }
 
         processQueuedRescans(world);
+    }
+
+    @Override
+    public String getHudInfo() {
+        return bedCache.size() + " beds";
     }
 
     @Override

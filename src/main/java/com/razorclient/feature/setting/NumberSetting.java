@@ -6,7 +6,7 @@ public final class NumberSetting extends Setting {
     private final int min;
     private final int max;
     private final int step;
-    private int value;
+    private volatile int value;
 
     public NumberSetting(String name, int min, int max, int step, int value) {
         super(name);

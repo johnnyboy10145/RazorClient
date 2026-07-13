@@ -27,6 +27,8 @@ public final class PacketDelayManager {
     private final ModuleManager moduleManager;
     private final Queue<QueuedOutboundPacket> outboundQueue = new ArrayDeque<QueuedOutboundPacket>();
     private final Queue<QueuedInboundPacket> inboundQueue = new ArrayDeque<QueuedInboundPacket>();
+    /** Packets detached from the active delay queue and awaiting client-thread delivery. */
+    private final Queue<QueuedInboundPacket> pendingInboundReleases = new ArrayDeque<QueuedInboundPacket>();
     private final Set<Packet<?>> outboundFastTrack = Collections.newSetFromMap(
         Collections.synchronizedMap(new IdentityHashMap<Packet<?>, Boolean>())
     );
@@ -34,8 +36,10 @@ public final class PacketDelayManager {
     private long lastInboundReleaseAt;
     private String outboundQueueOwner = "None";
     private String inboundQueueOwner = "None";
-    private volatile boolean inboundOverflowFlushRequested;
+    private volatile boolean inboundReleaseRequested;
     private long lastReleaseFailureAt;
+    private long lastOverflowLogAt;
+    private String lastFlushReason = "None";
 
     public PacketDelayManager(ModuleManager moduleManager) {
         this.moduleManager = moduleManager;
@@ -47,12 +51,18 @@ public final class PacketDelayManager {
     }
 
     public void flushAll() {
+        lastFlushReason = "Manual";
         flushQueuedInboundPackets();
         flushQueuedOutboundPackets();
     }
 
     public String getArbitrationStatus() {
         return "Out: " + outboundQueueOwner + " | In: " + inboundQueueOwner;
+    }
+
+    public String getQueueStatus() {
+        return "Out " + outboundQueueSize() + " (" + outboundQueueOwner + ") | In "
+            + inboundQueueSize() + " (" + inboundQueueOwner + ") | Flush " + lastFlushReason;
     }
 
     public int getApproximateQueuedDelay() {
@@ -68,26 +78,32 @@ public final class PacketDelayManager {
                 latest = Math.max(latest, packet.releaseAt);
             }
         }
-        return (int) Math.max(0L, latest - now);
+        long remaining = Math.max(0L, latest - now);
+        return remaining >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) remaining;
     }
 
     public void onClientTick() {
         NetHandlerPlayClient netHandler = minecraft.getNetHandler();
         if (netHandler == null) {
+            lastFlushReason = "Disconnect";
             clearQueues();
             return;
         }
 
-        if (moduleManager.consumeOutboundFlushRequest() || moduleManager.consumeFlushRequest()) {
+        boolean flushAllRequested = moduleManager.consumeFlushRequest();
+        if (flushAllRequested || moduleManager.consumeOutboundFlushRequest()) {
+            lastFlushReason = "Module request";
             flushQueuedOutboundPackets();
         }
 
-        if (moduleManager.consumeInboundFlushRequest()) {
+        if (flushAllRequested || moduleManager.consumeInboundFlushRequest()) {
+            lastFlushReason = "Module request";
             flushQueuedInboundPackets();
         }
-        if (inboundOverflowFlushRequested) {
-            inboundOverflowFlushRequested = false;
-            flushQueuedInboundPackets();
+        if (inboundReleaseRequested) {
+            inboundReleaseRequested = false;
+            lastFlushReason = "Owner change/overflow";
+            flushPendingInboundPackets();
         }
 
         flushReadyInboundPackets();
@@ -105,22 +121,27 @@ public final class PacketDelayManager {
         moduleManager.onOutboundPacket(packet);
         PacketDelaySelection selection = moduleManager.selectOutboundPacketDelay(packet);
         int delay = selection.getDelay();
-        if (delay <= 0) {
+        if (delay <= 0 && !selection.isIndefinite()) {
             if (hasQueuedOutboundPackets()) {
+                lastFlushReason = "Delay ended";
                 flushQueuedOutboundPackets();
             }
             return false;
         }
 
         if (hasQueuedOutboundPackets() && !selection.getOwnerName().equals(outboundQueueOwner)) {
+            lastFlushReason = "Owner changed";
             flushQueuedOutboundPackets();
         }
         if (outboundQueueSize() >= MAX_QUEUE_SIZE) {
+            lastFlushReason = "Outbound overflow";
             flushQueuedOutboundPackets();
+            logOverflow("outbound", selection.getOwnerName());
+            if (selection.getOwner() != null) selection.getOwner().onPacketDelayOverflow(true);
         }
         synchronized (outboundQueue) {
             long now = monotonicMillis();
-            long releaseAt = Math.max(now + delay, lastOutboundReleaseAt);
+            long releaseAt = selection.isIndefinite() ? Long.MAX_VALUE : Math.max(now + delay, lastOutboundReleaseAt);
             lastOutboundReleaseAt = releaseAt;
             outboundQueue.add(new QueuedOutboundPacket(packet, listeners, releaseAt));
             outboundQueueOwner = selection.getOwnerName();
@@ -137,17 +158,19 @@ public final class PacketDelayManager {
 
         PacketDelaySelection selection = moduleManager.selectInboundPacketDelay(packet);
         int delay = selection.getDelay();
-        if (delay <= 0) {
+        if (delay <= 0 && !selection.isIndefinite()) {
             if (moduleManager.shouldCancelInboundPacket(packet)) {
                 return true;
             }
             if (hasQueuedInboundPackets()) {
-                flushQueuedInboundPackets();
+                lastFlushReason = "Delay ended";
+                queueInboundForImmediateRelease(packet, listener);
+                return true;
             }
             return false;
         }
 
-        queueInbound(packet, listener, delay, selection.getOwnerName());
+        queueInbound(packet, listener, delay, selection);
         return true;
     }
 
@@ -167,18 +190,12 @@ public final class PacketDelayManager {
     }
 
     private void flushQueuedInboundPackets() {
-        List<QueuedInboundPacket> packets = new ArrayList<QueuedInboundPacket>();
         synchronized (inboundQueue) {
-            while (!inboundQueue.isEmpty()) {
-                packets.add(inboundQueue.poll());
-            }
+            stageActiveInboundQueue();
             lastInboundReleaseAt = 0L;
             inboundQueueOwner = "None";
         }
-
-        for (QueuedInboundPacket packet : packets) {
-            releaseInbound(packet);
-        }
+        flushPendingInboundPackets();
     }
 
     private void flushReadyOutboundPackets() {
@@ -202,6 +219,7 @@ public final class PacketDelayManager {
     }
 
     private void flushReadyInboundPackets() {
+        flushPendingInboundPackets();
         long now = monotonicMillis();
         List<QueuedInboundPacket> packets = new ArrayList<QueuedInboundPacket>();
         synchronized (inboundQueue) {
@@ -277,12 +295,13 @@ public final class PacketDelayManager {
         }
         synchronized (inboundQueue) {
             inboundQueue.clear();
+            pendingInboundReleases.clear();
         }
         lastOutboundReleaseAt = 0L;
         lastInboundReleaseAt = 0L;
         outboundQueueOwner = "None";
         inboundQueueOwner = "None";
-        inboundOverflowFlushRequested = false;
+        inboundReleaseRequested = false;
         outboundFastTrack.clear();
     }
 
@@ -294,7 +313,7 @@ public final class PacketDelayManager {
 
     private boolean hasQueuedInboundPackets() {
         synchronized (inboundQueue) {
-            return !inboundQueue.isEmpty();
+            return !inboundQueue.isEmpty() || !pendingInboundReleases.isEmpty();
         }
     }
 
@@ -304,23 +323,34 @@ public final class PacketDelayManager {
         }
     }
 
+    private int inboundQueueSize() {
+        synchronized (inboundQueue) {
+            return inboundQueue.size() + pendingInboundReleases.size();
+        }
+    }
+
     private void queueInbound(
         Packet<?> packet,
         INetHandler listener,
         int delay,
-        String owner
+        PacketDelaySelection selection
     ) {
+        String owner = selection.getOwnerName();
         Runnable action = createInboundAction(packet, listener);
         synchronized (inboundQueue) {
             if (!inboundQueue.isEmpty() && !owner.equals(inboundQueueOwner)) {
-                inboundOverflowFlushRequested = true;
+                stageActiveInboundQueue();
+                inboundReleaseRequested = true;
             }
             if (inboundQueue.size() >= MAX_QUEUE_SIZE) {
                 // Packet processing belongs to the client thread. Request an ordered flush there.
-                inboundOverflowFlushRequested = true;
+                stageActiveInboundQueue();
+                inboundReleaseRequested = true;
+                logOverflow("inbound", owner);
+                if (selection.getOwner() != null) selection.getOwner().onPacketDelayOverflow(false);
             }
             long now = monotonicMillis();
-            long releaseAt = Math.max(now + delay, lastInboundReleaseAt);
+            long releaseAt = selection.isIndefinite() ? Long.MAX_VALUE : Math.max(now + delay, lastInboundReleaseAt);
             lastInboundReleaseAt = releaseAt;
             inboundQueue.add(new QueuedInboundPacket(packet, action, releaseAt));
             if (inboundQueue.size() == 1) {
@@ -328,6 +358,39 @@ public final class PacketDelayManager {
             }
         }
         moduleManager.onInboundPacketQueued(packet);
+    }
+
+    private void queueInboundForImmediateRelease(Packet<?> packet, INetHandler listener) {
+        QueuedInboundPacket queued = new QueuedInboundPacket(packet, createInboundAction(packet, listener), monotonicMillis());
+        synchronized (inboundQueue) {
+            stageActiveInboundQueue();
+            pendingInboundReleases.add(queued);
+            lastInboundReleaseAt = 0L;
+            inboundQueueOwner = "None";
+            inboundReleaseRequested = true;
+        }
+        moduleManager.onInboundPacketQueued(packet);
+    }
+
+    /** Caller must hold the inboundQueue monitor. */
+    private void stageActiveInboundQueue() {
+        while (!inboundQueue.isEmpty()) {
+            pendingInboundReleases.add(inboundQueue.poll());
+        }
+        lastInboundReleaseAt = 0L;
+        inboundQueueOwner = "None";
+    }
+
+    private void flushPendingInboundPackets() {
+        List<QueuedInboundPacket> packets = new ArrayList<QueuedInboundPacket>();
+        synchronized (inboundQueue) {
+            while (!pendingInboundReleases.isEmpty()) {
+                packets.add(pendingInboundReleases.poll());
+            }
+        }
+        for (QueuedInboundPacket packet : packets) {
+            releaseInbound(packet);
+        }
     }
 
     private static long monotonicMillis() {
@@ -341,6 +404,13 @@ public final class PacketDelayManager {
         }
         lastReleaseFailureAt = now;
         AgentLog.error("Unable to release delayed " + direction + " packet", failure);
+    }
+
+    private void logOverflow(String direction, String owner) {
+        long now = monotonicMillis();
+        if (now - lastOverflowLogAt < 5_000L) return;
+        lastOverflowLogAt = now;
+        AgentLog.info("Ordered " + direction + " queue overflow flush; owner=" + owner);
     }
 
     private static final class QueuedOutboundPacket {

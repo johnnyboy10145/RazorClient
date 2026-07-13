@@ -1,5 +1,7 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.combat.CombatTargetService;
+import com.razorclient.combat.CombatActionCoordinator;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.DecimalSetting;
@@ -58,14 +60,28 @@ public final class ReachModule extends Module {
             return;
         }
 
-        double distance = minecraft.thePlayer.getDistanceToEntity(target);
+        EntityLivingBase living = (EntityLivingBase) target;
+        if (!CombatTargetService.isValid(minecraft, living, true, true, false, false, false, configuredReach)
+                || isBlocked(minecraft, living)) {
+            return;
+        }
+
+        double distance = CombatTargetService.distanceToHitbox(minecraft, living);
         if (distance <= VANILLA_REACH || distance > configuredReach) {
             return;
         }
 
+        if (!CombatActionCoordinator.tryAcquire("Reach")) return;
         minecraft.playerController.attackEntity(minecraft.thePlayer, target);
         minecraft.thePlayer.swingItem();
         event.setCanceled(true);
+    }
+
+    private boolean isBlocked(Minecraft minecraft, EntityLivingBase target) {
+        Vec3 eyes = minecraft.thePlayer.getPositionEyes(1.0F);
+        Vec3 targetPoint = new Vec3(target.posX, target.posY + (target.height * 0.5D), target.posZ);
+        MovingObjectPosition hit = minecraft.theWorld.rayTraceBlocks(eyes, targetPoint, false, false, true);
+        return hit != null && hit.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK;
     }
 
     private Entity rayTraceEntity(Minecraft minecraft, double reachDistance) {
@@ -116,5 +132,10 @@ public final class ReachModule extends Module {
         }
 
         return pointedEntity;
+    }
+
+    @Override
+    public String getHudInfo() {
+        return String.format(java.util.Locale.ROOT, "%.1f", reach.getValue());
     }
 }

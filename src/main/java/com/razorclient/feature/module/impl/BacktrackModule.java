@@ -21,9 +21,10 @@ public final class BacktrackModule extends Module {
     private final BooleanSetting disableOnHit = new BooleanSetting("Disable On Hit", true);
     private final BooleanSetting holdingWeapon = new BooleanSetting("Holding Weapon", false);
 
-    private int targetEntityId = -1;
-    private long lastDeactivatedAt;
-    private boolean inboundFlushRequested;
+    private volatile int targetEntityId = -1;
+    private volatile long lastDeactivatedAt;
+    private volatile boolean inboundFlushRequested;
+    private volatile int targetHurtTimeMs;
 
     public BacktrackModule() {
         super("Backtrack", "Delays target position packets while they are near the edge of range.", Category.LAG_MODULES, Keyboard.KEY_NONE);
@@ -50,6 +51,13 @@ public final class BacktrackModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        inboundFlushRequested = true;
+        targetEntityId = -1;
+        lastDeactivatedAt = LagModuleSupport.now();
+    }
+
+    @Override
     public void onClientTick() {
         Minecraft minecraft = Minecraft.getMinecraft();
         if (!LagModuleSupport.activeInGame(minecraft)) {
@@ -66,7 +74,10 @@ public final class BacktrackModule extends Module {
         }
 
         EntityPlayer target = LagModuleSupport.crosshairTarget(minecraft, targetDistance.getValue(), 180.0F);
+        int previousTargetId = targetEntityId;
         targetEntityId = target == null ? -1 : target.getEntityId();
+        targetHurtTimeMs = target == null ? 0 : Math.max(0, target.hurtResistantTime) * 50;
+        if (previousTargetId != -1 && previousTargetId != targetEntityId) inboundFlushRequested = true;
     }
 
     @Override
@@ -134,12 +145,6 @@ public final class BacktrackModule extends Module {
             return false;
         }
 
-        Entity entity = minecraft.theWorld.getEntityByID(targetEntityId);
-        if (!(entity instanceof EntityPlayer)) {
-            return false;
-        }
-        EntityPlayer target = (EntityPlayer) entity;
-        int hurtTimeMs = Math.max(0, target.hurtResistantTime) * 50;
-        return hurtTimeMs <= maximumHurtTime.getValue();
+        return targetHurtTimeMs <= maximumHurtTime.getValue();
     }
 }

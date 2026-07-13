@@ -19,7 +19,8 @@ public final class SprintModule extends Module {
         }
 
         Minecraft minecraft = Minecraft.getMinecraft();
-        if (minecraft.thePlayer == null || minecraft.theWorld == null) {
+        if (minecraft.thePlayer == null || minecraft.theWorld == null || minecraft.currentScreen != null || !minecraft.inGameHasFocus) {
+            onDisable();
             return;
         }
 
@@ -32,5 +33,20 @@ public final class SprintModule extends Module {
         if (minecraft.gameSettings != null) {
             KeyBinding.setKeyBindState(minecraft.gameSettings.keyBindSprint.getKeyCode(), false);
         }
+    }
+
+    @Override
+    public void onSessionReset() {
+        onDisable();
+    }
+
+    @Override
+    public void onInputContextLost() {
+        onDisable();
+    }
+
+    @Override
+    public String getHudInfo() {
+        return "Auto";
     }
 }

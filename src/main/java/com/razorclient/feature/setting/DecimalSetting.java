@@ -8,7 +8,7 @@ public final class DecimalSetting extends Setting {
     private final double min;
     private final double max;
     private final double step;
-    private double value;
+    private volatile double value;
 
     public DecimalSetting(String name, double min, double max, double step, double value) {
         super(name);

@@ -81,7 +81,7 @@ $jniWin = Join-Path $jniInclude 'win32'
     -I $jniInclude -I $jniWin `
     -o (Join-Path $dist 'razorclient-bootstrap.dll') `
     (Join-Path $root 'native\bootstrap\bootstrap.cpp') `
-    -ladvapi32 -luser32
+    -ladvapi32 -luser32 -lgdi32
 if ($LASTEXITCODE) { throw 'Bootstrap DLL build failed.' }
 
 $rcTemplate = Get-Content -LiteralPath (Join-Path $root 'native\launcher\resources.rc.in') -Raw

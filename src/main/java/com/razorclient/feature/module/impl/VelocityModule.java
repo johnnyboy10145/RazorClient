@@ -42,11 +42,11 @@ public final class VelocityModule extends Module {
 
     private final Map<Packet<?>, VelocityDecision> decisions = new IdentityHashMap<Packet<?>, VelocityDecision>();
     private final Random random = new Random();
-    private String status = "Ready";
-    private long statusUntil;
-    private long clientTick;
-    private long lastAttackTick = Long.MIN_VALUE;
-    private boolean doubleAttackThisTick;
+    private volatile String status = "Ready";
+    private volatile long statusUntil;
+    private volatile long clientTick;
+    private volatile long lastAttackTick = Long.MIN_VALUE;
+    private volatile boolean doubleAttackThisTick;
 
     public VelocityModule() {
         super("Velocity", "Adjusts or cancels local knockback response.", Category.LAG_MODULES, Keyboard.KEY_NONE);
@@ -72,11 +72,16 @@ public final class VelocityModule extends Module {
 
     @Override
     protected void onDisable() {
-        decisions.clear();
+        synchronized (decisions) { decisions.clear(); }
         status = "Ready";
         statusUntil = 0L;
         lastAttackTick = Long.MIN_VALUE;
         doubleAttackThisTick = false;
+    }
+
+    @Override
+    public void onSessionReset() {
+        resetRuntimeState();
     }
 
     @Override
@@ -91,8 +96,8 @@ public final class VelocityModule extends Module {
             doubleAttackThisTick = false;
         }
 
-        if (!decisions.isEmpty()) {
-            cleanupExpiredDecisions(LagModuleSupport.now());
+        synchronized (decisions) {
+            if (!decisions.isEmpty()) cleanupExpiredDecisions(LagModuleSupport.now());
         }
 
         if (statusUntil > 0L && LagModuleSupport.now() > statusUntil) {
@@ -121,9 +126,7 @@ public final class VelocityModule extends Module {
         if (kind == PacketKind.NONE) {
             return;
         }
-        if (decisions.containsKey(packet)) {
-            return;
-        }
+        synchronized (decisions) { if (decisions.containsKey(packet)) return; }
 
         if (!conditionsPass(minecraft) || !roll(chance.getValue())) {
             setStatus("Skipped", 900L);
@@ -147,18 +150,20 @@ public final class VelocityModule extends Module {
 
     @Override
     public int getInboundPacketDelay(Packet<?> packet) {
-        VelocityDecision decision = decisions.get(packet);
+        VelocityDecision decision;
+        synchronized (decisions) { decision = decisions.get(packet); }
         return decision == null ? 0 : decision.delayMs;
     }
 
     @Override
     public int getInboundPacketDelayPriority(Packet<?> packet) {
-        return decisions.containsKey(packet) ? 100 : 0;
+        synchronized (decisions) { return decisions.containsKey(packet) ? 100 : 0; }
     }
 
     @Override
     public void onInboundPacketReleased(Packet<?> packet) {
-        VelocityDecision decision = decisions.get(packet);
+        VelocityDecision decision;
+        synchronized (decisions) { decision = decisions.get(packet); }
         if (decision == null) {
             return;
         }
@@ -166,13 +171,14 @@ public final class VelocityModule extends Module {
             return;
         }
 
-        decisions.remove(packet);
+        synchronized (decisions) { decisions.remove(packet); }
         applyDecision(packet, decision);
     }
 
     @Override
     public boolean shouldCancelInboundPacket(Packet<?> packet) {
-        VelocityDecision decision = decisions.remove(packet);
+        VelocityDecision decision;
+        synchronized (decisions) { decision = decisions.remove(packet); }
         if (decision == null || !decision.cancel) {
             return false;
         }
@@ -356,13 +362,11 @@ public final class VelocityModule extends Module {
 
     private void cacheDecision(Packet<?> packet, VelocityDecision decision) {
         long now = LagModuleSupport.now();
-        if (decisions.size() >= MAX_CACHED_DECISIONS) {
-            cleanupExpiredDecisions(now);
+        synchronized (decisions) {
+            if (decisions.size() >= MAX_CACHED_DECISIONS) cleanupExpiredDecisions(now);
+            if (decisions.size() >= MAX_CACHED_DECISIONS) decisions.clear();
+            decisions.put(packet, decision);
         }
-        if (decisions.size() >= MAX_CACHED_DECISIONS) {
-            decisions.clear();
-        }
-        decisions.put(packet, decision);
     }
 
     private void cleanupExpiredDecisions(long now) {
@@ -376,7 +380,7 @@ public final class VelocityModule extends Module {
     }
 
     private void resetRuntimeState() {
-        decisions.clear();
+        synchronized (decisions) { decisions.clear(); }
         status = "Ready";
         statusUntil = 0L;
         lastAttackTick = Long.MIN_VALUE;

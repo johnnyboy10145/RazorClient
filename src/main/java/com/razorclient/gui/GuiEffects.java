@@ -34,8 +34,8 @@ public final class GuiEffects {
             return;
         }
 
-        long now = System.currentTimeMillis();
-        float wave = GuiTheme.pulse(now, 3200L);
+        long nowMillis = System.nanoTime() / 1000000L;
+        float wave = GuiTheme.pulse(nowMillis, 3200L);
         int sweepWidth = Math.max(4, width / 10);
         int center = x + Math.round((width + sweepWidth * 2) * wave) - sweepWidth;
         int alpha = Math.max(4, Math.min(32, Math.round(intensity * hover * 0.32F)));
@@ -53,8 +53,9 @@ public final class GuiEffects {
         int light = GuiTheme.lightAccent();
         int dark = GuiTheme.darkAccent();
         int alpha = Math.max(0, Math.min(30, baseAlpha));
-        Gui.drawRect(x, y, x + width, y + height, 0xF2050805);
-        Gui.drawRect(x + 1, y + 1, x + width - 1, y + Math.max(y + 2, y + height / 5), GuiTheme.withAlpha(light, alpha / 4));
+        Gui.drawRect(x, y, x + width, y + height, GuiTheme.withAlpha(GuiTheme.pageBackground(), 242));
+        int highlightBottom = Math.min(y + height - 1, y + Math.max(2, height / 5));
+        Gui.drawRect(x + 1, y + 1, x + width - 1, highlightBottom, GuiTheme.withAlpha(light, alpha / 4));
         Gui.drawRect(x + 1, y + height - Math.max(2, height / 6), x + width - 1, y + height - 1, GuiTheme.withAlpha(dark, alpha / 2));
         Gui.drawRect(x + 2, y + 1, x + 3, y + height - 1, GuiTheme.withAlpha(accent, alpha));
     }

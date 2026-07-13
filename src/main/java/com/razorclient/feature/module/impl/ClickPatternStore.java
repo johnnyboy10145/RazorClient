@@ -26,6 +26,10 @@ public final class ClickPatternStore {
         return delays.size();
     }
 
+    public static int getDelay(int index) {
+        return delays.get(index).intValue();
+    }
+
     public static List<Integer> getDelays() {
         return Collections.unmodifiableList(new ArrayList<Integer>(delays));
     }

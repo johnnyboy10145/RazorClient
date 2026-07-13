@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include "resource.h"
 
 namespace {
@@ -359,6 +360,54 @@ bool isKnownAdapter(const std::string& adapterVersion) {
     return false;
 }
 
+bool knownMappingsAdapter(const std::string& mappingsHash, std::string& adapterVersion) {
+    for (const auto& build : SUPPORTED_LUNAR_BUILDS) {
+        if (mappingsHash == build.mappingsHash) {
+            adapterVersion = build.adapterVersion;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool fileContainsMarkers(const std::filesystem::path& path, const std::vector<std::string>& markers) {
+    if (markers.empty()) return true;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    size_t longest = 0;
+    for (const auto& marker : markers) longest = std::max(longest, marker.size());
+    std::string carry;
+    std::vector<char> buffer(1024 * 1024);
+    std::vector<bool> found(markers.size(), false);
+    size_t foundCount = 0;
+    while (input && foundCount < markers.size()) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        std::streamsize count = input.gcount();
+        if (count <= 0) break;
+        std::string chunk = carry + std::string(buffer.data(), static_cast<size_t>(count));
+        for (size_t index = 0; index < markers.size(); ++index) {
+            if (!found[index] && chunk.find(markers[index]) != std::string::npos) {
+                found[index] = true;
+                ++foundCount;
+            }
+        }
+        size_t keep = longest > 0 ? longest - 1 : 0;
+        carry = chunk.size() > keep ? chunk.substr(chunk.size() - keep) : chunk;
+    }
+    return foundCount == markers.size();
+}
+
+bool genericLunar189Compatible(const LunarBuildDetection& detection, std::string& adapterVersion) {
+    if (detection.bakePath.empty() || !knownMappingsAdapter(detection.mappingsHash, adapterVersion)) return false;
+    std::error_code ec;
+    auto size = std::filesystem::file_size(detection.bakePath, ec);
+    if (ec || size < 10ULL * 1024ULL * 1024ULL || size > 250ULL * 1024ULL * 1024ULL) return false;
+    return fileContainsMarkers(detection.bakePath, {
+        "net.minecraft.client.Minecraft",
+        "com.lunarclient.apollo.network.ApolloNetworkManager"
+    });
+}
+
 bool remoteManifestApproves(const std::string& bakeHash, const std::string& mappingsHash, std::string& name, std::string& adapterVersion) {
     if (bakeHash.empty() || mappingsHash.empty()) {
         remoteCompatStatus = "missing local fingerprint";
@@ -426,6 +475,13 @@ std::vector<std::filesystem::path> findBakeCandidates(const std::filesystem::pat
             candidates.push_back(entry.path());
         }
     }
+    std::sort(candidates.begin(), candidates.end(), [](const std::filesystem::path& left, const std::filesystem::path& right) {
+        std::error_code leftError, rightError;
+        auto leftTime = std::filesystem::last_write_time(left, leftError);
+        auto rightTime = std::filesystem::last_write_time(right, rightError);
+        if (leftError || rightError) return left.wstring() < right.wstring();
+        return leftTime > rightTime;
+    });
     return candidates;
 }
 
@@ -439,21 +495,19 @@ LunarBuildDetection detectLunarBuild() {
     std::stringstream detail;
     detail << "mappings=" << detection.mappingsHash << " mappingsPath=" << narrow(detection.mappingsPath.wstring());
 
-    for (const auto& bakePath : bakeCandidates) {
+    if (!bakeCandidates.empty()) {
+        const auto& bakePath = bakeCandidates.front();
         std::string bakeHash = sha256(bakePath);
         detail << " bakeCandidate=" << bakeHash << " path=" << narrow(bakePath.wstring());
+        detail << " ignoredOlderBakeCandidates=" << (bakeCandidates.size() - 1);
+        detection.bakeHash = bakeHash;
+        detection.bakePath = bakePath;
         for (const auto& build : SUPPORTED_LUNAR_BUILDS) {
             if (bakeHash == build.bakeHash && detection.mappingsHash == build.mappingsHash) {
-                detection.bakeHash = bakeHash;
-                detection.bakePath = bakePath;
                 detection.supported = &build;
                 fingerprintDetail = detail.str() + " supportedBuild=" + build.name + " adapter=" + build.adapterVersion;
                 return detection;
             }
-        }
-        if (detection.bakeHash.empty()) {
-            detection.bakeHash = bakeHash;
-            detection.bakePath = bakePath;
         }
     }
 
@@ -469,6 +523,14 @@ LunarBuildDetection detectLunarBuild() {
             fingerprintDetail = detail.str() + " remoteSupportedBuild=" + remoteName + " adapter=" + remoteAdapter;
             return detection;
         }
+    }
+    std::string genericAdapter;
+    if (genericLunar189Compatible(detection, genericAdapter)) {
+        detection.remoteName = "Lunar 1.8.9 generic-compatible";
+        detection.remoteAdapterVersion = genericAdapter;
+        remoteCompatStatus += "; generic structural match";
+        fingerprintDetail = detail.str() + " genericSupportedBuild=" + detection.remoteName + " adapter=" + genericAdapter;
+        return detection;
     }
     fingerprintDetail = detail.str();
     return detection;
@@ -567,8 +629,9 @@ bool inject(DWORD pid, const std::filesystem::path& dll) {
     bool ok = remote && WriteProcessMemory(process, remote, path.c_str(), bytes, nullptr);
     if (!ok) lastInjectError = GetLastError();
     HANDLE thread = ok ? CreateRemoteThread(process, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW")), remote, 0, nullptr) : nullptr;
+    DWORD wait = WAIT_FAILED;
     if (thread) {
-        DWORD wait = WaitForSingleObject(thread, 15000);
+        wait = WaitForSingleObject(thread, 15000);
         DWORD code = 0;
         GetExitCodeThread(thread, &code);
         ok = wait == WAIT_OBJECT_0 && code != 0;
@@ -578,7 +641,8 @@ bool inject(DWORD pid, const std::filesystem::path& dll) {
         lastInjectError = GetLastError();
         ok = false;
     }
-    if (remote) VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+    // A timed-out LoadLibraryW thread may still be reading this path.
+    if (remote && wait != WAIT_TIMEOUT) VirtualFreeEx(process, remote, 0, MEM_RELEASE);
     CloseHandle(process);
     return ok;
 }

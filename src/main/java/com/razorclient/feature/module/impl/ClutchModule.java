@@ -28,6 +28,7 @@ import net.minecraft.util.MovingObjectPosition;
 import org.lwjgl.input.Keyboard;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.common.eventhandler.EventPriority;
+import net.minecraftforge.fml.common.eventhandler.Event;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 
@@ -104,6 +105,13 @@ public final class ClutchModule extends Module {
     private BlockPos lastPlacementTarget;
     private EnumFacing lastPlacementFace;
     private int lastHeldBlockSlot = -1;
+    private boolean modelRotationActive;
+    private boolean modelPitchSwapActive;
+    private float savedRenderPitch;
+    private float savedPrevRenderPitch;
+    private float previousSilentPitch;
+    private float lastSilentPitch;
+    private java.lang.reflect.Field renderPlayerField;
 
     private ClutchModule() {
         super("Clutch", "Bridges blocks back to safety when knocked off an edge", Category.PLAYER, Keyboard.KEY_NONE);
@@ -168,10 +176,26 @@ public final class ClutchModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        restoreSavedSlot(mc.thePlayer);
+        resetState();
+        clearRotationState();
+    }
+
+    @Override
+    public void onInputContextLost() {
+        restoreSavedSlot(mc.thePlayer);
+        resetState();
+        clearRotationState();
+    }
+
+    @Override
     public void onClientTick(TickEvent.ClientTickEvent event) {
         if (event.phase != TickEvent.Phase.START) {
             return;
         }
+        // Recover immediately if a renderer abort skipped the matching Post event.
+        restoreRenderPitchSwap();
 
         if (!isPlayerReady()) {
             resetState();
@@ -255,6 +279,7 @@ public final class ClutchModule extends Module {
         float[] aim = faceAim(player, placement.neighbor, placement.face);
         setRotationTarget(aim[0], aim[1]);
         stepRotation(resolveAimSpeed());
+        updateSilentModelRotation(player);
         applyVisibleRotation();
 
         if (!hasReachedTarget(2.0F)) {
@@ -295,8 +320,46 @@ public final class ClutchModule extends Module {
             return;
         }
 
-        event.yaw = Float.valueOf(currentYaw);
-        event.pitch = Float.valueOf(currentPitch);
+        ClientRotationHelper helper = ClientRotationHelper.get();
+        if (helper.requestRotations("Clutch", 80, currentYaw, currentPitch)
+                || "Clutch".equals(helper.getRequestedOwner())) {
+            event.yaw = Float.valueOf(currentYaw);
+            event.pitch = Float.valueOf(currentPitch);
+        }
+    }
+
+    @SubscribeEvent
+    public void onForgeRenderEvent(Event event) {
+        if (event == null) return;
+        String eventName = event.getClass().getName();
+        boolean pre = "net.minecraftforge.client.event.RenderPlayerEvent$Pre".equals(eventName);
+        boolean post = "net.minecraftforge.client.event.RenderPlayerEvent$Post".equals(eventName);
+        if (!pre && !post) return;
+        if (resolveRenderedPlayer(event) != mc.thePlayer) return;
+        if (post) {
+            restoreRenderPitchSwap();
+            return;
+        }
+        if (!modelRotationActive || !silentAim.isEnabled()) return;
+        restoreRenderPitchSwap();
+        EntityPlayerSP player = mc.thePlayer;
+        savedRenderPitch = player.rotationPitch;
+        savedPrevRenderPitch = player.prevRotationPitch;
+        player.prevRotationPitch = previousSilentPitch;
+        player.rotationPitch = currentPitch;
+        modelPitchSwapActive = true;
+    }
+
+    private Object resolveRenderedPlayer(Event event) {
+        try {
+            if (renderPlayerField == null || !renderPlayerField.getDeclaringClass().isAssignableFrom(event.getClass())) {
+                renderPlayerField = event.getClass().getField("entityPlayer");
+                renderPlayerField.setAccessible(true);
+            }
+            return renderPlayerField.get(event);
+        } catch (ReflectiveOperationException ignored) {
+            return null;
+        }
     }
 
     @SubscribeEvent
@@ -1172,11 +1235,52 @@ public final class ClutchModule extends Module {
     }
 
     private void clearRotationState() {
+        clearSilentModelRotation();
         rotationActive = false;
         targetYaw = 0.0F;
         targetPitch = 0.0F;
         rotationHeldTicks = 0;
-        ClientRotationHelper.get().clearRequestedRotations();
+        ClientRotationHelper helper = ClientRotationHelper.get();
+        if ("Clutch".equals(helper.getRequestedOwner())) helper.clearRequestedRotations();
+    }
+
+    private void updateSilentModelRotation(EntityPlayerSP player) {
+        if (player == null || !silentAim.isEnabled() || !rotationActive) {
+            clearSilentModelRotation();
+            return;
+        }
+        previousSilentPitch = modelRotationActive ? lastSilentPitch : player.prevRotationPitch;
+        lastSilentPitch = currentPitch;
+        player.prevRotationYawHead = modelRotationActive ? player.rotationYawHead : player.prevRotationYaw;
+        player.rotationYawHead = currentYaw;
+        player.prevRenderYawOffset = modelRotationActive ? player.renderYawOffset : player.prevRotationYaw;
+        player.renderYawOffset = currentYaw;
+        modelRotationActive = true;
+        ClientRotationHelper.get().requestRotations("Clutch", 80, currentYaw, currentPitch);
+    }
+
+    private void restoreRenderPitchSwap() {
+        if (!modelPitchSwapActive || mc.thePlayer == null) {
+            modelPitchSwapActive = false;
+            return;
+        }
+        mc.thePlayer.rotationPitch = savedRenderPitch;
+        mc.thePlayer.prevRotationPitch = savedPrevRenderPitch;
+        modelPitchSwapActive = false;
+    }
+
+    private void clearSilentModelRotation() {
+        restoreRenderPitchSwap();
+        EntityPlayerSP player = mc.thePlayer;
+        if (modelRotationActive && player != null) {
+            player.rotationYawHead = player.rotationYaw;
+            player.prevRotationYawHead = player.prevRotationYaw;
+            player.renderYawOffset = player.rotationYaw;
+            player.prevRenderYawOffset = player.prevRotationYaw;
+        }
+        modelRotationActive = false;
+        previousSilentPitch = 0.0F;
+        lastSilentPitch = 0.0F;
     }
 
     private void resetState() {
@@ -1208,6 +1312,11 @@ public final class ClutchModule extends Module {
         restoreSavedSlot(player);
         resetState();
         clearRotationState();
+    }
+
+    @Override
+    public String getHudInfo() {
+        return clutching ? blocksPlaced + "/" + maxBlocks.getValue() : "Ready";
     }
 
     private void abortActiveClutch(EntityPlayerSP player) {

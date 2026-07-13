@@ -112,6 +112,21 @@ public final class HudModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        draggingComponent = null;
+        lastTarget = null;
+        lastTargetId = -1;
+        lastTargetHealth = 0.0F;
+        targetCombo = 0;
+        targetHitsTaken = 0;
+    }
+
+    @Override
+    public void onInputContextLost() {
+        draggingComponent = null;
+    }
+
+    @Override
     public void onRenderOverlay(RenderGameOverlayEvent.Text event) {
         Minecraft minecraft = Minecraft.getMinecraft();
         if (minecraft.gameSettings.showDebugInfo) {
@@ -339,7 +354,7 @@ public final class HudModule extends Module {
             return getLegacyCustomColor();
         }
         if (colorMode == ColorMode.MODULE) {
-            double time = System.currentTimeMillis() / 320.0D;
+            double time = (System.nanoTime() / 1000000.0D) / 320.0D;
             float wave = (float) ((Math.sin(time + (index * 0.45D)) + 1.0D) * 0.5D);
             return 0xFF000000 | ClickGuiModule.blendColor(ClickGuiModule.getLightAccentColor(), ClickGuiModule.getDarkAccentColor(), wave);
         }

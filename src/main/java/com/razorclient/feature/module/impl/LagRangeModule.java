@@ -19,8 +19,8 @@ public final class LagRangeModule extends Module {
     private final BooleanSetting realPositionIndicator = new BooleanSetting("Real Position Indicator", true);
     private final BooleanSetting holdingWeapon = new BooleanSetting("Holding Weapon", false);
 
-    private EntityPlayer target;
-    private boolean outboundFlushRequested;
+    private volatile EntityPlayer target;
+    private volatile boolean outboundFlushRequested;
 
     public LagRangeModule() {
         super("Lag Range", "Delays outbound movement while a target is near range.", Category.LAG_MODULES, Keyboard.KEY_NONE);
@@ -40,6 +40,12 @@ public final class LagRangeModule extends Module {
 
     @Override
     protected void onDisable() {
+        target = null;
+        outboundFlushRequested = true;
+    }
+
+    @Override
+    public void onSessionReset() {
         target = null;
         outboundFlushRequested = true;
     }

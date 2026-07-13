@@ -17,8 +17,8 @@ public abstract class Module {
     private final String description;
     private final Category category;
     private final List<Setting> settings = new ArrayList<Setting>();
-    private int keyCode;
-    private boolean enabled;
+    private volatile int keyCode;
+    private volatile boolean enabled;
 
     protected Module(String name, String description, Category category, int keyCode) {
         this.name = name;
@@ -125,6 +125,22 @@ public abstract class Module {
     public void onClientTick(TickEvent.ClientTickEvent event) {
     }
 
+    /** Called once when the active world or local player instance changes. */
+    public void onSessionReset() {
+    }
+
+    public void onSessionReset(ModuleResetReason reason) {
+        onSessionReset();
+    }
+
+    /** Called once when gameplay input becomes unavailable due to focus loss or a GUI. */
+    public void onInputContextLost() {
+    }
+
+    public void onInputContextLost(ModuleResetReason reason) {
+        onInputContextLost();
+    }
+
     public void onPlayerTick(TickEvent.PlayerTickEvent event) {
     }
 
@@ -147,6 +163,11 @@ public abstract class Module {
         return 0;
     }
 
+    /** True when the packet must remain queued until an explicit flush rather than a deadline. */
+    public boolean shouldHoldOutboundPacket(Packet<?> packet) {
+        return false;
+    }
+
     /** Higher values win when several modules request a delay for the same outbound packet. */
     public int getOutboundPacketDelayPriority(Packet<?> packet) {
         return 0;
@@ -154,6 +175,11 @@ public abstract class Module {
 
     public int getInboundPacketDelay(Packet<?> packet) {
         return 0;
+    }
+
+    /** True when the packet must remain queued until an explicit flush rather than a deadline. */
+    public boolean shouldHoldInboundPacket(Packet<?> packet) {
+        return false;
     }
 
     /** Higher values win when several modules request a delay for the same inbound packet. */
@@ -181,6 +207,9 @@ public abstract class Module {
     public void onInboundPacketReleased(Packet<?> packet) {
     }
 
+    public void onPacketDelayOverflow(boolean outbound) {
+    }
+
     public boolean isPacketDelayActive() {
         return false;
     }
@@ -198,10 +227,10 @@ public abstract class Module {
     }
 
     public boolean consumeOutboundFlushRequest() {
-        return consumeFlushRequest();
+        return false;
     }
 
     public boolean consumeInboundFlushRequest() {
-        return consumeFlushRequest();
+        return false;
     }
 }

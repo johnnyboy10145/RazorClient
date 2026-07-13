@@ -20,6 +20,7 @@ import net.minecraft.network.Packet;
 import net.minecraftforge.client.event.MouseEvent;
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
+import org.lwjgl.opengl.GL11;
 
 public final class LiveEntrypoint {
     private static final AtomicBoolean STARTED = new AtomicBoolean();
@@ -29,12 +30,17 @@ public final class LiveEntrypoint {
     private static volatile boolean running;
     private static volatile String injectionId;
     private static volatile NetworkManager installedManager;
+    private static volatile NetworkManager pendingManager;
     private static final Set<Integer> downKeys = new HashSet<Integer>();
     private static final boolean[] downMouseButtons = new boolean[8];
     private static boolean supportLogged;
     private static boolean firstPulseLogged;
     private static boolean renderBridgeLogged;
     private static boolean firstWorldRenderLogged;
+    private static final AtomicBoolean RENDERING = new AtomicBoolean();
+
+    private static native boolean installNativeRenderBridge();
+    private static native void uninstallNativeRenderBridge();
 
     public static void start() {
         String activeEpoch = System.getProperty("razorclient.live.epoch");
@@ -53,6 +59,9 @@ public final class LiveEntrypoint {
             injectionId = UUID.randomUUID().toString();
             running = true;
             ClientHooks.start();
+            if (!installNativeRenderBridge()) {
+                throw new IllegalStateException("Native render bridge installation failed");
+            }
             System.setProperty("razorclient.live.injected", "true");
             System.setProperty("razorclient.live.epoch", injectionId);
             AgentLog.info("LiveEntrypoint started with loader " + LiveEntrypoint.class.getClassLoader());
@@ -85,6 +94,11 @@ public final class LiveEntrypoint {
 
     public static void unload() {
         running = false;
+        try {
+            uninstallNativeRenderBridge();
+        } catch (Throwable failure) {
+            AgentLog.error("Native render bridge removal failed", failure);
+        }
         removePacketHandler();
         if (isCurrentEpoch()) {
             System.clearProperty("razorclient.live.injected");
@@ -168,26 +182,49 @@ public final class LiveEntrypoint {
             return;
         }
         rewriteMovementInput(mc.thePlayer);
-        ClientHooks.renderFrame(0.0F);
-        renderLiveBridge();
         ClientHooks.runTickTail();
     }
 
-    private static void renderLiveBridge() {
+    public static void renderNativeFrame() {
+        if (!running || !isCurrentEpoch() || !RENDERING.compareAndSet(false, true)) return;
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc == null || mc.theWorld == null || mc.thePlayer == null || mc.currentScreen != null) {
+            RENDERING.set(false);
+            return;
+        }
         try {
             if (!renderBridgeLogged) {
                 renderBridgeLogged = true;
                 AgentLog.info("Live render bridge active");
-                InjectionStatus.write("RENDER_BRIDGE_ACTIVE", "world and overlay callbacks enabled");
+                InjectionStatus.write("RENDER_BRIDGE_ACTIVE", "OpenGL frame callback active");
             }
-            ClientHooks.renderWorld(0.0F);
-            ClientHooks.renderOverlay(0.0F);
+            GL11.glPushAttrib(GL11.GL_ALL_ATTRIB_BITS);
+            GL11.glMatrixMode(GL11.GL_PROJECTION);
+            GL11.glPushMatrix();
+            GL11.glMatrixMode(GL11.GL_MODELVIEW);
+            GL11.glPushMatrix();
+            try {
+                mc.entityRenderer.setupCameraTransform(1.0F, 0);
+                ClientHooks.renderWorld(1.0F);
+                mc.entityRenderer.setupOverlayRendering();
+                ClientHooks.renderOverlay(1.0F);
+                ClientHooks.renderFrame(1.0F);
+            } finally {
+                GL11.glMatrixMode(GL11.GL_MODELVIEW);
+                GL11.glPopMatrix();
+                GL11.glMatrixMode(GL11.GL_PROJECTION);
+                GL11.glPopMatrix();
+                GL11.glMatrixMode(GL11.GL_MODELVIEW);
+                GL11.glPopAttrib();
+            }
             if (!firstWorldRenderLogged) {
                 firstWorldRenderLogged = true;
                 InjectionStatus.write("FIRST_WORLD_RENDER", "ClientHooks.renderWorld reached");
             }
         } catch (Throwable failure) {
             AgentLog.error("Live render bridge failed", failure);
+        } finally {
+            RENDERING.set(false);
         }
     }
 
@@ -259,14 +296,16 @@ public final class LiveEntrypoint {
             return;
         }
         final NetworkManager manager = mc.getNetHandler().getNetworkManager();
-        if (manager == installedManager) return;
+        if (manager == installedManager || manager == pendingManager) return;
         removePacketHandler();
         final Channel channel = manager.channel;
         if (channel == null) return;
+        pendingManager = manager;
         channel.eventLoop().execute(new Runnable() {
             @Override
             public void run() {
                 try {
+                    if (!running || !isCurrentEpoch() || pendingManager != manager) return;
                     ChannelPipeline pipeline = channel.pipeline();
                     if (pipeline.get(INBOUND_HANDLER_NAME) != null) {
                         pipeline.remove(INBOUND_HANDLER_NAME);
@@ -281,6 +320,8 @@ public final class LiveEntrypoint {
                     installedManager = manager;
                 } catch (Throwable failure) {
                     AgentLog.error("Failed to install live Netty packet handler", failure);
+                } finally {
+                    if (pendingManager == manager) pendingManager = null;
                 }
             }
         });
@@ -307,6 +348,7 @@ public final class LiveEntrypoint {
     }
 
     private static void removePacketHandler() {
+        pendingManager = null;
         final NetworkManager manager = installedManager;
         installedManager = null;
         if (manager == null || manager.channel == null) return;

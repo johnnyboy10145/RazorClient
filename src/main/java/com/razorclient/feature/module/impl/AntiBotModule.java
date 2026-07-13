@@ -3,6 +3,7 @@ package com.razorclient.feature.module.impl;
 import com.razorclient.RazorClient;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
+import com.razorclient.feature.setting.BooleanSetting;
 import java.util.Collection;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.network.NetworkPlayerInfo;
@@ -10,8 +11,13 @@ import net.minecraft.entity.player.EntityPlayer;
 import org.lwjgl.input.Keyboard;
 
 public final class AntiBotModule extends Module {
+    private final BooleanSetting requireTabList = new BooleanSetting("Require Tab List", true);
+    private final BooleanSetting ignoreSpectators = new BooleanSetting("Ignore Spectators", true);
+
     public AntiBotModule() {
         super("AntiBot", "Filters NPCs from players.", Category.CLIENT, Keyboard.KEY_NONE);
+        addSetting(requireTabList);
+        addSetting(ignoreSpectators);
     }
 
     public static boolean shouldIgnore(EntityPlayer player) {
@@ -34,7 +40,10 @@ public final class AntiBotModule extends Module {
             return false;
         }
 
-        return !isInTabList(minecraft, player);
+        if (ignoreSpectators.isEnabled() && player.isSpectator()) {
+            return true;
+        }
+        return requireTabList.isEnabled() && !isInTabList(minecraft, player);
     }
 
     private boolean isInTabList(Minecraft minecraft, EntityPlayer player) {
@@ -56,5 +65,10 @@ public final class AntiBotModule extends Module {
         }
 
         return false;
+    }
+
+    @Override
+    public String getHudInfo() {
+        return requireTabList.isEnabled() ? "Tab" : "Local";
     }
 }

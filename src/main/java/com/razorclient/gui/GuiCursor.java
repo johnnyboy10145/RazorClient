@@ -25,6 +25,7 @@ public final class GuiCursor {
 
     public static void draw(int mouseX, int mouseY) {
         if (!ClickGuiModule.isCustomCursorEnabled()) {
+            setNativeCursorHidden(false);
             return;
         }
 

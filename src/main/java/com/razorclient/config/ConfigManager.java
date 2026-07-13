@@ -17,6 +17,7 @@ import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.IntRangeSetting;
 import com.razorclient.feature.setting.NumberSetting;
 import com.razorclient.feature.setting.Setting;
+import com.razorclient.inject.AgentLog;
 import java.awt.Desktop;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -192,7 +193,8 @@ public final class ConfigManager {
             currentConfigName = name;
             persistCurrentConfigName();
             moduleManager.refreshConfigModule();
-        } catch (Exception ignored) {
+        } catch (Exception failure) {
+            AgentLog.error("Unable to load config " + name, failure);
         } finally {
             suppressSave = false;
         }
@@ -204,7 +206,8 @@ public final class ConfigManager {
             if (Desktop.isDesktopSupported()) {
                 Desktop.getDesktop().open(configDirectory);
             }
-        } catch (IOException ignored) {
+        } catch (IOException failure) {
+            AgentLog.error("Unable to open config folder " + configDirectory.getAbsolutePath(), failure);
         }
     }
 
@@ -254,15 +257,25 @@ public final class ConfigManager {
             } finally {
                 writer.close();
             }
-        } catch (IOException ignored) {
+        } catch (IOException failure) {
+            AgentLog.error("Unable to save config " + file.getAbsolutePath(), failure);
         }
     }
 
     private void ensureBuiltInConfigs() {
         File survival = getConfigFile("survival");
         File bedwarsSurvival = getConfigFile("bedwars-survival");
+        File bedwarsLegit = getConfigFile("bedwars-legit");
+        File bedwarsAggressive = getConfigFile("bedwars-aggressive");
         boolean createSurvival = !survival.isFile();
-        if (!createSurvival && bedwarsSurvival.isFile()) {
+        boolean createBedwarsSurvival = !bedwarsSurvival.isFile();
+        boolean createBedwarsLegit = !bedwarsLegit.isFile();
+        boolean createBedwarsAggressive = !bedwarsAggressive.isFile();
+        if (!createSurvival && !createBedwarsSurvival && !createBedwarsLegit && !createBedwarsAggressive) {
+            ensureUtilityProfileEntries(survival);
+            ensureUtilityProfileEntries(bedwarsSurvival);
+            ensureUtilityProfileEntries(bedwarsLegit);
+            ensureUtilityProfileEntries(bedwarsAggressive);
             return;
         }
 
@@ -273,9 +286,9 @@ public final class ConfigManager {
         addModule(modules, "Sprint", true, org.lwjgl.input.Keyboard.KEY_NONE);
         addModule(modules, "HUD", true, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("Mode", "CLASSIC"),
-            setting("Red", 170),
-            setting("Green", 95),
-            setting("Blue", 255),
+            setting("Red", 45),
+            setting("Green", 210),
+            setting("Blue", 110),
             setting("Text GUI", true),
             setting("Text GUI Pinned", true),
             setting("Text GUI Scale", 85),
@@ -311,6 +324,20 @@ public final class ConfigManager {
         );
         addModule(modules, "Config", false, org.lwjgl.input.Keyboard.KEY_NONE);
         addModule(modules, "Self Destruct", false, org.lwjgl.input.Keyboard.KEY_NONE);
+        addModule(modules, "Fullbright", true, org.lwjgl.input.Keyboard.KEY_NONE,
+            setting("Brightness", 10)
+        );
+        addModule(modules, "Auto Tool", true, org.lwjgl.input.Keyboard.KEY_NONE,
+            setting("Return To Slot", true)
+        );
+        addModule(modules, "Fast Place", false, org.lwjgl.input.Keyboard.KEY_NONE,
+            setting("Delay", 0),
+            setting("Blocks Only", true)
+        );
+        addModule(modules, "Item Physics", false, org.lwjgl.input.Keyboard.KEY_NONE,
+            setting("No Bob", true),
+            setting("No Spin", true)
+        );
 
         addModule(modules, "BedPlates", true, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("Range", 96),
@@ -320,13 +347,28 @@ public final class ConfigManager {
         addModule(modules, "PlayerESP", true, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("Mode", "CLASSIC"),
             setting("Render Mode", "BOTH"),
+            setting("Projection Mode", "BOTH"),
+            setting("Target Type", "BOTH"),
             setting("Red", 170),
             setting("Green", 95),
             setting("Blue", 255),
+            setting("Hidden Red", 235),
+            setting("Hidden Green", 70),
+            setting("Hidden Blue", 70),
+            setting("Target Red", 255),
+            setting("Target Green", 190),
+            setting("Target Blue", 70),
             setting("See Invis", false),
+            setting("Through Walls", true),
             setting("Show Names", true),
             setting("Show Health", true),
+            setting("Health Bar", true),
+            setting("Health Value", true),
             setting("Show Distance", true),
+            setting("Armor", true),
+            setting("Held Item", true),
+            setting("Tracers", false),
+            setting("Target Highlight", true),
             setting("Max Distance", 96),
             setting("Line Width", 2),
             setting("Fill Alpha", 12),
@@ -503,10 +545,150 @@ public final class ConfigManager {
         );
 
         root.add("modules", modules);
+        JsonObject legitRoot = createBedwarsProfile(root, false);
+        JsonObject aggressiveRoot = createBedwarsProfile(root, true);
         if (createSurvival) {
             writeConfigJson(survival, root);
+        } else {
+            ensureUtilityProfileEntries(survival);
         }
-        writeConfigJson(bedwarsSurvival, root);
+        if (createBedwarsSurvival) {
+            writeConfigJson(bedwarsSurvival, legitRoot);
+        } else {
+            ensureUtilityProfileEntries(bedwarsSurvival);
+        }
+        if (createBedwarsLegit) {
+            writeConfigJson(bedwarsLegit, legitRoot);
+        } else {
+            ensureUtilityProfileEntries(bedwarsLegit);
+        }
+        if (createBedwarsAggressive) {
+            writeConfigJson(bedwarsAggressive, aggressiveRoot);
+        } else {
+            ensureUtilityProfileEntries(bedwarsAggressive);
+        }
+    }
+
+    private JsonObject createBedwarsProfile(JsonObject base, boolean aggressive) {
+        JsonObject profile = base.deepCopy();
+        setModuleEnabled(profile, "AntiBot", true);
+        setModuleEnabled(profile, "BedPlates", true);
+        setModuleEnabled(profile, "PlayerESP", true);
+        setModuleEnabled(profile, "LegitScaffold", true);
+        setModuleEnabled(profile, "Clutch", true);
+        setModuleEnabled(profile, "Fullbright", true);
+        setModuleEnabled(profile, "Auto Tool", true);
+        setModuleEnabled(profile, "AimAssist", true);
+        setModuleSetting(profile, "AimAssist", "Target Type", "PLAYERS");
+        setModuleSetting(profile, "AimAssist", "Ignore Teammates", true);
+        setModuleSetting(profile, "AimAssist", "Require Visibility", true);
+        setModuleSetting(profile, "AimAssist", "Click Aim", true);
+        setModuleSetting(profile, "AimAssist", "Weapon Only", true);
+        setModuleSetting(profile, "AimAssist", "Distance", aggressive ? 4.5D : 4.0D);
+        setModuleSetting(profile, "AimAssist", "FOV", aggressive ? 120 : 80);
+        setModuleSetting(profile, "AimAssist", "Aim Mode", aggressive ? "SILENT" : "REGULAR");
+        setModuleSetting(profile, "AimAssist", "Horizontal Speed", aggressive ? 8 : 4);
+        setModuleSetting(profile, "AimAssist", "Vertical Speed", aggressive ? 6 : 3);
+
+        setModuleEnabled(profile, "LeftClicker", true);
+        setModuleSetting(profile, "LeftClicker", "Mode", "NORMAL");
+        setModuleSetting(profile, "LeftClicker", "Click Pattern", aggressive ? "JITTER" : "NORMAL");
+        setModuleSetting(profile, "LeftClicker", "Min CPS", aggressive ? 12 : 8);
+        setModuleSetting(profile, "LeftClicker", "Max CPS", aggressive ? 16 : 12);
+        setModuleSetting(profile, "LeftClicker", "Weapon Only", true);
+        setModuleSetting(profile, "LeftClicker", "Not Using Item", true);
+
+        setModuleEnabled(profile, "KillAura", aggressive);
+        setModuleSetting(profile, "KillAura", "Target Type", "PLAYERS");
+        setModuleSetting(profile, "KillAura", "Target CPS", aggressive ? 10.0D : 8.0D);
+        setModuleSetting(profile, "KillAura", "Range (Attack)", aggressive ? 3.2D : 3.0D);
+        setModuleSetting(profile, "KillAura", "Range (Swing)", aggressive ? 4.2D : 4.0D);
+        setModuleSetting(profile, "KillAura", "Range (Aim)", aggressive ? 4.5D : 4.0D);
+        setModuleSetting(profile, "KillAura", "Weapon Only", true);
+
+        setModuleEnabled(profile, "Reach", aggressive);
+        setModuleSetting(profile, "Reach", "Reach", aggressive ? 3.4D : 3.0D);
+        setModuleSetting(profile, "Reach", "Chance", aggressive ? 90 : 100);
+        setModuleEnabled(profile, "Velocity", aggressive);
+        setModuleSetting(profile, "Velocity", "Mode", "REGULAR");
+        setModuleSetting(profile, "Velocity", "Horizontal", aggressive ? 85 : 90);
+        setModuleSetting(profile, "Velocity", "Vertical", 100);
+        setModuleSetting(profile, "Velocity", "Only Moving", true);
+        setModuleSetting(profile, "Velocity", "Randomize", true);
+        setModuleEnabled(profile, "Fast Place", aggressive);
+        setModuleEnabled(profile, "No Jump Delay", aggressive);
+
+        for (String lagModule : new String[] {"Fake Lag", "Blink", "Backtrack", "Lag Range", "Knockback Delay"}) {
+            setModuleEnabled(profile, lagModule, false);
+        }
+        return profile;
+    }
+
+    private void setModuleEnabled(JsonObject root, String moduleName, boolean enabled) {
+        JsonObject module = getProfileModule(root, moduleName);
+        module.addProperty("enabled", enabled);
+    }
+
+    private void setModuleSetting(JsonObject root, String moduleName, String settingName, boolean value) {
+        getProfileSettings(root, moduleName).addProperty(settingName, value);
+    }
+
+    private void setModuleSetting(JsonObject root, String moduleName, String settingName, int value) {
+        getProfileSettings(root, moduleName).addProperty(settingName, value);
+    }
+
+    private void setModuleSetting(JsonObject root, String moduleName, String settingName, double value) {
+        getProfileSettings(root, moduleName).addProperty(settingName, value);
+    }
+
+    private void setModuleSetting(JsonObject root, String moduleName, String settingName, String value) {
+        getProfileSettings(root, moduleName).addProperty(settingName, value);
+    }
+
+    private JsonObject getProfileModule(JsonObject root, String moduleName) {
+        JsonObject modules = root.getAsJsonObject("modules");
+        if (!modules.has(moduleName)) addModule(modules, moduleName, false, org.lwjgl.input.Keyboard.KEY_NONE);
+        return modules.getAsJsonObject(moduleName);
+    }
+
+    private JsonObject getProfileSettings(JsonObject root, String moduleName) {
+        JsonObject module = getProfileModule(root, moduleName);
+        if (!module.has("settings")) module.add("settings", new JsonObject());
+        return module.getAsJsonObject("settings");
+    }
+
+    /** Adds new managed defaults without changing existing built-in profile values. */
+    private void ensureUtilityProfileEntries(File file) {
+        try {
+            JsonObject root = JsonParser.parseString(new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8)).getAsJsonObject();
+            JsonObject modules = root.has("modules") ? root.getAsJsonObject("modules") : new JsonObject();
+            boolean changed = false;
+            if (!modules.has("Fullbright")) {
+                addModule(modules, "Fullbright", true, org.lwjgl.input.Keyboard.KEY_NONE, setting("Brightness", 10));
+                changed = true;
+            }
+            if (!modules.has("Auto Tool")) {
+                addModule(modules, "Auto Tool", true, org.lwjgl.input.Keyboard.KEY_NONE, setting("Return To Slot", true));
+                changed = true;
+            }
+            if (!modules.has("Fast Place")) {
+                addModule(modules, "Fast Place", false, org.lwjgl.input.Keyboard.KEY_NONE,
+                    setting("Delay", 0), setting("Blocks Only", true));
+                changed = true;
+            }
+            if (!modules.has("Item Physics")) {
+                addModule(modules, "Item Physics", false, org.lwjgl.input.Keyboard.KEY_NONE,
+                    setting("No Bob", true), setting("No Spin", true));
+                changed = true;
+            }
+            if (changed) {
+                root.add("modules", modules);
+                writeConfigJson(file, root);
+            }
+        } catch (Exception failure) {
+            // A malformed user-edited built-in profile is left untouched.
+            AgentLog.error("Unable to update built-in profile " + file.getAbsolutePath(), failure);
+        }
     }
 
     private void writeConfigJson(File file, JsonObject root) {
@@ -517,7 +699,8 @@ public final class ConfigManager {
             } finally {
                 writer.close();
             }
-        } catch (IOException ignored) {
+        } catch (IOException failure) {
+            AgentLog.error("Unable to write config " + file.getAbsolutePath(), failure);
         }
     }
 
@@ -616,7 +799,8 @@ public final class ConfigManager {
 
         try {
             return sanitize(new String(Files.readAllBytes(currentConfigFile.toPath()), StandardCharsets.UTF_8).trim());
-        } catch (IOException ignored) {
+        } catch (IOException failure) {
+            AgentLog.error("Unable to read active config marker", failure);
             return null;
         }
     }
@@ -624,7 +808,8 @@ public final class ConfigManager {
     private void persistCurrentConfigName() {
         try {
             Files.write(currentConfigFile.toPath(), currentConfigName.getBytes(StandardCharsets.UTF_8));
-        } catch (IOException ignored) {
+        } catch (IOException failure) {
+            AgentLog.error("Unable to persist active config marker", failure);
         }
     }
 

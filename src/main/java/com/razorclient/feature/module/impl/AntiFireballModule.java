@@ -1,6 +1,7 @@
 package com.razorclient.feature.module.impl;
 
 import com.razorclient.combat.ClientRotationHelper;
+import com.razorclient.combat.CombatActionCoordinator;
 import com.razorclient.combat.KillAuraRotationUtils;
 import com.razorclient.event.ClientRotationEvent;
 import com.razorclient.event.PrePlayerInputEvent;
@@ -82,6 +83,15 @@ public final class AntiFireballModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        nextClickTime = 0L;
+        fireball = null;
+        trackedFireballs.clear();
+        ClientRotationHelper.get().clearRequestedRotations();
+        seedTrackedFireballs();
+    }
+
+    @Override
     public void onClientTick(TickEvent.ClientTickEvent event) {
         if (event.phase != TickEvent.Phase.START) {
             return;
@@ -122,8 +132,10 @@ public final class AntiFireballModule extends Module {
             rotationSpeed.getValue(),
             0.0F
         );
-        event.yaw = Float.valueOf(smooth[0]);
-        event.pitch = Float.valueOf(smooth[1]);
+        if (ClientRotationHelper.get().requestRotations("AntiFireball", 90, smooth[0], smooth[1])) {
+            event.yaw = Float.valueOf(smooth[0]);
+            event.pitch = Float.valueOf(smooth[1]);
+        }
     }
 
     @SubscribeEvent
@@ -157,17 +169,18 @@ public final class AntiFireballModule extends Module {
             return;
         }
 
-        long now = System.currentTimeMillis();
+        long now = System.nanoTime();
         if (nextClickTime == 0L) {
             nextClickTime = now;
         }
 
         int key = minecraft.gameSettings.keyBindAttack.getKeyCode();
-        while (nextClickTime <= now) {
-            KeyBinding.onTick(key);
-            MouseButtonHelper.setButton(0, true);
-            nextClickTime += nextDelay();
-        }
+        if (nextClickTime > now) return;
+        if (!CombatActionCoordinator.tryAcquire("AntiFireball")) return;
+        KeyBinding.onTick(key);
+        MouseButtonHelper.setButton(0, true);
+        MouseButtonHelper.setButton(0, false);
+        nextClickTime = now + (nextDelay() * 1000000L);
     }
 
     @SubscribeEvent
@@ -225,6 +238,11 @@ public final class AntiFireballModule extends Module {
             } catch (IllegalAccessException ignored) {
             }
         }
+    }
+
+    @Override
+    public String getHudInfo() {
+        return fireball == null ? "Ready" : "Target";
     }
 
     private boolean canProcess(Minecraft minecraft) {

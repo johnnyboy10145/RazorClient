@@ -63,8 +63,20 @@ public final class ClickGuiModule extends Module {
     }
 
     public static int getDarkAccentColor() {
-        return blendColor(getAccentColor(), 0x08111B, 0.48F);
+        return blendColor(getAccentColor(), getThemeBackgroundColor(), 0.48F);
     }
+
+    private static ColorPreset getPreset() {
+        return instance == null ? ColorPreset.RAZOR_GREEN : instance.colorPreset.getValue();
+    }
+
+    public static int getThemeBackgroundColor() { return getPreset().getBackground(); }
+    public static int getThemeSurfaceColor() { return getPreset().getSurface(); }
+    public static int getThemeRaisedColor() { return getPreset().getRaised(); }
+    public static int getThemeHoverColor() { return getPreset().getHover(); }
+    public static int getThemeBorderColor() { return getPreset().getBorder(); }
+    public static int getThemeTextColor() { return getPreset().getText(); }
+    public static int getThemeMutedTextColor() { return getPreset().getMutedText(); }
 
     public static boolean areGuiEffectsEnabled() {
         return instance == null || instance.guiEffects.isEnabled();
@@ -101,29 +113,51 @@ public final class ClickGuiModule extends Module {
     }
 
     public enum ColorPreset {
-        CLASSIC_BLUE("Classic Blue", 0x305CA8),
-        RAZOR_GREEN("Razor Green", 0x2D9656),
-        EXHIBIT_GREEN("Exhibit Green", 0x1E7F48),
-        MINT_GREEN("Mint Green", 0x45C883),
-        PURPLE("Purple", 0x8A5CFF),
-        PINK("Pink", 0xFF5CA8),
-        RED("Red", 0xE84855),
-        ORANGE("Orange", 0xFF9F1C),
-        YELLOW("Yellow", 0xFFD166),
-        CYAN("Cyan", 0x2EC4B6),
-        WHITE("White", 0xE8EAF1);
+        CLASSIC_BLUE("Midnight", 0x4778D9, 0x060812, 0x0B1020, 0x111A31, 0x16233F, 0x22345A, 0xEAF0FF, 0x8592AC),
+        RAZOR_GREEN("Razor", 0x2D9656, 0x050805, 0x0A100C, 0x0D1711, 0x132319, 0x173820, 0xE9EEE9, 0x85908A),
+        EXHIBIT_GREEN("Exhibit", 0x1E7F48, 0x030704, 0x08110B, 0x0C1910, 0x11251A, 0x163A25, 0xE6EDE8, 0x78877E),
+        MINT_GREEN("Emerald", 0x45C883, 0x050B08, 0x0A1610, 0x0E2017, 0x153025, 0x20513A, 0xE8F5ED, 0x83A092),
+        PURPLE("Amethyst", 0x8A5CFF, 0x080611, 0x100B20, 0x17102D, 0x21183D, 0x39265F, 0xF0EBFF, 0x988CAD),
+        PINK("Sakura", 0xE864A5, 0x10060C, 0x1B0C15, 0x27121E, 0x381A2A, 0x5A2942, 0xFFF0F7, 0xAD8B9B),
+        RED("Crimson", 0xE84855, 0x100506, 0x1A0B0D, 0x261013, 0x37171B, 0x57252B, 0xFFF0F1, 0xAD898D),
+        ORANGE("Ember", 0xF28C35, 0x0F0904, 0x1A1008, 0x25170C, 0x362214, 0x55351E, 0xFFF4E9, 0xAA927E),
+        YELLOW("Gold", 0xDDB84A, 0x0D0B05, 0x171409, 0x211D0D, 0x302A14, 0x4F4522, 0xFFF9E7, 0xA49B7D),
+        CYAN("Abyss", 0x2EC4B6, 0x040B0C, 0x081517, 0x0C1E21, 0x112C30, 0x1A484D, 0xE8FBFA, 0x7F9FA0),
+        WHITE("Monochrome", 0xE8EAF1, 0x08090B, 0x101216, 0x171A1F, 0x22262D, 0x363C46, 0xF2F3F5, 0x92979F);
 
         private final String displayName;
         private final int color;
+        private final int background;
+        private final int surface;
+        private final int raised;
+        private final int hover;
+        private final int border;
+        private final int text;
+        private final int mutedText;
 
-        ColorPreset(String displayName, int color) {
+        ColorPreset(String displayName, int color, int background, int surface, int raised, int hover, int border, int text, int mutedText) {
             this.displayName = displayName;
             this.color = color;
+            this.background = background;
+            this.surface = surface;
+            this.raised = raised;
+            this.hover = hover;
+            this.border = border;
+            this.text = text;
+            this.mutedText = mutedText;
         }
 
         public int getColor() {
             return color;
         }
+
+        public int getBackground() { return background; }
+        public int getSurface() { return surface; }
+        public int getRaised() { return raised; }
+        public int getHover() { return hover; }
+        public int getBorder() { return border; }
+        public int getText() { return text; }
+        public int getMutedText() { return mutedText; }
 
         @Override
         public String toString() {

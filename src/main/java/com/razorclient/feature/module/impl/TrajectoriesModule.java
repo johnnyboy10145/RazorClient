@@ -91,7 +91,6 @@ public final class TrajectoriesModule extends Module {
             renderPath(minecraft, result.points, lineColor);
         } finally {
             GL11.glDisable(GL11.GL_LINE_SMOOTH);
-            GL11.glDisable(GL11.GL_LINE_SMOOTH);
             GL11.glLineWidth(1.0F);
             GlStateManager.enableCull();
             GlStateManager.enableLighting();
@@ -103,6 +102,11 @@ public final class TrajectoriesModule extends Module {
             GL11.glColor4f(1.0F, 1.0F, 1.0F, 1.0F);
             GL11.glPopMatrix();
         }
+    }
+
+    @Override
+    public String getHudInfo() {
+        return thickness.getValue() + "px";
     }
 
     private ProjectileProperties getProjectileProperties(EntityPlayerSP player) {

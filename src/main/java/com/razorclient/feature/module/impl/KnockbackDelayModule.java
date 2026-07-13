@@ -35,6 +35,15 @@ public final class KnockbackDelayModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        holdPacketsUntil = 0L;
+        cachedPlayerId = -1;
+        cachedOnGround = false;
+        RazorClient client = RazorClient.getInstance();
+        if (client != null) client.getKnockbackDelayBuffer().flushAllIncoming();
+    }
+
+    @Override
     public void onClientTick() {
         Minecraft minecraft = Minecraft.getMinecraft();
         if (minecraft.thePlayer == null) {

@@ -1,6 +1,9 @@
 package com.razorclient.feature.module;
 
 import com.razorclient.config.ConfigManager;
+import com.razorclient.combat.CombatTargetService;
+import com.razorclient.combat.CombatActionCoordinator;
+import com.razorclient.util.MouseButtonHelper;
 import com.razorclient.feature.module.impl.AimAssistModule;
 import com.razorclient.feature.module.impl.AutoClickerModule;
 import com.razorclient.feature.module.impl.AntiBotModule;
@@ -18,6 +21,11 @@ import com.razorclient.feature.module.impl.ClutchModule;
 import com.razorclient.feature.module.impl.KnockbackDelayModule;
 import com.razorclient.feature.module.impl.LagRangeModule;
 import com.razorclient.feature.module.impl.LegitScaffoldModule;
+import com.razorclient.feature.module.impl.NoJumpDelayModule;
+import com.razorclient.feature.module.impl.FastPlaceModule;
+import com.razorclient.feature.module.impl.AutoToolModule;
+import com.razorclient.feature.module.impl.ItemPhysicsModule;
+import com.razorclient.feature.module.impl.FullbrightModule;
 import com.razorclient.feature.module.impl.PingFixModule;
 import com.razorclient.feature.module.impl.PlayerEspModule;
 import com.razorclient.feature.module.impl.ReachModule;
@@ -32,6 +40,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import net.minecraft.network.Packet;
+import net.minecraft.client.Minecraft;
 import net.minecraftforge.client.event.MouseEvent;
 import net.minecraftforge.client.event.RenderGameOverlayEvent;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
@@ -43,6 +52,10 @@ public final class ModuleManager {
     private final Map<Category, List<Module>> modulesByCategory = new EnumMap<Category, List<Module>>(Category.class);
     private final ConfigManager configManager;
     private final ConfigModule configModule;
+    private Object lastWorld;
+    private Object lastPlayer;
+    private boolean lastPlayerDead;
+    private boolean inputContextLost = true;
 
     public ModuleManager() {
         for (Category category : Category.values()) {
@@ -52,6 +65,9 @@ public final class ModuleManager {
         register(new SprintModule());
         register(new BedPlatesModule());
         register(new LegitScaffoldModule());
+        register(new NoJumpDelayModule());
+        register(new FastPlaceModule());
+        register(new AutoToolModule());
         register(new AutoClickerModule());
         register(new RightClickerModule());
         register(new ReachModule());
@@ -70,6 +86,8 @@ public final class ModuleManager {
         register(new ClickRecorderModule());
         register(new ClickGuiModule());
         register(new PlayerEspModule());
+        register(new ItemPhysicsModule());
+        register(new FullbrightModule());
         register(new HudModule());
         register(new TrajectoriesModule());
         register(new SelfDestructModule());
@@ -102,10 +120,51 @@ public final class ModuleManager {
     }
 
     public void onClientTick() {
+        updateLifecycleState();
         for (Module module : modules) {
             if (module.isEnabled()) {
                 module.onClientTick();
             }
+        }
+    }
+
+    private void updateLifecycleState() {
+        Minecraft minecraft = Minecraft.getMinecraft();
+        Object world = minecraft == null ? null : minecraft.theWorld;
+        Object player = minecraft == null ? null : minecraft.thePlayer;
+        boolean playerDead = minecraft != null && minecraft.thePlayer != null && minecraft.thePlayer.isDead;
+        if (world != lastWorld || player != lastPlayer) {
+            ModuleResetReason reason = world == null ? ModuleResetReason.DISCONNECT
+                : lastWorld == world ? ModuleResetReason.RESPAWN : ModuleResetReason.WORLD_CHANGE;
+            lastWorld = world;
+            lastPlayer = player;
+            lastPlayerDead = playerDead;
+            resetEnabledModules(reason);
+        } else if (playerDead != lastPlayerDead) {
+            lastPlayerDead = playerDead;
+            resetEnabledModules(ModuleResetReason.RESPAWN);
+        }
+
+        boolean lost = minecraft == null || world == null || player == null
+            || playerDead || !minecraft.inGameHasFocus || minecraft.currentScreen != null;
+        if (lost && !inputContextLost) {
+            ModuleResetReason reason = minecraft != null && minecraft.currentScreen != null
+                ? ModuleResetReason.GUI_OPENED : ModuleResetReason.FOCUS_LOSS;
+            CombatActionCoordinator.clear();
+            MouseButtonHelper.releaseAllSynthetic();
+            for (Module module : modules) {
+                if (module.isEnabled()) module.onInputContextLost(reason);
+            }
+        }
+        inputContextLost = lost;
+    }
+
+    private void resetEnabledModules(ModuleResetReason reason) {
+        CombatTargetService.clear();
+        CombatActionCoordinator.clear();
+        MouseButtonHelper.releaseAllSynthetic();
+        for (Module module : modules) {
+            if (module.isEnabled()) module.onSessionReset(reason);
         }
     }
 
@@ -181,13 +240,15 @@ public final class ModuleManager {
         Module selected = null;
         int selectedDelay = 0;
         int selectedPriority = Integer.MIN_VALUE;
+        boolean selectedHold = false;
         for (Module module : modules) {
             if (!module.isEnabled()) {
                 continue;
             }
 
             int delay = outbound ? module.getOutboundPacketDelay(packet) : module.getInboundPacketDelay(packet);
-            if (delay <= 0) {
+            boolean hold = outbound ? module.shouldHoldOutboundPacket(packet) : module.shouldHoldInboundPacket(packet);
+            if (delay <= 0 && !hold) {
                 continue;
             }
             int priority = outbound ? module.getOutboundPacketDelayPriority(packet) : module.getInboundPacketDelayPriority(packet);
@@ -195,9 +256,10 @@ public final class ModuleManager {
                 selected = module;
                 selectedDelay = delay;
                 selectedPriority = priority;
+                selectedHold = hold;
             }
         }
-        return new PacketDelaySelection(selected, selectedDelay, selectedPriority);
+        return new PacketDelaySelection(selected, selectedDelay, selectedPriority, selectedHold);
     }
 
     public void onOutboundPacket(Packet<?> packet) {
@@ -304,6 +366,8 @@ public final class ModuleManager {
     }
 
     public void shutdownForUnload() {
+        CombatActionCoordinator.clear();
+        MouseButtonHelper.releaseAllSynthetic();
         for (Module module : new ArrayList<Module>(modules)) {
             module.forceDisableForUnload();
         }
@@ -313,11 +377,13 @@ public final class ModuleManager {
         private final Module owner;
         private final int delay;
         private final int priority;
+        private final boolean indefinite;
 
-        private PacketDelaySelection(Module owner, int delay, int priority) {
+        private PacketDelaySelection(Module owner, int delay, int priority, boolean indefinite) {
             this.owner = owner;
             this.delay = delay;
             this.priority = priority;
+            this.indefinite = indefinite;
         }
 
         public Module getOwner() {
@@ -334,6 +400,10 @@ public final class ModuleManager {
 
         public int getPriority() {
             return priority;
+        }
+
+        public boolean isIndefinite() {
+            return indefinite;
         }
     }
 }

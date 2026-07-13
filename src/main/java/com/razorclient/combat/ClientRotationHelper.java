@@ -25,6 +25,8 @@ public final class ClientRotationHelper {
 
     public boolean swappedForMouseOver;
     private boolean swappedForWalkingUpdate;
+    private String requestedOwner = "None";
+    private int requestedPriority = Integer.MIN_VALUE;
 
     private ClientRotationHelper() {
         MinecraftForge.EVENT_BUS.register(this);
@@ -57,12 +59,32 @@ public final class ClientRotationHelper {
         rotationsUpdatedThisTick = false;
         swappedForMouseOver = false;
         swappedForWalkingUpdate = false;
+        requestedOwner = "None";
+        requestedPriority = Integer.MIN_VALUE;
     }
 
     public void clearRequestedRotations() {
         serverYaw = null;
         serverPitch = null;
         setRotations = false;
+        requestedOwner = "None";
+        requestedPriority = Integer.MIN_VALUE;
+    }
+
+    public boolean requestRotations(String owner, int priority, float yaw, float pitch) {
+        if (owner == null || priority < requestedPriority || Float.isNaN(yaw) || Float.isNaN(pitch)) {
+            return false;
+        }
+        requestedOwner = owner;
+        requestedPriority = priority;
+        serverYaw = Float.valueOf(yaw);
+        serverPitch = Float.valueOf(pitch);
+        setRotations = true;
+        return true;
+    }
+
+    public String getRequestedOwner() {
+        return requestedOwner;
     }
 
     public void updateServerRotations() {

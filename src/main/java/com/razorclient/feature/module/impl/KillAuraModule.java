@@ -1,5 +1,7 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.combat.CombatTargetService;
+import com.razorclient.combat.CombatActionCoordinator;
 import com.razorclient.combat.ClientRotationHelper;
 import com.razorclient.combat.KillAuraRotationUtils;
 import com.razorclient.event.ClientRotationEvent;
@@ -96,6 +98,13 @@ public final class KillAuraModule extends Module {
         ClientRotationHelper.get().clearRequestedRotations();
     }
 
+    @Override
+    public void onSessionReset() {
+        hitMap.clear();
+        clearTargetState();
+        ClientRotationHelper.get().clearRequestedRotations();
+    }
+
     @SubscribeEvent
     public void onClientRotation(ClientRotationEvent event) {
         Minecraft minecraft = Minecraft.getMinecraft();
@@ -135,8 +144,10 @@ public final class KillAuraModule extends Module {
         }
 
         float[] smooth = KillAuraRotationUtils.smoothRotation(baseYaw, basePitch, rotations[0], rotations[1], SILENT_ROTATION_SPEED, 0.0F);
-        event.yaw = Float.valueOf(smooth[0]);
-        event.pitch = Float.valueOf(smooth[1]);
+        if (ClientRotationHelper.get().requestRotations("KillAura", 100, smooth[0], smooth[1])) {
+            event.yaw = Float.valueOf(smooth[0]);
+            event.pitch = Float.valueOf(smooth[1]);
+        }
     }
 
     @SubscribeEvent
@@ -150,16 +161,13 @@ public final class KillAuraModule extends Module {
         }
 
         int key = minecraft.gameSettings.keyBindAttack.getKeyCode();
-        long now = System.currentTimeMillis();
+        long now = System.nanoTime();
         if (nextClickTime == 0L) {
             nextClickTime = now;
         }
 
-        int clicks = 0;
-        while (nextClickTime <= now) {
-            clicks++;
-            nextClickTime += nextDelay();
-        }
+        if (nextClickTime > now) return;
+        nextClickTime = now + (nextDelay() * 1000000L);
 
         if (!basicCondition(minecraft) || !settingCondition(minecraft)) {
             return;
@@ -168,10 +176,10 @@ public final class KillAuraModule extends Module {
             return;
         }
 
-        for (int i = 0; i < clicks; i++) {
-            KeyBinding.onTick(key);
-            MouseButtonHelper.setButton(0, true);
-        }
+        if (!CombatActionCoordinator.tryAcquire("KillAura")) return;
+        KeyBinding.onTick(key);
+        MouseButtonHelper.setButton(0, true);
+        MouseButtonHelper.setButton(0, false);
     }
 
     public boolean shouldOverrideMouseOver() {
@@ -181,6 +189,19 @@ public final class KillAuraModule extends Module {
             && attackingEntity != null
             && target == attackingEntity
             && targetDistance <= swingRange.getValue();
+    }
+
+    public boolean isActivelyOwningRotation() {
+        return isEnabled() && target != null && targetDistance <= aimRange.getValue();
+    }
+
+    public boolean isActivelyAttacking() {
+        return isEnabled() && attackingEntity != null && targetDistance <= swingRange.getValue();
+    }
+
+    @Override
+    public String getHudInfo() {
+        return target == null ? "No target" : target.getName() + " " + String.format(java.util.Locale.ROOT, "%.1f", targetDistance);
     }
 
     public void modifyMouseOverFromGetMouseOver(float partialTicks) {
@@ -229,12 +250,8 @@ public final class KillAuraModule extends Module {
     private void handleTarget(Minecraft minecraft) {
         double maxRange = Math.max(attackRange.getValue(), aimRange.getValue());
         List<KillAuraTarget> candidates = new ArrayList<KillAuraTarget>();
-        for (Object object : minecraft.theWorld.loadedEntityList) {
-            if (!(object instanceof Entity)) {
-                continue;
-            }
-
-            Candidate candidate = getCandidateTarget(minecraft, (Entity) object, maxRange);
+        for (EntityLivingBase living : CombatTargetService.candidates(minecraft)) {
+            Candidate candidate = getCandidateTarget(minecraft, living, maxRange);
             if (candidate == null) {
                 continue;
             }
@@ -283,31 +300,17 @@ public final class KillAuraModule extends Module {
     }
 
     private Candidate getCandidateTarget(Minecraft minecraft, Entity entity, double maxRange) {
-        if (!(entity instanceof EntityLivingBase) || entity == minecraft.thePlayer || entity.isDead) {
+        if (!(entity instanceof EntityLivingBase)) {
             return null;
         }
 
         EntityLivingBase living = (EntityLivingBase) entity;
-        if (living.deathTime != 0 || living.getHealth() <= 0.0F) {
-            return null;
-        }
-        if (living instanceof EntityPlayer) {
-            if (!targetType.getValue().targetsPlayers() || AntiBotModule.shouldIgnore((EntityPlayer) living)) {
-                return null;
-            }
-        } else if (!targetType.getValue().targetsMobs()) {
-            return null;
-        }
-        if (entity.isInvisible() && !targetInvis.isEnabled()) {
+        if (!CombatTargetService.isValid(minecraft, living, targetType.getValue().targetsPlayers(),
+                targetType.getValue().targetsMobs(), targetInvis.isEnabled(), false, false, maxRange)) {
             return null;
         }
 
-        double distance = KillAuraRotationUtils.distanceFromEyeToClosestOnAABB(entity);
-        if (distance > maxRange) {
-            return null;
-        }
-
-        return new Candidate(living, distance);
+        return new Candidate(living, CombatTargetService.distanceToHitbox(minecraft, living));
     }
 
     private KillAuraTarget buildKillAuraTarget(EntityLivingBase entity, double distanceToBoundingBox, double maxRange) {
@@ -445,6 +448,7 @@ public final class KillAuraModule extends Module {
         }
 
         target = (EntityLivingBase) entity;
+        CombatTargetService.publishTarget(Minecraft.getMinecraft(), target, 100);
     }
 
     private void clearTargetState() {
