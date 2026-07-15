@@ -4,7 +4,7 @@ import com.razorclient.config.ConfigManager;
 
 public final class EnumSetting<T extends Enum<T>> extends Setting {
     private final T[] values;
-    private int index;
+    private volatile int index;
 
     public EnumSetting(String name, T[] values, T initial) {
         super(name);

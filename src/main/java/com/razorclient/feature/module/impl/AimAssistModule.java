@@ -1,5 +1,8 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.RazorClient;
+import com.razorclient.combat.ClientRotationHelper;
+import com.razorclient.combat.CombatTargetService;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
@@ -28,6 +31,7 @@ public final class AimAssistModule extends Module {
     private final NumberSetting randomization = new NumberSetting("Randomization", 0, 30, 1, 0);
     private final NumberSetting fov = new NumberSetting("FOV", 15, 360, 1, 90);
     private final DecimalSetting distance = new DecimalSetting("Distance", 1.0D, 10.0D, 0.5D, 4.5D);
+    private final DecimalSetting minimumRange = new DecimalSetting("Minimum Range", 0.0D, 9.5D, 0.5D, 0.0D);
     private final EnumSetting<TargetType> targetType = new EnumSetting<TargetType>("Target Type", TargetType.values(), TargetType.PLAYERS);
     private final BooleanSetting clickAim = new BooleanSetting("Click Aim", true);
     private final BooleanSetting weaponOnly = new BooleanSetting("Weapon Only", false);
@@ -48,13 +52,23 @@ public final class AimAssistModule extends Module {
     private final BooleanSetting requireSprinting = new BooleanSetting("Require Sprinting", false);
     private final BooleanSetting ignoreTeammates = new BooleanSetting("Ignore Teammates", true);
     private final BooleanSetting requireVisibility = new BooleanSetting("Require Visibility", false);
+    private final BooleanSetting keepMoveDirection = new BooleanSetting("Keep Move Direction", true);
+    private final BooleanSetting ignoreManualAim = new BooleanSetting("Ignore Manual Aim", false);
 
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
     private EntityLivingBase lockedTarget;
     private long lastRenderUpdateNanos = -1L;
     private float lastObservedYaw;
     private float lastObservedPitch;
     private boolean haveObservedRotation;
+    private float silentYaw;
+    private float silentPitch;
+    private boolean silentRotationInitialized;
+    private volatile float desiredSilentYaw;
+    private volatile float desiredSilentPitch;
+    private volatile long desiredSilentAtNanos;
+    private volatile boolean desiredSilentRotation;
+    private String status = "Ready";
 
     public AimAssistModule() {
         super("AimAssist", "Smoothly nudges your aim toward selected targets.", Category.COMBAT, Keyboard.KEY_NONE);
@@ -62,6 +76,7 @@ public final class AimAssistModule extends Module {
         addSetting(randomization);
         addSetting(fov);
         addSetting(distance);
+        addSetting(minimumRange);
         addSetting(targetType);
         addSetting(clickAim);
         addSetting(weaponOnly);
@@ -81,6 +96,8 @@ public final class AimAssistModule extends Module {
         addSetting(requireSprinting);
         addSetting(ignoreTeammates);
         addSetting(requireVisibility);
+        addSetting(keepMoveDirection);
+        addSetting(ignoreManualAim);
     }
 
     @Override
@@ -91,6 +108,28 @@ public final class AimAssistModule extends Module {
     @Override
     protected void onDisable() {
         resetState();
+    }
+
+    @Override
+    public void onSessionReset() {
+        resetState();
+    }
+
+    @Override
+    public void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.START || aimMode.getValue() != AimMode.SILENT
+                || !desiredSilentRotation) return;
+        if (System.nanoTime() - desiredSilentAtNanos > 250_000_000L) {
+            clearSilentRotation();
+            return;
+        }
+        if (ClientRotationHelper.get().requestRotations(
+                "AimAssist", 10, desiredSilentYaw, desiredSilentPitch)) {
+            if (keepMoveDirection.isEnabled()) ClientRotationHelper.get().fixMovementInputs();
+            status = "Silent";
+        } else {
+            status = "Suppressed: " + ClientRotationHelper.get().getRequestedOwner();
+        }
     }
 
     @Override
@@ -119,15 +158,47 @@ public final class AimAssistModule extends Module {
             return;
         }
 
+        boolean silent = aimMode.getValue() == AimMode.SILENT;
+        if (silent && (isKillAuraOwningRotation() || (!ignoreManualAim.isEnabled() && userMovedMouse))) {
+            clearSilentRotation();
+            status = isKillAuraOwningRotation()
+                ? "Suppressed: " + ClientRotationHelper.get().getRequestedOwner() : "Manual";
+            return;
+        }
+        if (!silent) {
+            clearSilentRotation();
+        }
+
         TargetSnapshot target = selectTarget(minecraft, currentYaw, currentPitch);
         if (target == null) {
             lockedTarget = null;
+            clearSilentRotation();
+            status = "No target";
             return;
         }
+        CombatTargetService.publishTarget(minecraft, target.entity, 50);
 
         float deltaSeconds = consumeDeltaSeconds();
-        Rotation rotation = rotateToward(currentYaw, currentPitch, target.yaw, target.pitch, deltaSeconds);
+        if (silent && !silentRotationInitialized) {
+            silentYaw = currentYaw;
+            silentPitch = currentPitch;
+            silentRotationInitialized = true;
+        }
+        float rotationBaseYaw = silent ? silentYaw : currentYaw;
+        float rotationBasePitch = silent ? silentPitch : currentPitch;
+        Rotation rotation = rotateToward(rotationBaseYaw, rotationBasePitch, target.yaw, target.pitch, deltaSeconds);
+        if (silent) {
+            silentYaw = rotation.yaw;
+            silentPitch = rotation.pitch;
+            desiredSilentYaw = rotation.yaw;
+            desiredSilentPitch = rotation.pitch;
+            desiredSilentAtNanos = System.nanoTime();
+            desiredSilentRotation = true;
+            status = "Silent";
+            return;
+        }
         applyClientRotations(minecraft, rotation.yaw, rotation.pitch);
+        status = target.entity.getName();
     }
 
     private TargetSnapshot selectTarget(Minecraft minecraft, float baseYaw, float basePitch) {
@@ -139,12 +210,8 @@ public final class AimAssistModule extends Module {
         }
 
         TargetSnapshot best = null;
-        for (Object object : minecraft.theWorld.loadedEntityList) {
-            if (!(object instanceof EntityLivingBase)) {
-                continue;
-            }
-
-            TargetSnapshot candidate = snapshotFor(minecraft, (EntityLivingBase) object, baseYaw, basePitch, maximumDistance, false);
+        for (EntityLivingBase living : CombatTargetService.candidates(minecraft)) {
+            TargetSnapshot candidate = snapshotFor(minecraft, living, baseYaw, basePitch, maximumDistance, false);
             if (candidate != null && (best == null || compare(candidate, best) < 0)) {
                 best = candidate;
             }
@@ -171,7 +238,7 @@ public final class AimAssistModule extends Module {
         }
 
         double eyeDistance = minecraft.thePlayer.getPositionEyes(1.0F).distanceTo(aimPoint);
-        if (eyeDistance > maximumDistance) {
+        if (eyeDistance < minimumRange.getValue() || eyeDistance > maximumDistance) {
             return null;
         }
 
@@ -193,27 +260,9 @@ public final class AimAssistModule extends Module {
     }
 
     private boolean isValidTarget(Minecraft minecraft, EntityLivingBase candidate, double maximumDistance) {
-        if (candidate == null || candidate == minecraft.thePlayer || candidate.isDead || candidate.deathTime != 0
-                || candidate.getHealth() <= 0.0F) {
-            return false;
-        }
-        if (candidate instanceof EntityPlayer) {
-            if (!targetType.getValue().targetsPlayers() || AntiBotModule.shouldIgnore((EntityPlayer) candidate)) {
-                return false;
-            }
-            if (ignoreTeammates.isEnabled() && minecraft.thePlayer.isOnSameTeam(candidate)) {
-                return false;
-            }
-        } else if (!targetType.getValue().targetsMobs()) {
-            return false;
-        }
-        if (candidate.isInvisible() && !targetInvis.isEnabled()) {
-            return false;
-        }
-        if (requireVisibility.isEnabled() && !minecraft.thePlayer.canEntityBeSeen(candidate)) {
-            return false;
-        }
-        return minecraft.thePlayer.getDistanceToEntity(candidate) <= maximumDistance + 1.0D;
+        return CombatTargetService.isValid(minecraft, candidate, targetType.getValue().targetsPlayers(),
+            targetType.getValue().targetsMobs(), targetInvis.isEnabled(), requireVisibility.isEnabled(),
+            ignoreTeammates.isEnabled(), maximumDistance);
     }
 
     private Vec3 createAimPoint(Minecraft minecraft, EntityLivingBase entity) {
@@ -336,11 +385,34 @@ public final class AimAssistModule extends Module {
     private void resetTargetTiming() {
         lockedTarget = null;
         lastRenderUpdateNanos = -1L;
+        clearSilentRotation();
+    }
+
+    private void clearSilentRotation() {
+        silentRotationInitialized = false;
+        desiredSilentRotation = false;
+        ClientRotationHelper.get().clearRequestedRotations("AimAssist");
     }
 
     private void resetState() {
         resetTargetTiming();
         haveObservedRotation = false;
+        status = "Ready";
+        CombatTargetService.clear();
+    }
+
+    @Override
+    public String getHudInfo() {
+        return status;
+    }
+
+    private boolean isKillAuraOwningRotation() {
+        RazorClient client = RazorClient.getInstance();
+        if (client == null) {
+            return false;
+        }
+        KillAuraModule aura = client.getModuleManager().getModule(KillAuraModule.class);
+        return aura != null && aura.isActivelyOwningRotation();
     }
 
     private static double clamp(double value, double minimum, double maximum) {
@@ -392,7 +464,7 @@ public final class AimAssistModule extends Module {
     }
 
     private enum AimMode {
-        REGULAR("Regular"), LINEAR("Linear"), LOCK_ON("Lock On");
+        REGULAR("Regular"), LINEAR("Linear"), LOCK_ON("Lock On"), SILENT("Silent");
         private final String label;
         AimMode(String label) { this.label = label; }
         @Override public String toString() { return label; }

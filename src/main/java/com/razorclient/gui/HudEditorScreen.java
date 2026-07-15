@@ -1,5 +1,6 @@
 package com.razorclient.gui;
 
+import com.razorclient.config.ConfigManager;
 import com.razorclient.feature.module.impl.ClickGuiModule;
 import com.razorclient.feature.module.impl.HudModule;
 import net.minecraft.client.gui.Gui;
@@ -27,6 +28,7 @@ public final class HudEditorScreen extends GuiScreen {
         if (hudModule == null) {
             drawCenteredString(this.fontRendererObj, "HUD module missing", this.width / 2, this.height / 2, 0xFFFFFFFF);
             super.drawScreen(mouseX, mouseY, partialTicks);
+            GuiCursor.draw(mouseX, mouseY);
             return;
         }
 
@@ -39,6 +41,10 @@ public final class HudEditorScreen extends GuiScreen {
 
     @Override
     public void onGuiClosed() {
+        if (hudModule != null) {
+            hudModule.editorMouseReleased();
+        }
+        ConfigManager.flushPendingSaveNow();
         super.onGuiClosed();
         GuiCursor.exitGui();
     }

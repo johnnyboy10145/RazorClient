@@ -1,393 +1,369 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.RazorClient;
+import com.razorclient.combat.CombatTargetService;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import java.nio.FloatBuffer;
+import java.nio.IntBuffer;
 import java.util.Locale;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.FontRenderer;
+import net.minecraft.client.gui.Gui;
+import net.minecraft.client.gui.ScaledResolution;
 import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.entity.monster.EntityMob;
+import net.minecraft.entity.passive.EntityAnimal;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.scoreboard.Team;
-import net.minecraft.util.AxisAlignedBB;
+import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
+import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
+import com.razorclient.runtime.FrameContext;
+import net.minecraftforge.client.event.RenderGameOverlayEvent;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
+import org.lwjgl.BufferUtils;
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.opengl.GL11;
+import org.lwjgl.util.glu.GLU;
 
 public final class PlayerEspModule extends Module {
     private static final int[] CHAT_COLORS = {
-        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA,
-        0xAA0000, 0xAA00AA, 0xFFAA00, 0xAAAAAA,
-        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF,
-        0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
+        0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xFFAA00, 0xAAAAAA,
+        0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
     };
+    private static final int MAX_SNAPSHOTS = 256;
 
     private final EnumSetting<Mode> mode = new EnumSetting<Mode>("Mode", Mode.values(), Mode.MODERN);
     private final EnumSetting<RenderMode> renderMode = new EnumSetting<RenderMode>("Render Mode", RenderMode.values(), RenderMode.BOTH);
-    private final NumberSetting red = new NumberSetting("Red", 0, 255, 5, 255);
-    private final NumberSetting green = new NumberSetting("Green", 0, 255, 5, 60);
-    private final NumberSetting blue = new NumberSetting("Blue", 0, 255, 5, 60);
+    private final EnumSetting<ProjectionMode> projectionMode = new EnumSetting<ProjectionMode>("Projection Mode", ProjectionMode.values(), ProjectionMode.BOTH);
+    private final EnumSetting<TargetType> targetType = new EnumSetting<TargetType>("Target Type", TargetType.values(), TargetType.BOTH);
+    private final NumberSetting red = new NumberSetting("Red", 0, 255, 5, 45);
+    private final NumberSetting green = new NumberSetting("Green", 0, 255, 5, 210);
+    private final NumberSetting blue = new NumberSetting("Blue", 0, 255, 5, 110);
+    private final NumberSetting hiddenRed = new NumberSetting("Hidden Red", 0, 255, 5, 235);
+    private final NumberSetting hiddenGreen = new NumberSetting("Hidden Green", 0, 255, 5, 70);
+    private final NumberSetting hiddenBlue = new NumberSetting("Hidden Blue", 0, 255, 5, 70);
+    private final NumberSetting targetRed = new NumberSetting("Target Red", 0, 255, 5, 255);
+    private final NumberSetting targetGreen = new NumberSetting("Target Green", 0, 255, 5, 190);
+    private final NumberSetting targetBlue = new NumberSetting("Target Blue", 0, 255, 5, 70);
     private final BooleanSetting seeInvis = new BooleanSetting("See Invis", false);
+    private final BooleanSetting throughWalls = new BooleanSetting("Through Walls", true);
     private final BooleanSetting showNames = new BooleanSetting("Show Names", true);
     private final BooleanSetting showHealth = new BooleanSetting("Show Health", true);
+    private final BooleanSetting healthBar = new BooleanSetting("Health Bar", true);
+    private final BooleanSetting healthValue = new BooleanSetting("Health Value", true);
     private final BooleanSetting showDistance = new BooleanSetting("Show Distance", true);
+    private final BooleanSetting showArmor = new BooleanSetting("Armor", true);
+    private final BooleanSetting showHeldItem = new BooleanSetting("Held Item", true);
+    private final BooleanSetting tracers = new BooleanSetting("Tracers", false);
+    private final BooleanSetting targetHighlight = new BooleanSetting("Target Highlight", true);
     private final BooleanSetting useTeamColors = new BooleanSetting("Use Team Colors", true);
     private final NumberSetting maxDistance = new NumberSetting("Max Distance", 8, 256, 1, 96);
     private final NumberSetting lineWidth = new NumberSetting("Line Width", 1, 5, 1, 2);
     private final NumberSetting fillAlpha = new NumberSetting("Fill Alpha", 0, 100, 1, 12);
 
+    private final FloatBuffer modelView = BufferUtils.createFloatBuffer(16);
+    private final FloatBuffer projection = BufferUtils.createFloatBuffer(16);
+    private final IntBuffer viewport = BufferUtils.createIntBuffer(16);
+    private final FloatBuffer projectedPoint = BufferUtils.createFloatBuffer(3);
+    private final EntitySnapshot[] renderSnapshots = new EntitySnapshot[MAX_SNAPSHOTS];
+    private final int[] renderTeamColors = new int[MAX_SNAPSHOTS];
+    private final ProjectedSnapshot[] projected = new ProjectedSnapshot[MAX_SNAPSHOTS];
+    private volatile SnapshotFrame snapshots;
+    private int renderSnapshotCount;
+    private int projectedCount;
+    private int activeTargetId = -1;
+    private volatile int renderedCount;
+
     public PlayerEspModule() {
-        super("PlayerESP", "Draws boxes and labels around other players through walls.", Category.RENDER, Keyboard.KEY_NONE);
-        red.setVisibility(new java.util.function.BooleanSupplier() {
-            @Override
-            public boolean getAsBoolean() {
-                return mode.getValue() == Mode.CLASSIC;
-            }
-        });
-        green.setVisibility(new java.util.function.BooleanSupplier() {
-            @Override
-            public boolean getAsBoolean() {
-                return mode.getValue() == Mode.CLASSIC;
-            }
-        });
-        blue.setVisibility(new java.util.function.BooleanSupplier() {
-            @Override
-            public boolean getAsBoolean() {
-                return mode.getValue() == Mode.CLASSIC;
-            }
-        });
-        addSetting(mode);
-        addSetting(renderMode);
-        addSetting(red);
-        addSetting(green);
-        addSetting(blue);
-        addSetting(seeInvis);
-        addSetting(showNames);
-        addSetting(showHealth);
-        addSetting(showDistance);
-        addSetting(maxDistance);
-        addSetting(lineWidth);
-        addSetting(fillAlpha);
-        addSetting(useTeamColors);
+        super("PlayerESP", "Local-only 2D and 3D entity overlay.", Category.RENDER, Keyboard.KEY_NONE);
+        java.util.function.BooleanSupplier customColors = () -> mode.getValue() == Mode.CLASSIC;
+        red.setVisibility(customColors);
+        green.setVisibility(customColors);
+        blue.setVisibility(customColors);
+        healthBar.setVisibility(() -> showHealth.isEnabled());
+        healthValue.setVisibility(() -> showHealth.isEnabled());
+        addSetting(mode); addSetting(renderMode); addSetting(projectionMode); addSetting(targetType);
+        addSetting(red); addSetting(green); addSetting(blue);
+        addSetting(hiddenRed); addSetting(hiddenGreen); addSetting(hiddenBlue);
+        addSetting(targetRed); addSetting(targetGreen); addSetting(targetBlue);
+        addSetting(seeInvis); addSetting(throughWalls); addSetting(showNames); addSetting(showHealth);
+        addSetting(healthBar); addSetting(healthValue); addSetting(showDistance); addSetting(showArmor);
+        addSetting(showHeldItem); addSetting(tracers); addSetting(targetHighlight); addSetting(maxDistance);
+        addSetting(lineWidth); addSetting(fillAlpha); addSetting(useTeamColors);
+    }
+
+    @Override
+    public void onClientTick() {
+        Minecraft mc = Minecraft.getMinecraft();
+        RazorClient client = RazorClient.getInstance();
+        if (client == null || mc.theWorld == null || mc.thePlayer == null) {
+            clearRenderState();
+            return;
+        }
+        snapshots = client.getModuleManager().getEntitySnapshots().current();
     }
 
     @Override
     public void onRenderWorld(RenderWorldLastEvent event) {
-        Minecraft minecraft = Minecraft.getMinecraft();
-        if (minecraft == null || minecraft.theWorld == null || minecraft.thePlayer == null || minecraft.getRenderManager() == null) {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.theWorld == null || mc.thePlayer == null || mc.getRenderManager() == null) return;
+        prepareRenderSnapshots(mc);
+        projectedCount = 0;
+        RazorClient client = RazorClient.getInstance();
+        FrameContext frame = client == null ? null : client.getModuleManager().getFrameContext();
+        if (projectionMode.getValue().draws3d()) render3d(mc, frame, event.partialTicks);
+        if (projectionMode.getValue().draws2d()) project2d(mc, frame, event.partialTicks);
+    }
+
+    @Override
+    public void onRenderOverlay(RenderGameOverlayEvent.Text event) {
+        if (!projectionMode.getValue().draws2d() || projectedCount == 0) return;
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.currentScreen != null || mc.fontRendererObj == null) return;
+        render2d(mc, event.resolution);
+    }
+
+    @Override protected void onDisable() { clearRenderState(); }
+    @Override public void onSessionReset() { clearRenderState(); }
+    @Override public void onInputContextLost() { projectedCount = 0; }
+
+    private boolean isEligible(Minecraft mc, EntitySnapshot snapshot, double limit) {
+        if (snapshot == null || snapshot.isDead()) return false;
+        boolean player = snapshot.isPlayer();
+        boolean mob = snapshot.getEntity() instanceof EntityMob || snapshot.getEntity() instanceof EntityAnimal;
+        if ((player && !targetType.getValue().players) || (mob && !targetType.getValue().mobs) || (!player && !mob)) return false;
+        if (snapshot.getDistanceToHitbox() > limit || (!throughWalls.isEnabled() && !snapshot.isVisible())) return false;
+        return CombatTargetService.isValid(mc, snapshot.getEntity(), player, mob, seeInvis.isEnabled(), false, false, limit);
+    }
+
+    private void prepareRenderSnapshots(Minecraft mc) {
+        renderSnapshotCount = 0;
+        SnapshotFrame frame = snapshots;
+        if (frame == null) {
+            renderedCount = 0;
             return;
         }
-
-        float partialTicks = event == null ? 0.0F : event.partialTicks;
-        RenderMode currentRenderMode = renderMode.getValue();
-        boolean drawBox = currentRenderMode == RenderMode.BOX || currentRenderMode == RenderMode.BOTH;
-        boolean drawOutline = currentRenderMode == RenderMode.OUTLINE || currentRenderMode == RenderMode.BOTH;
-        if (!drawBox && !drawOutline && !showNames.isEnabled()) {
-            return;
+        activeTargetId = CombatTargetService.getPublishedTargetId(mc);
+        double limit = maxDistance.getValue();
+        for (int i = 0; i < frame.size() && renderSnapshotCount < MAX_SNAPSHOTS; i++) {
+            EntitySnapshot snapshot = frame.get(i);
+            if (!isEligible(mc, snapshot, limit)) continue;
+            renderSnapshots[renderSnapshotCount] = snapshot;
+            renderTeamColors[renderSnapshotCount] = snapshot.isPlayer()
+                ? getTeamColor((EntityPlayer) snapshot.getEntity()) : -1;
+            renderSnapshotCount++;
         }
+        renderedCount = renderSnapshotCount;
+    }
 
-        double maxDistanceSq = maxDistance.getValue() * maxDistance.getValue();
-        double viewerX = minecraft.getRenderManager().viewerPosX;
-        double viewerY = minecraft.getRenderManager().viewerPosY;
-        double viewerZ = minecraft.getRenderManager().viewerPosZ;
-
-        GL11.glPushAttrib(GL11.GL_ENABLE_BIT | GL11.GL_CURRENT_BIT | GL11.GL_LINE_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+    private void render3d(Minecraft mc, FrameContext frame, float partialTicks) {
+        double viewX = frame == null ? mc.getRenderManager().viewerPosX : frame.getCameraX();
+        double viewY = frame == null ? mc.getRenderManager().viewerPosY : frame.getCameraY();
+        double viewZ = frame == null ? mc.getRenderManager().viewerPosZ : frame.getCameraZ();
+        GL11.glPushAttrib(GL11.GL_ALL_ATTRIB_BITS);
         GL11.glPushMatrix();
         try {
-            GlStateManager.disableTexture2D();
-            GlStateManager.enableBlend();
+            GlStateManager.disableTexture2D(); GlStateManager.enableBlend();
             GlStateManager.tryBlendFuncSeparate(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA, 1, 0);
-            GlStateManager.disableDepth();
-            GlStateManager.depthMask(false);
-            GlStateManager.disableLighting();
-            GlStateManager.disableCull();
-            GL11.glLineWidth((float) lineWidth.getValue());
-
-            for (Object object : minecraft.theWorld.playerEntities) {
-                if (!(object instanceof EntityPlayer)) {
-                    continue;
-                }
-
-                EntityPlayer player = (EntityPlayer) object;
-                if (!shouldRender(minecraft, player, maxDistanceSq)) {
-                    continue;
-                }
-
-                double x = interpolate(player.lastTickPosX, player.posX, partialTicks) - viewerX;
-                double y = interpolate(player.lastTickPosY, player.posY, partialTicks) - viewerY;
-                double z = interpolate(player.lastTickPosZ, player.posZ, partialTicks) - viewerZ;
-
-                AxisAlignedBB bb = player.getEntityBoundingBox();
-                if (bb == null) {
-                    continue;
-                }
-
-                AxisAlignedBB renderBox = new AxisAlignedBB(
-                    bb.minX - player.posX + x,
-                    bb.minY - player.posY + y,
-                    bb.minZ - player.posZ + z,
-                    bb.maxX - player.posX + x,
-                    bb.maxY - player.posY + y,
-                    bb.maxZ - player.posZ + z
-                ).expand(0.05D, 0.1D, 0.05D);
-
-                float[] colors = getColor(player);
-                if (drawBox) {
-                    drawFilledBox(renderBox, colors[0], colors[1], colors[2], (float) (fillAlpha.getValue() / 100.0D));
-                }
-                if (drawOutline) {
-                    drawOutlinedBox(renderBox, colors[0], colors[1], colors[2], mode.getValue() == Mode.MODERN ? 0.95F : 1.0F);
-                }
+            GlStateManager.disableLighting(); GlStateManager.disableCull();
+            if (throughWalls.isEnabled()) { GlStateManager.disableDepth(); GlStateManager.depthMask(false); }
+            GL11.glLineWidth(lineWidth.getValue());
+            for (int index = 0; index < renderSnapshotCount; index++) {
+                EntitySnapshot snapshot = renderSnapshots[index];
+                int color = colorFor(snapshot, renderTeamColors[index]);
+                float r = ((color >>> 16) & 255) / 255.0F;
+                float g = ((color >>> 8) & 255) / 255.0F;
+                float b = (color & 255) / 255.0F;
+                double offsetX = snapshot.interpolateX(partialTicks) - snapshot.getX();
+                double offsetY = snapshot.interpolateY(partialTicks) - snapshot.getY();
+                double offsetZ = snapshot.interpolateZ(partialTicks) - snapshot.getZ();
+                double minX = snapshot.getMinX() + offsetX - viewX - 0.04D;
+                double minY = snapshot.getMinY() + offsetY - viewY - 0.08D;
+                double minZ = snapshot.getMinZ() + offsetZ - viewZ - 0.04D;
+                double maxX = snapshot.getMaxX() + offsetX - viewX + 0.04D;
+                double maxY = snapshot.getMaxY() + offsetY - viewY + 0.08D;
+                double maxZ = snapshot.getMaxZ() + offsetZ - viewZ + 0.04D;
+                if (renderMode.getValue().fill) drawFilledBox(minX, minY, minZ, maxX, maxY, maxZ, r, g, b, fillAlpha.getValue() / 100.0F);
+                if (renderMode.getValue().outline) drawOutlinedBox(minX, minY, minZ, maxX, maxY, maxZ, r, g, b, 1.0F);
             }
         } finally {
-            GL11.glLineWidth(1.0F);
-            GlStateManager.enableCull();
-            GlStateManager.disableLighting();
-            GlStateManager.depthMask(true);
-            GlStateManager.enableDepth();
-            GlStateManager.disableBlend();
-            GlStateManager.enableTexture2D();
-            GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
-            GL11.glColor4f(1.0F, 1.0F, 1.0F, 1.0F);
-            GL11.glPopMatrix();
-            GL11.glPopAttrib();
-        }
-
-        if (showNames.isEnabled()) {
-            renderLabels(minecraft, partialTicks, maxDistanceSq);
+            GlStateManager.depthMask(true); GlStateManager.enableDepth(); GlStateManager.enableCull();
+            GlStateManager.enableTexture2D(); GlStateManager.disableBlend();
+            GlStateManager.color(1, 1, 1, 1); GL11.glLineWidth(1.0F);
+            GL11.glPopMatrix(); GL11.glPopAttrib();
         }
     }
 
-    private boolean shouldRender(Minecraft minecraft, EntityPlayer player, double maxDistanceSq) {
-        return player != minecraft.thePlayer
-            && !player.isDead
-            && (seeInvis.isEnabled() || !player.isInvisible())
-            && !AntiBotModule.shouldIgnore(player)
-            && player.getDistanceSqToEntity(minecraft.thePlayer) <= maxDistanceSq;
-    }
-
-    private void renderLabels(Minecraft minecraft, float partialTicks, double maxDistanceSq) {
-        FontRenderer font = minecraft.fontRendererObj;
-        if (font == null) {
+    private void project2d(Minecraft mc, FrameContext frame, float partialTicks) {
+        if (frame == null || !frame.isProjectionValid()) {
+            projectedCount = 0;
             return;
         }
 
-        double viewerX = minecraft.getRenderManager().viewerPosX;
-        double viewerY = minecraft.getRenderManager().viewerPosY;
-        double viewerZ = minecraft.getRenderManager().viewerPosZ;
-
-        for (Object object : minecraft.theWorld.playerEntities) {
-            if (!(object instanceof EntityPlayer)) {
-                continue;
+        modelView.clear(); projection.clear(); viewport.clear();
+        for (int i = 0; i < 16; i++) modelView.put(frame.getModelView(i));
+        for (int i = 0; i < 16; i++) projection.put(frame.getProjection(i));
+        for (int i = 0; i < 4; i++) viewport.put(frame.getViewport(i));
+        modelView.flip(); projection.flip(); viewport.flip();
+        int scaledWidth = frame.getScaledWidth();
+        int scaledHeight = frame.getScaledHeight();
+        double viewerX = frame.getCameraX();
+        double viewerY = frame.getCameraY();
+        double viewerZ = frame.getCameraZ();
+        for (int index = 0; index < renderSnapshotCount; index++) {
+            EntitySnapshot snapshot = renderSnapshots[index];
+            double offsetX = snapshot.interpolateX(partialTicks) - snapshot.getX();
+            double offsetY = snapshot.interpolateY(partialTicks) - snapshot.getY();
+            double offsetZ = snapshot.interpolateZ(partialTicks) - snapshot.getZ();
+            float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
+            boolean any = false;
+            for (int corner = 0; corner < 8; corner++) {
+                double x = ((corner & 1) == 0 ? snapshot.getMinX() : snapshot.getMaxX()) + offsetX - viewerX;
+                double y = ((corner & 2) == 0 ? snapshot.getMinY() : snapshot.getMaxY()) + offsetY - viewerY;
+                double z = ((corner & 4) == 0 ? snapshot.getMinZ() : snapshot.getMaxZ()) + offsetZ - viewerZ;
+                projectedPoint.clear();
+                if (!GLU.gluProject((float) x, (float) y, (float) z, modelView, projection, viewport, projectedPoint)) continue;
+                float depth = projectedPoint.get(2);
+                if (depth < 0.0F || depth > 1.0F) continue;
+                float sx = projectedPoint.get(0) * scaledWidth / Math.max(1.0F, mc.displayWidth);
+                float sy = (mc.displayHeight - projectedPoint.get(1)) * scaledHeight / Math.max(1.0F, mc.displayHeight);
+                minX = Math.min(minX, sx); minY = Math.min(minY, sy); maxX = Math.max(maxX, sx); maxY = Math.max(maxY, sy); any = true;
             }
-
-            EntityPlayer player = (EntityPlayer) object;
-            if (!shouldRender(minecraft, player, maxDistanceSq)) {
-                continue;
+            if (any && maxX >= 0 && maxY >= 0 && minX <= scaledWidth && minY <= scaledHeight) {
+                ProjectedSnapshot output = projected[projectedCount];
+                if (output == null) projected[projectedCount] = output = new ProjectedSnapshot();
+                output.set(snapshot, renderTeamColors[index], minX, minY, maxX, maxY);
+                projectedCount++;
             }
-
-            String label = buildLabel(minecraft, player);
-            if (label.isEmpty()) {
-                continue;
-            }
-
-            double x = interpolate(player.lastTickPosX, player.posX, partialTicks) - viewerX;
-            double y = interpolate(player.lastTickPosY, player.posY, partialTicks) - viewerY + player.height + 0.55D;
-            double z = interpolate(player.lastTickPosZ, player.posZ, partialTicks) - viewerZ;
-            renderLabel(minecraft, font, label, x, y, z, getColor(player));
         }
     }
 
-    private String buildLabel(Minecraft minecraft, EntityPlayer player) {
-        StringBuilder builder = new StringBuilder(player.getName());
-        if (showHealth.isEnabled()) {
-            builder.append(' ').append(Math.round(Math.max(0.0F, player.getHealth()))).append("hp");
-        }
-        if (showDistance.isEnabled()) {
-            builder.append(' ').append(String.format(Locale.US, "%.1fm", player.getDistanceToEntity(minecraft.thePlayer)));
-        }
-        return builder.toString();
-    }
-
-    private void renderLabel(Minecraft minecraft, FontRenderer font, String label, double x, double y, double z, float[] color) {
-        float scale = 0.026F;
-        int width = font.getStringWidth(label) / 2;
-        int textColor = 0xFF000000
-            | (((int) (color[0] * 255.0F) & 255) << 16)
-            | (((int) (color[1] * 255.0F) & 255) << 8)
-            | ((int) (color[2] * 255.0F) & 255);
-
-        GL11.glPushAttrib(GL11.GL_ENABLE_BIT | GL11.GL_CURRENT_BIT | GL11.GL_DEPTH_BUFFER_BIT);
+    private void render2d(Minecraft mc, ScaledResolution resolution) {
+        FontRenderer font = mc.fontRendererObj;
+        GL11.glPushAttrib(GL11.GL_ALL_ATTRIB_BITS);
         GL11.glPushMatrix();
         try {
-            GlStateManager.translate(x, y, z);
-            GL11.glNormal3f(0.0F, 1.0F, 0.0F);
-            GlStateManager.rotate(-minecraft.getRenderManager().playerViewY, 0.0F, 1.0F, 0.0F);
-            GlStateManager.rotate(minecraft.getRenderManager().playerViewX, 1.0F, 0.0F, 0.0F);
-            GlStateManager.scale(-scale, -scale, scale);
-            GlStateManager.disableLighting();
-            GlStateManager.depthMask(false);
-            GlStateManager.disableDepth();
-            GlStateManager.enableBlend();
-            GlStateManager.tryBlendFuncSeparate(GL11.GL_SRC_ALPHA, GL11.GL_ONE_MINUS_SRC_ALPHA, 1, 0);
-            GlStateManager.enableTexture2D();
-            drawLabelBackground(width);
-            font.drawString(label, -width, 0, textColor);
+            GlStateManager.enableBlend(); GlStateManager.disableDepth(); GlStateManager.depthMask(false);
+            for (int index = 0; index < projectedCount; index++) {
+                ProjectedSnapshot projection = projected[index];
+                EntitySnapshot snapshot = projection.snapshot;
+                int color = 0xFF000000 | colorFor(snapshot, projection.teamColor);
+                int translucent = (fillAlpha.getValue() * 255 / 100 << 24) | (color & 0xFFFFFF);
+                int x1 = Math.round(projection.minX), y1 = Math.round(projection.minY);
+                int x2 = Math.round(projection.maxX), y2 = Math.round(projection.maxY);
+                if (renderMode.getValue().fill) Gui.drawRect(x1, y1, x2, y2, translucent);
+                if (renderMode.getValue().outline) drawScreenBox(x1, y1, x2, y2, color);
+                if (showHealth.isEnabled() && healthBar.isEnabled()) drawHealthBar(snapshot, x1, y1, y2);
+                drawInformation(font, snapshot, x1, y1, x2, y2, color);
+                if (tracers.isEnabled()) drawTracer(resolution, x1 + (x2 - x1) / 2, y2, color);
+            }
         } finally {
-            GlStateManager.disableBlend();
-            GlStateManager.enableDepth();
-            GlStateManager.depthMask(true);
-            GlStateManager.disableLighting();
-            GlStateManager.enableTexture2D();
-            GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
-            GL11.glPopMatrix();
-            GL11.glPopAttrib();
+            GlStateManager.depthMask(true); GlStateManager.enableDepth(); GlStateManager.disableBlend();
+            GlStateManager.enableTexture2D(); GlStateManager.color(1, 1, 1, 1);
+            GL11.glLineWidth(1.0F); GL11.glPopMatrix(); GL11.glPopAttrib();
         }
     }
 
-    private void drawLabelBackground(int halfWidth) {
-        GlStateManager.disableTexture2D();
-        GlStateManager.color(0.0F, 0.0F, 0.0F, 0.45F);
-        GL11.glBegin(GL11.GL_QUADS);
-        GL11.glVertex2f(-halfWidth - 3, -2);
-        GL11.glVertex2f(-halfWidth - 3, 10);
-        GL11.glVertex2f(halfWidth + 3, 10);
-        GL11.glVertex2f(halfWidth + 3, -2);
-        GL11.glEnd();
+    private void drawInformation(FontRenderer font, EntitySnapshot s, int x1, int y1, int x2, int y2, int color) {
+        StringBuilder top = new StringBuilder();
+        if (showNames.isEnabled()) top.append(s.getName());
+        if (showHealth.isEnabled() && healthValue.isEnabled()) append(top, Math.round(s.getHealth()) + "hp");
+        if (showDistance.isEnabled()) append(top, String.format(Locale.ROOT, "%.1fm", s.getDistanceToHitbox()));
+        if (top.length() > 0) font.drawStringWithShadow(top.toString(), (x1 + x2 - font.getStringWidth(top.toString())) / 2.0F, y1 - 10, color);
+        StringBuilder bottom = new StringBuilder();
+        if (showArmor.isEnabled()) append(bottom, "Armor " + s.getArmor());
+        if (showHeldItem.isEnabled() && !s.getHeldItemName().isEmpty()) append(bottom, s.getHeldItemName());
+        if (bottom.length() > 0) font.drawStringWithShadow(bottom.toString(), (x1 + x2 - font.getStringWidth(bottom.toString())) / 2.0F, y2 + 2, 0xFFFFFFFF);
+    }
+
+    private void append(StringBuilder builder, String value) { if (builder.length() > 0) builder.append(" | "); builder.append(value); }
+    private void drawHealthBar(EntitySnapshot s, int x, int top, int bottom) {
+        float ratio = Math.max(0.0F, Math.min(1.0F, s.getHealth() / Math.max(1.0F, s.getMaxHealth())));
+        int filled = Math.round((bottom - top) * ratio);
+        int healthColor = ratio > 0.5F ? 0xFF42D66A : ratio > 0.25F ? 0xFFFFB340 : 0xFFFF4B4B;
+        Gui.drawRect(x - 4, top - 1, x - 2, bottom + 1, 0xAA000000);
+        Gui.drawRect(x - 3, bottom - filled, x - 2, bottom, healthColor);
+    }
+    private void drawScreenBox(int x1, int y1, int x2, int y2, int color) {
+        Gui.drawRect(x1, y1, x2, y1 + lineWidth.getValue(), color); Gui.drawRect(x1, y2 - lineWidth.getValue(), x2, y2, color);
+        Gui.drawRect(x1, y1, x1 + lineWidth.getValue(), y2, color); Gui.drawRect(x2 - lineWidth.getValue(), y1, x2, y2, color);
+    }
+    private void drawTracer(ScaledResolution resolution, int x, int y, int color) {
+        float r = ((color >>> 16) & 255) / 255.0F, g = ((color >>> 8) & 255) / 255.0F, b = (color & 255) / 255.0F;
+        GlStateManager.disableTexture2D(); GL11.glLineWidth(lineWidth.getValue()); GL11.glColor4f(r, g, b, 0.9F);
+        GL11.glBegin(GL11.GL_LINES); GL11.glVertex2f(resolution.getScaledWidth() / 2.0F, resolution.getScaledHeight()); GL11.glVertex2f(x, y); GL11.glEnd();
         GlStateManager.enableTexture2D();
     }
 
-    private void drawOutlinedBox(AxisAlignedBB bb, float r, float g, float b, float a) {
-        GlStateManager.color(r, g, b, a);
-        GL11.glBegin(GL11.GL_LINES);
-
-        vertex(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.minY, bb.minZ);
-        vertex(bb.maxX, bb.minY, bb.minZ, bb.maxX, bb.minY, bb.maxZ);
-        vertex(bb.maxX, bb.minY, bb.maxZ, bb.minX, bb.minY, bb.maxZ);
-        vertex(bb.minX, bb.minY, bb.maxZ, bb.minX, bb.minY, bb.minZ);
-
-        vertex(bb.minX, bb.maxY, bb.minZ, bb.maxX, bb.maxY, bb.minZ);
-        vertex(bb.maxX, bb.maxY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ);
-        vertex(bb.maxX, bb.maxY, bb.maxZ, bb.minX, bb.maxY, bb.maxZ);
-        vertex(bb.minX, bb.maxY, bb.maxZ, bb.minX, bb.maxY, bb.minZ);
-
-        vertex(bb.minX, bb.minY, bb.minZ, bb.minX, bb.maxY, bb.minZ);
-        vertex(bb.maxX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.minZ);
-        vertex(bb.maxX, bb.minY, bb.maxZ, bb.maxX, bb.maxY, bb.maxZ);
-        vertex(bb.minX, bb.minY, bb.maxZ, bb.minX, bb.maxY, bb.maxZ);
-
-        GL11.glEnd();
-    }
-
-    private void drawFilledBox(AxisAlignedBB bb, float r, float g, float b, float a) {
-        GlStateManager.color(r, g, b, a);
-        GL11.glBegin(GL11.GL_QUADS);
-
-        quad(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.minY, bb.minZ, bb.maxX, bb.maxY, bb.minZ, bb.minX, bb.maxY, bb.minZ);
-        quad(bb.minX, bb.minY, bb.maxZ, bb.maxX, bb.minY, bb.maxZ, bb.maxX, bb.maxY, bb.maxZ, bb.minX, bb.maxY, bb.maxZ);
-        quad(bb.minX, bb.minY, bb.minZ, bb.minX, bb.minY, bb.maxZ, bb.minX, bb.maxY, bb.maxZ, bb.minX, bb.maxY, bb.minZ);
-        quad(bb.maxX, bb.minY, bb.minZ, bb.maxX, bb.minY, bb.maxZ, bb.maxX, bb.maxY, bb.maxZ, bb.maxX, bb.maxY, bb.minZ);
-        quad(bb.minX, bb.maxY, bb.minZ, bb.maxX, bb.maxY, bb.minZ, bb.maxX, bb.maxY, bb.maxZ, bb.minX, bb.maxY, bb.maxZ);
-        quad(bb.minX, bb.minY, bb.minZ, bb.maxX, bb.minY, bb.minZ, bb.maxX, bb.minY, bb.maxZ, bb.minX, bb.minY, bb.maxZ);
-
-        GL11.glEnd();
-    }
-
-    private void vertex(double x1, double y1, double z1, double x2, double y2, double z2) {
-        GL11.glVertex3d(x1, y1, z1);
-        GL11.glVertex3d(x2, y2, z2);
-    }
-
-    private void quad(double x1, double y1, double z1, double x2, double y2, double z2, double x3, double y3, double z3, double x4, double y4, double z4) {
-        GL11.glVertex3d(x1, y1, z1);
-        GL11.glVertex3d(x2, y2, z2);
-        GL11.glVertex3d(x3, y3, z3);
-        GL11.glVertex3d(x4, y4, z4);
-    }
-
-    private double interpolate(double previous, double current, float partialTicks) {
-        return previous + (current - previous) * partialTicks;
-    }
-
-    private float[] getColor(EntityPlayer player) {
-        if (useTeamColors.isEnabled()) {
-            int teamColor = getTeamColor(player);
-            if (teamColor >= 0) {
-                return rgb(teamColor);
-            }
+    private int colorFor(EntitySnapshot snapshot, int teamColor) {
+        if (targetHighlight.isEnabled() && snapshot.getEntityId() == activeTargetId) return rgb(targetRed, targetGreen, targetBlue);
+        if (!snapshot.isVisible()) return rgb(hiddenRed, hiddenGreen, hiddenBlue);
+        if (useTeamColors.isEnabled() && teamColor >= 0) return teamColor;
+        if (mode.getValue() == Mode.MODERN) {
+            float wave = (float) ((Math.sin(System.nanoTime() / 340000000.0D + snapshot.getEntityId() * 0.35D) + 1.0D) * 0.5D);
+            return ClickGuiModule.blendColor(ClickGuiModule.getLightAccentColor(), ClickGuiModule.getDarkAccentColor(), wave);
         }
-        return mode.getValue() == Mode.MODERN ? getModernColor(player) : getClassicColor();
+        return rgb(red, green, blue);
     }
-
-    private float[] getClassicColor() {
-        return new float[] {
-            red.getValue() / 255.0F,
-            green.getValue() / 255.0F,
-            blue.getValue() / 255.0F
-        };
-    }
-
-    private float[] getModernColor(EntityPlayer player) {
-        double time = System.currentTimeMillis() / 340.0D;
-        float wave = (float) ((Math.sin(time + (player.getEntityId() * 0.35D)) + 1.0D) * 0.5D);
-        int color = ClickGuiModule.blendColor(ClickGuiModule.getLightAccentColor(), ClickGuiModule.getDarkAccentColor(), wave);
-        return rgb(color);
-    }
-
-    private float[] rgb(int color) {
-        return new float[] {
-            ((color >>> 16) & 255) / 255.0F,
-            ((color >>> 8) & 255) / 255.0F,
-            (color & 255) / 255.0F
-        };
-    }
+    private int rgb(NumberSetting r, NumberSetting g, NumberSetting b) { return r.getValue() << 16 | g.getValue() << 8 | b.getValue(); }
 
     private int getTeamColor(EntityPlayer player) {
-        Team team = player.getTeam();
-        if (team == null) {
-            return -1;
-        }
-        String formatted = team.formatString(player.getName());
-        int marker = formatted.lastIndexOf('\u00A7');
-        if (marker < 0 || marker + 1 >= formatted.length()) {
-            return -1;
-        }
+        Team team = player.getTeam(); if (team == null) return -1;
+        String formatted = team.formatString(player.getName()); int marker = formatted.lastIndexOf('\u00A7');
+        if (marker < 0 || marker + 1 >= formatted.length()) return -1;
         int index = "0123456789abcdef".indexOf(Character.toLowerCase(formatted.charAt(marker + 1)));
         return index >= 0 ? CHAT_COLORS[index] : -1;
     }
 
-    private enum Mode {
-        MODERN("Modern"),
-        CLASSIC("Classic");
+    private void clearRenderState() {
+        snapshots = null;
+        renderSnapshotCount = 0;
+        projectedCount = 0;
+        renderedCount = 0;
+        activeTargetId = -1;
+    }
+    @Override public String getHudInfo() { return projectionMode.getValue() + " " + renderedCount; }
 
-        private final String label;
+    private void drawOutlinedBox(double minX, double minY, double minZ, double maxX, double maxY, double maxZ,
+            float r, float g, float blue, float a) {
+        GlStateManager.color(r, g, blue, a); GL11.glBegin(GL11.GL_LINES);
+        edge(minX,minY,minZ,maxX,minY,minZ); edge(maxX,minY,minZ,maxX,minY,maxZ); edge(maxX,minY,maxZ,minX,minY,maxZ); edge(minX,minY,maxZ,minX,minY,minZ);
+        edge(minX,maxY,minZ,maxX,maxY,minZ); edge(maxX,maxY,minZ,maxX,maxY,maxZ); edge(maxX,maxY,maxZ,minX,maxY,maxZ); edge(minX,maxY,maxZ,minX,maxY,minZ);
+        edge(minX,minY,minZ,minX,maxY,minZ); edge(maxX,minY,minZ,maxX,maxY,minZ); edge(maxX,minY,maxZ,maxX,maxY,maxZ); edge(minX,minY,maxZ,minX,maxY,maxZ); GL11.glEnd();
+    }
+    private void edge(double a,double b,double c,double d,double e,double f){GL11.glVertex3d(a,b,c);GL11.glVertex3d(d,e,f);}
+    private void drawFilledBox(double minX, double minY, double minZ, double maxX, double maxY, double maxZ,
+            float r,float g,float blue,float a){
+        GlStateManager.color(r,g,blue,a); GL11.glBegin(GL11.GL_QUADS);
+        quad(minX,minY,minZ,maxX,minY,minZ,maxX,maxY,minZ,minX,maxY,minZ); quad(minX,minY,maxZ,maxX,minY,maxZ,maxX,maxY,maxZ,minX,maxY,maxZ);
+        quad(minX,minY,minZ,minX,minY,maxZ,minX,maxY,maxZ,minX,maxY,minZ); quad(maxX,minY,minZ,maxX,minY,maxZ,maxX,maxY,maxZ,maxX,maxY,minZ);
+        quad(minX,minY,minZ,maxX,minY,minZ,maxX,minY,maxZ,minX,minY,maxZ); quad(minX,maxY,minZ,maxX,maxY,minZ,maxX,maxY,maxZ,minX,maxY,maxZ); GL11.glEnd();
+    }
+    private void quad(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j,double k,double l){GL11.glVertex3d(a,b,c);GL11.glVertex3d(d,e,f);GL11.glVertex3d(g,h,i);GL11.glVertex3d(j,k,l);}
 
-        Mode(String label) {
-            this.label = label;
-        }
+    private static final class ProjectedSnapshot {
+        private EntitySnapshot snapshot;
+        private int teamColor;
+        private float minX;
+        private float minY;
+        private float maxX;
+        private float maxY;
 
-        @Override
-        public String toString() {
-            return label;
+        private void set(EntitySnapshot snapshot, int teamColor, float minX, float minY, float maxX, float maxY) {
+            this.snapshot = snapshot;
+            this.teamColor = teamColor;
+            this.minX = minX;
+            this.minY = minY;
+            this.maxX = maxX;
+            this.maxY = maxY;
         }
     }
-
-    private enum RenderMode {
-        BOX("Box"),
-        OUTLINE("Outline"),
-        BOTH("Both");
-
-        private final String label;
-
-        RenderMode(String label) {
-            this.label = label;
-        }
-
-        @Override
-        public String toString() {
-            return label;
-        }
-    }
+    private enum Mode { MODERN("Modern"), CLASSIC("Classic"); final String label; Mode(String l){label=l;} @Override public String toString(){return label;} }
+    private enum RenderMode { BOX("Box",true,false), OUTLINE("Outline",false,true), BOTH("Both",true,true); final String label; final boolean fill,outline; RenderMode(String l,boolean f,boolean o){label=l;fill=f;outline=o;} @Override public String toString(){return label;} }
+    private enum ProjectionMode { TWO_D("2D",true,false), THREE_D("3D",false,true), BOTH("Both",true,true); final String label; final boolean d2,d3; ProjectionMode(String l,boolean a,boolean b){label=l;d2=a;d3=b;} boolean draws2d(){return d2;} boolean draws3d(){return d3;} @Override public String toString(){return label;} }
+    private enum TargetType { PLAYERS("Players",true,false), MOBS("Mobs",false,true), BOTH("Both",true,true); final String label; final boolean players,mobs; TargetType(String l,boolean p,boolean m){label=l;players=p;mobs=m;} @Override public String toString(){return label;} }
 }

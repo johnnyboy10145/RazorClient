@@ -5,6 +5,7 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.Packet;
 import org.lwjgl.input.Keyboard;
@@ -20,10 +21,11 @@ public final class FakeLagModule extends Module {
     private final BooleanSetting requireAttack = new BooleanSetting("Require Attack", false);
     private final BooleanSetting inGameOnly = new BooleanSetting("In Game Only", true);
 
-    private long enabledAt;
-    private long lastAttackAt;
-    private boolean flushRequested;
-    private boolean wasDelaying;
+    private volatile long enabledAt;
+    private volatile long lastAttackAt;
+    private final AtomicBoolean flushRequested = new AtomicBoolean();
+    private volatile boolean delayActive;
+    private volatile boolean pulseHoldActive;
 
     public FakeLagModule() {
         super("Fake Lag", "Adds controlled inbound and outbound packet latency.", Category.LAG_MODULES, Keyboard.KEY_NONE);
@@ -42,14 +44,25 @@ public final class FakeLagModule extends Module {
     protected void onEnable() {
         enabledAt = LagModuleSupport.now();
         lastAttackAt = 0L;
-        flushRequested = false;
-        wasDelaying = false;
+        flushRequested.set(false);
+        delayActive = false;
+        pulseHoldActive = false;
     }
 
     @Override
     protected void onDisable() {
-        flushRequested = true;
-        wasDelaying = false;
+        flushRequested.set(true);
+        delayActive = false;
+        pulseHoldActive = false;
+    }
+
+    @Override
+    public void onSessionReset() {
+        flushRequested.set(true);
+        delayActive = false;
+        pulseHoldActive = false;
+        enabledAt = LagModuleSupport.now();
+        lastAttackAt = 0L;
     }
 
     @Override
@@ -61,16 +74,18 @@ public final class FakeLagModule extends Module {
 
     @Override
     public void onClientTick() {
-        boolean delaying = conditionsPass();
-        if (wasDelaying && !delaying) {
-            flushRequested = true;
+        boolean wasActive = delayActive;
+        boolean wasHolding = pulseHoldActive;
+        delayActive = conditionsPass();
+        pulseHoldActive = delayActive && mode.getValue() == Mode.PULSE && pulseHolding();
+        if ((wasActive && !delayActive) || (wasHolding && !pulseHoldActive)) {
+            flushRequested.set(true);
         }
-        wasDelaying = delaying;
     }
 
     @Override
     public int getOutboundPacketDelay(Packet<?> packet) {
-        return shouldDelay(false, packet) ? currentDelay(outboundDelay.getValue()) : 0;
+        return shouldDelay(false, packet) && mode.getValue() == Mode.STATIC ? outboundDelay.getValue() : 0;
     }
 
     @Override
@@ -78,7 +93,20 @@ public final class FakeLagModule extends Module {
         if (realtimeDamage.isEnabled() && LagModuleSupport.isDamageStatus(packet)) {
             return 0;
         }
-        return shouldDelay(true, packet) ? currentDelay(inboundDelay.getValue()) : 0;
+        return shouldDelay(true, packet) && mode.getValue() == Mode.STATIC ? inboundDelay.getValue() : 0;
+    }
+
+    @Override
+    public boolean shouldHoldOutboundPacket(Packet<?> packet) {
+        return mode.getValue() == Mode.PULSE && pulseHoldActive && outboundDelay.getValue() > 0;
+    }
+
+    @Override
+    public boolean shouldHoldInboundPacket(Packet<?> packet) {
+        return mode.getValue() == Mode.PULSE
+            && pulseHoldActive
+            && inboundDelay.getValue() > 0
+            && !(realtimeDamage.isEnabled() && LagModuleSupport.isDamageStatus(packet));
     }
 
     @Override
@@ -93,16 +121,12 @@ public final class FakeLagModule extends Module {
 
     @Override
     public boolean isPacketDelayActive() {
-        return conditionsPass();
+        return delayActive;
     }
 
     @Override
     public boolean consumeFlushRequest() {
-        if (!flushRequested) {
-            return false;
-        }
-        flushRequested = false;
-        return true;
+        return flushRequested.getAndSet(false);
     }
 
     @Override
@@ -111,18 +135,8 @@ public final class FakeLagModule extends Module {
     }
 
     private boolean shouldDelay(boolean inbound, Packet<?> packet) {
-        if (!conditionsPass()) {
-            return false;
-        }
-        if (mode.getValue() == Mode.PULSE && !pulseHolding()) {
-            flushRequested = true;
-            return false;
-        }
+        if (!delayActive) return false;
         return inbound ? inboundDelay.getValue() > 0 : outboundDelay.getValue() > 0;
-    }
-
-    private int currentDelay(int baseDelay) {
-        return mode.getValue() == Mode.PULSE ? Math.max(baseDelay, pulseHold.getValue()) : baseDelay;
     }
 
     private boolean pulseHolding() {

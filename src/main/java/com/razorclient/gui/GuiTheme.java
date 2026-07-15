@@ -28,24 +28,27 @@ public final class GuiTheme {
     }
 
     public static int pageBackground() {
-        return BACKGROUND;
+        return ClickGuiModule.getThemeBackgroundColor();
     }
 
     public static int surface() {
-        return SURFACE;
+        return ClickGuiModule.getThemeSurfaceColor();
     }
 
     public static int raisedSurface() {
-        return SURFACE_RAISED;
+        return ClickGuiModule.getThemeRaisedColor();
     }
 
     public static int hoverSurface() {
-        return SURFACE_HOVER;
+        return ClickGuiModule.getThemeHoverColor();
     }
 
     public static int border() {
-        return BORDER;
+        return ClickGuiModule.getThemeBorderColor();
     }
+
+    public static int text() { return ClickGuiModule.getThemeTextColor(); }
+    public static int mutedText() { return ClickGuiModule.getThemeMutedTextColor(); }
 
     public static int withAlpha(int rgb, int alpha) {
         return ((clamp(alpha) & 255) << 24) | (rgb & 0xFFFFFF);

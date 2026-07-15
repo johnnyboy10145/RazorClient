@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <jni.h>
 #include <jvmti.h>
 #include <filesystem>
@@ -7,12 +8,213 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
+#include <atomic>
+#include <mutex>
 
 namespace {
 JavaVM* vm = nullptr;
 jvmtiEnv* jvmti = nullptr;
 HINSTANCE selfInstance = nullptr;
 std::filesystem::path statusFile;
+using SwapBuffersFn = BOOL (WINAPI*)(HDC);
+struct ImportPatch { HMODULE module; void** slot; void* original; };
+std::vector<ImportPatch> renderPatches;
+std::mutex renderMutex;
+std::atomic<bool> renderInstalled{false};
+std::atomic<int> activeRenderCallbacks{0};
+std::atomic<DWORD> renderThreadId{0};
+std::atomic<HGLRC> renderContext{nullptr};
+std::atomic<HDC> renderDeviceContext{nullptr};
+std::atomic<HWND> renderWindow{nullptr};
+std::atomic<ULONGLONG> lastRenderCallbackTick{0};
+jclass liveEntrypointClass = nullptr;
+jmethodID nativeRenderMethod = nullptr;
+SwapBuffersFn originalSwapBuffers = nullptr;
+void writeStatus(const std::string& phase, const std::string& detail);
+
+BOOL WINAPI hookedSwapBuffers(HDC dc) {
+    thread_local bool inside = false;
+    const DWORD currentThreadId = GetCurrentThreadId();
+    const HGLRC currentContext = wglGetCurrentContext();
+    const HWND currentWindow = dc ? WindowFromDC(dc) : nullptr;
+    const DWORD selectedThreadId = renderThreadId.load(std::memory_order_acquire);
+    const HGLRC selectedContext = renderContext.load(std::memory_order_acquire);
+    const HDC selectedDc = renderDeviceContext.load(std::memory_order_acquire);
+    const HWND selectedWindow = renderWindow.load(std::memory_order_acquire);
+    const ULONGLONG lastRender = lastRenderCallbackTick.load(std::memory_order_acquire);
+    const bool selectedSurface = selectedThreadId == currentThreadId
+        && selectedContext == currentContext && selectedDc == dc;
+    const bool selectedWindowGone = selectedWindow && !IsWindow(selectedWindow);
+    const bool rendererReloadCandidate = selectedThreadId == currentThreadId
+        && currentWindow && (currentWindow == selectedWindow || selectedWindowGone)
+        && GetTickCount64() - lastRender > 1000;
+    const bool eligibleSurface = (selectedThreadId == 0 && currentWindow)
+        || selectedSurface || rendererReloadCandidate;
+    if (!inside && eligibleSurface && currentContext && dc
+            && renderInstalled.load(std::memory_order_acquire) && vm) {
+        inside = true;
+        JNIEnv* env = nullptr;
+        bool attached = false;
+        jint state = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8);
+        if (state == JNI_EDETACHED && vm->AttachCurrentThreadAsDaemon(reinterpret_cast<void**>(&env), nullptr) == JNI_OK) {
+            attached = true;
+        }
+
+        jclass entrypoint = nullptr;
+        jmethodID renderMethod = nullptr;
+        if (env) {
+            // Take a local reference while holding the lifecycle lock. This closes the
+            // install/uninstall race without holding the mutex across arbitrary Java code.
+            std::lock_guard<std::mutex> lock(renderMutex);
+            if (renderInstalled.load(std::memory_order_acquire) && liveEntrypointClass && nativeRenderMethod) {
+                entrypoint = static_cast<jclass>(env->NewLocalRef(liveEntrypointClass));
+                renderMethod = nativeRenderMethod;
+                if (entrypoint) activeRenderCallbacks.fetch_add(1, std::memory_order_acq_rel);
+            }
+        }
+        if (entrypoint) {
+            const jboolean rendered = env->CallStaticBooleanMethod(entrypoint, renderMethod);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+            } else if (rendered == JNI_TRUE) {
+                // Java confirms this is Minecraft's client/render thread before the
+                // native bridge pins subsequent callbacks to its OpenGL context.
+                renderContext.store(currentContext, std::memory_order_release);
+                renderDeviceContext.store(dc, std::memory_order_release);
+                renderWindow.store(currentWindow, std::memory_order_release);
+                lastRenderCallbackTick.store(GetTickCount64(), std::memory_order_release);
+                renderThreadId.store(currentThreadId, std::memory_order_release);
+            }
+            env->DeleteLocalRef(entrypoint);
+            activeRenderCallbacks.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        if (attached) vm->DetachCurrentThread();
+        inside = false;
+    }
+    return originalSwapBuffers ? originalSwapBuffers(dc) : FALSE;
+}
+
+bool patchModuleSwapBuffers(HMODULE module) {
+    auto base = reinterpret_cast<unsigned char*>(module);
+    auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    auto directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!directory.VirtualAddress || !directory.Size) return false;
+    bool patched = false;
+    auto descriptor = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress);
+    for (; descriptor->Name; ++descriptor) {
+        auto thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + descriptor->FirstThunk);
+        auto names = descriptor->OriginalFirstThunk
+            ? reinterpret_cast<IMAGE_THUNK_DATA*>(base + descriptor->OriginalFirstThunk) : nullptr;
+        for (; thunk->u1.Function; ++thunk) {
+            void** slot = reinterpret_cast<void**>(&thunk->u1.Function);
+            bool isSwapBuffers = false;
+            if (names) {
+                if (names->u1.AddressOfData && !IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) {
+                    auto import = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(base + names->u1.AddressOfData);
+                    isSwapBuffers = std::strcmp(reinterpret_cast<const char*>(import->Name), "SwapBuffers") == 0;
+                }
+                ++names;
+            } else {
+                isSwapBuffers = *slot == reinterpret_cast<void*>(originalSwapBuffers);
+            }
+            if (!isSwapBuffers) continue;
+            if (*slot == reinterpret_cast<void*>(&hookedSwapBuffers)) continue;
+            // Do not bypass another renderer/overlay that already owns this import.
+            if (*slot != reinterpret_cast<void*>(originalSwapBuffers)) continue;
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) continue;
+            renderPatches.push_back({module, slot, *slot});
+            *slot = reinterpret_cast<void*>(&hookedSwapBuffers);
+            VirtualProtect(slot, sizeof(void*), oldProtect, &oldProtect);
+            FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void*));
+            patched = true;
+        }
+    }
+    return patched;
+}
+
+jboolean JNICALL installRenderBridge(JNIEnv* env, jclass owner) {
+    std::lock_guard<std::mutex> lock(renderMutex);
+    if (renderInstalled.load()) {
+        return liveEntrypointClass && env->IsSameObject(liveEntrypointClass, owner)
+            ? JNI_TRUE : JNI_FALSE;
+    }
+    nativeRenderMethod = env->GetStaticMethodID(owner, "renderNativeFrame", "()Z");
+    if (!nativeRenderMethod || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return JNI_FALSE;
+    }
+    liveEntrypointClass = static_cast<jclass>(env->NewGlobalRef(owner));
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    originalSwapBuffers = gdi ? reinterpret_cast<SwapBuffersFn>(GetProcAddress(gdi, "SwapBuffers")) : nullptr;
+    if (!liveEntrypointClass || !originalSwapBuffers) {
+        if (liveEntrypointClass) env->DeleteGlobalRef(liveEntrypointClass);
+        liveEntrypointClass = nullptr;
+        nativeRenderMethod = nullptr;
+        writeStatus("RENDER_BRIDGE_FAILED", "JNI class reference or SwapBuffers export unavailable");
+        return JNI_FALSE;
+    }
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    MODULEENTRY32W entry{sizeof(entry)};
+    bool patched = false;
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        if (Module32FirstW(snapshot, &entry)) {
+            do { patched |= patchModuleSwapBuffers(entry.hModule); } while (Module32NextW(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+    }
+    if (!patched) {
+        env->DeleteGlobalRef(liveEntrypointClass);
+        liveEntrypointClass = nullptr;
+        nativeRenderMethod = nullptr;
+        writeStatus("RENDER_BRIDGE_FAILED", "SwapBuffers import not found");
+        return JNI_FALSE;
+    }
+    renderInstalled.store(true, std::memory_order_release);
+    renderThreadId.store(0, std::memory_order_release);
+    renderContext.store(nullptr, std::memory_order_release);
+    renderDeviceContext.store(nullptr, std::memory_order_release);
+    renderWindow.store(nullptr, std::memory_order_release);
+    lastRenderCallbackTick.store(0, std::memory_order_release);
+    writeStatus("RENDER_BRIDGE_INSTALLED", "OpenGL present callback active");
+    return JNI_TRUE;
+}
+
+void JNICALL uninstallRenderBridge(JNIEnv* env, jclass) {
+    std::lock_guard<std::mutex> lock(renderMutex);
+    renderInstalled.store(false, std::memory_order_release);
+    for (const auto& patch : renderPatches) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (!VirtualQuery(patch.slot, &memory, sizeof(memory))
+                || memory.State != MEM_COMMIT || memory.AllocationBase != patch.module) {
+            continue;
+        }
+        DWORD oldProtect = 0;
+        if (VirtualProtect(patch.slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) {
+            InterlockedCompareExchangePointer(
+                reinterpret_cast<PVOID volatile*>(patch.slot),
+                patch.original,
+                reinterpret_cast<void*>(&hookedSwapBuffers)
+            );
+            VirtualProtect(patch.slot, sizeof(void*), oldProtect, &oldProtect);
+        }
+    }
+    renderPatches.clear();
+    for (int i = 0; i < 2000 && activeRenderCallbacks.load(std::memory_order_acquire) != 0; ++i) Sleep(1);
+    if (liveEntrypointClass) env->DeleteGlobalRef(liveEntrypointClass);
+    liveEntrypointClass = nullptr;
+    nativeRenderMethod = nullptr;
+    renderThreadId.store(0, std::memory_order_release);
+    renderContext.store(nullptr, std::memory_order_release);
+    renderDeviceContext.store(nullptr, std::memory_order_release);
+    renderWindow.store(nullptr, std::memory_order_release);
+    lastRenderCallbackTick.store(0, std::memory_order_release);
+    writeStatus("RENDER_BRIDGE_REMOVED", "OpenGL present callback removed");
+}
 
 std::string timestamp() {
     SYSTEMTIME time{};
@@ -40,12 +242,16 @@ std::string jsonEscape(const std::string& value) {
 }
 
 void log(const std::string& message) {
-    wchar_t local[MAX_PATH]{};
-    GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
-    std::filesystem::path dir = std::filesystem::path(local) / L"RazorClient";
-    std::filesystem::create_directories(dir);
-    std::ofstream out(dir / L"bootstrap.log", std::ios::app);
-    out << timestamp() << " " << message << '\n';
+    try {
+        wchar_t local[MAX_PATH]{};
+        GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+        std::filesystem::path dir = std::filesystem::path(local) / L"RazorClient";
+        std::filesystem::create_directories(dir);
+        std::ofstream out(dir / L"bootstrap.log", std::ios::app);
+        out << timestamp() << " " << message << '\n';
+    } catch (...) {
+        // Logging must never terminate the host JVM.
+    }
 }
 
 void writeStatus(const std::string& phase, const std::string& detail = "") {
@@ -123,13 +329,19 @@ bool clearException(JNIEnv* env, const char* context) {
     std::string detail;
     if (error) {
         jclass type = env->GetObjectClass(error);
-        jmethodID toString = env->GetMethodID(type, "toString", "()Ljava/lang/String;");
-        auto text = static_cast<jstring>(env->CallObjectMethod(error, toString));
-        if (text) {
+        jmethodID toString = type ? env->GetMethodID(type, "toString", "()Ljava/lang/String;") : nullptr;
+        auto text = toString ? static_cast<jstring>(env->CallObjectMethod(error, toString)) : nullptr;
+        if (!env->ExceptionCheck() && text) {
             const char* utf = env->GetStringUTFChars(text, nullptr);
-            detail = utf ? utf : "";
-            env->ReleaseStringUTFChars(text, utf);
+            if (utf) {
+                detail = utf;
+                env->ReleaseStringUTFChars(text, utf);
+            }
         }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (text) env->DeleteLocalRef(text);
+        if (type) env->DeleteLocalRef(type);
+        env->DeleteLocalRef(error);
     }
     log(std::string(context) + " raised a Java exception: " + detail);
     writeStatus("FAILED", std::string(context) + ": " + detail);
@@ -309,6 +521,7 @@ DWORD WINAPI initialize(void*) {
     if (vm->GetEnv(reinterpret_cast<void**>(&jvmti), JVMTI_VERSION_1_2) != JNI_OK) {
         log("JVMTI unavailable");
         writeStatus("FAILED", "JVMTI unavailable");
+        vm->DetachCurrentThread();
         return 5;
     }
 
@@ -330,7 +543,10 @@ DWORD WINAPI initialize(void*) {
     std::filesystem::path jar = resolveAgentJar();
     std::string jarUtf8 = jar.string();
     log("Using agent jar " + jarUtf8);
-    if (!std::filesystem::exists(jar) || std::filesystem::file_size(jar) == 0) {
+    std::error_code jarError;
+    const bool jarExists = std::filesystem::exists(jar, jarError);
+    const auto jarSize = jarExists ? std::filesystem::file_size(jar, jarError) : 0;
+    if (jarError || !jarExists || jarSize == 0) {
         log("Agent jar missing or empty");
         writeStatus("FAILED", "Agent jar missing or empty: " + jarUtf8);
         vm->DetachCurrentThread();
@@ -360,6 +576,16 @@ DWORD WINAPI initialize(void*) {
         clearException(env, "Resolve LiveEntrypoint");
         vm->DetachCurrentThread();
         return 9;
+    }
+
+    JNINativeMethod renderMethods[] = {
+        {const_cast<char*>("installNativeRenderBridge"), const_cast<char*>("()Z"), reinterpret_cast<void*>(&installRenderBridge)},
+        {const_cast<char*>("uninstallNativeRenderBridge"), const_cast<char*>("()V"), reinterpret_cast<void*>(&uninstallRenderBridge)}
+    };
+    if (env->RegisterNatives(live, renderMethods, 2) != JNI_OK || clearException(env, "Register render bridge natives")) {
+        writeStatus("FAILED", "Register render bridge natives failed");
+        vm->DetachCurrentThread();
+        return 12;
     }
 
     jmethodID startMethod = env->GetStaticMethodID(live, "start", "()V");

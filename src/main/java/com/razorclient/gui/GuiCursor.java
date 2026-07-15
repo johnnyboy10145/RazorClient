@@ -23,8 +23,22 @@ public final class GuiCursor {
         setNativeCursorHidden(false);
     }
 
+    public static void shutdown() {
+        setNativeCursorHidden(false);
+        Cursor cursor = transparentCursor;
+        transparentCursor = null;
+        if (cursor != null) {
+            try {
+                cursor.destroy();
+            } catch (Throwable ignored) {
+                // Native display teardown may already be in progress.
+            }
+        }
+    }
+
     public static void draw(int mouseX, int mouseY) {
         if (!ClickGuiModule.isCustomCursorEnabled()) {
+            setNativeCursorHidden(false);
             return;
         }
 

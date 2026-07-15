@@ -25,6 +25,9 @@ public final class KeybindHandler {
         }
 
         int keyCode = Keyboard.getEventKey();
+        if (keyCode == Keyboard.KEY_NONE) {
+            return;
+        }
         for (Module module : moduleManager.getModules()) {
             if (module.getKeyCode() == keyCode) {
                 module.toggle();

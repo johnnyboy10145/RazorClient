@@ -9,6 +9,7 @@ import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.DecimalSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import com.razorclient.runtime.ResourceArbiter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -28,11 +29,11 @@ import net.minecraft.util.MovingObjectPosition;
 import org.lwjgl.input.Keyboard;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.common.eventhandler.EventPriority;
+import net.minecraftforge.fml.common.eventhandler.Event;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
 
 public final class ClutchModule extends Module {
-    private static final ClutchModule INSTANCE = new ClutchModule();
     private static final EnumFacing[] SEARCH_DIRECTIONS = new EnumFacing[] {
         EnumFacing.NORTH,
         EnumFacing.SOUTH,
@@ -76,10 +77,11 @@ public final class ClutchModule extends Module {
     private final BooleanSetting onlyMidAir = new BooleanSetting("Only Mid-Air", false);
     private final BooleanSetting recentlyDamaged = new BooleanSetting("Recently Damaged", false);
     private final BooleanSetting movingBackwards = new BooleanSetting("Moving Backwards", false);
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
 
     private int blocksPlaced;
     private int savedSlot = -1;
+    private ResourceArbiter.Lease slotLease;
     private int moveFreezeTicks;
     private int groundedClutchTicks;
     private int snapBackDelayTicks;
@@ -104,8 +106,23 @@ public final class ClutchModule extends Module {
     private BlockPos lastPlacementTarget;
     private EnumFacing lastPlacementFace;
     private int lastHeldBlockSlot = -1;
+    private boolean modelRotationActive;
+    private ResourceArbiter.Lease modelRotationLease;
+    private boolean modelRenderSwapActive;
+    private EntityPlayerSP modelRenderPlayer;
+    private float savedRenderYawHead;
+    private float savedPrevRenderYawHead;
+    private float savedRenderYawOffset;
+    private float savedPrevRenderYawOffset;
+    private float savedRenderPitch;
+    private float savedPrevRenderPitch;
+    private float previousSilentYaw;
+    private float lastSilentYaw;
+    private float previousSilentPitch;
+    private float lastSilentPitch;
+    private java.lang.reflect.Field renderPlayerField;
 
-    private ClutchModule() {
+    public ClutchModule() {
         super("Clutch", "Bridges blocks back to safety when knocked off an edge", Category.PLAYER, Keyboard.KEY_NONE);
 
         blocks.setVisibility(new java.util.function.BooleanSupplier() {
@@ -149,10 +166,6 @@ public final class ClutchModule extends Module {
         addSetting(movingBackwards);
     }
 
-    public static ClutchModule getInstance() {
-        return INSTANCE;
-    }
-
     @Override
     protected void onEnable() {
         resetState();
@@ -168,10 +181,26 @@ public final class ClutchModule extends Module {
     }
 
     @Override
+    public void onSessionReset() {
+        restoreSavedSlot(mc.thePlayer);
+        resetState();
+        clearRotationState();
+    }
+
+    @Override
+    public void onInputContextLost() {
+        restoreSavedSlot(mc.thePlayer);
+        resetState();
+        clearRotationState();
+    }
+
+    @Override
     public void onClientTick(TickEvent.ClientTickEvent event) {
         if (event.phase != TickEvent.Phase.START) {
             return;
         }
+        // Recover immediately if a renderer abort skipped the matching Post event.
+        restoreModelRenderSwap();
 
         if (!isPlayerReady()) {
             resetState();
@@ -180,6 +209,11 @@ public final class ClutchModule extends Module {
         }
 
         EntityPlayerSP player = mc.thePlayer;
+        if (slotLease != null && !slotLease.renew(2)) {
+            slotLease = null;
+            abortClutch(player);
+            return;
+        }
         if (moveFreezeTicks > 0) {
             moveFreezeTicks--;
             return;
@@ -214,6 +248,7 @@ public final class ClutchModule extends Module {
         }
 
         if (!clutching) {
+            if (!acquireSlotLease(player)) return;
             clutching = true;
             blocksPlaced = 0;
             returningToCamera = false;
@@ -255,6 +290,7 @@ public final class ClutchModule extends Module {
         float[] aim = faceAim(player, placement.neighbor, placement.face);
         setRotationTarget(aim[0], aim[1]);
         stepRotation(resolveAimSpeed());
+        updateSilentModelRotation(player);
         applyVisibleRotation();
 
         if (!hasReachedTarget(2.0F)) {
@@ -295,8 +331,42 @@ public final class ClutchModule extends Module {
             return;
         }
 
-        event.yaw = Float.valueOf(currentYaw);
-        event.pitch = Float.valueOf(currentPitch);
+        ClientRotationHelper helper = ClientRotationHelper.get();
+        if (helper.requestRotations("Clutch", 95, currentYaw, currentPitch)
+                || "Clutch".equals(helper.getRequestedOwner())) {
+            event.yaw = Float.valueOf(currentYaw);
+            event.pitch = Float.valueOf(currentPitch);
+        }
+    }
+
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public void onForgeRenderPre(Event event) {
+        if (!isLocalRenderEvent(event, "net.minecraftforge.client.event.RenderPlayerEvent$Pre")) return;
+        beginModelRenderSwap(mc.thePlayer);
+    }
+
+    @SubscribeEvent(priority = EventPriority.HIGHEST)
+    public void onForgeRenderPost(Event event) {
+        if (!isLocalRenderEvent(event, "net.minecraftforge.client.event.RenderPlayerEvent$Post")) return;
+        restoreModelRenderSwap();
+    }
+
+    private boolean isLocalRenderEvent(Event event, String expectedClassName) {
+        return event != null
+            && expectedClassName.equals(event.getClass().getName())
+            && resolveRenderedPlayer(event) == mc.thePlayer;
+    }
+
+    private Object resolveRenderedPlayer(Event event) {
+        try {
+            if (renderPlayerField == null || !renderPlayerField.getDeclaringClass().isAssignableFrom(event.getClass())) {
+                renderPlayerField = event.getClass().getField("entityPlayer");
+                renderPlayerField.setAccessible(true);
+            }
+            return renderPlayerField.get(event);
+        } catch (ReflectiveOperationException ignored) {
+            return null;
+        }
     }
 
     @SubscribeEvent
@@ -321,9 +391,7 @@ public final class ClutchModule extends Module {
                 return;
             }
             groundedClutchTicks = 0;
-            if (savedSlot != -1 && returnToSlot.isEnabled()) {
-                restoreSavedSlot(player);
-            }
+            restoreSavedSlot(player);
 
             moveFreezeTicks = Math.max(1, clutchMoveDelay.getValue());
             clutching = false;
@@ -784,10 +852,12 @@ public final class ClutchModule extends Module {
 
         player.rotationYaw = yaw;
         player.rotationPitch = pitch;
-        MovingObjectPosition hit = player.rayTrace(reach, 1.0F);
-        player.rotationYaw = savedYaw;
-        player.rotationPitch = savedPitch;
-        return hit;
+        try {
+            return player.rayTrace(reach, 1.0F);
+        } finally {
+            player.rotationYaw = savedYaw;
+            player.rotationPitch = savedPitch;
+        }
     }
 
     private boolean attemptPlacement(EntityPlayerSP player, MovingObjectPosition hit, PlacementCandidate placement) {
@@ -800,14 +870,28 @@ public final class ClutchModule extends Module {
             return false;
         }
 
+        MovingObjectPosition previousHit = mc.objectMouseOver;
         mc.objectMouseOver = hit;
-
-        if (mc.playerController.onPlayerRightClick(player, mc.theWorld, heldItem, hit.getBlockPos(), hit.sideHit, hit.hitVec)) {
-            player.swingItem();
-            return true;
+        try {
+            boolean placed = mc.playerController.onPlayerRightClick(
+                player,
+                mc.theWorld,
+                heldItem,
+                hit.getBlockPos(),
+                hit.sideHit,
+                hit.hitVec
+            );
+            if (placed) {
+                player.swingItem();
+            }
+            return placed;
+        } catch (NoSuchMethodError | AbstractMethodError unavailable) {
+            // The raw packet path is only a compatibility fallback. A false controller result
+            // may already have transmitted C08, so it must never trigger a second placement.
+            return sendPlacementFallback(player, heldItem, hit, placement);
+        } finally {
+            mc.objectMouseOver = previousHit;
         }
-
-        return sendPlacementFallback(player, heldItem, hit, placement);
     }
 
     private boolean sendPlacementFallback(EntityPlayerSP player, ItemStack heldItem, MovingObjectPosition hit, PlacementCandidate placement) {
@@ -1162,25 +1246,132 @@ public final class ClutchModule extends Module {
     }
 
     private void restoreSavedSlot(EntityPlayerSP player) {
-        if (player == null || savedSlot < 0 || savedSlot > 8 || !returnToSlot.isEnabled()) {
-            savedSlot = -1;
-            return;
-        }
-
-        setSelectedSlot(savedSlot);
+        ResourceArbiter.Lease lease = slotLease;
+        slotLease = null;
+        if (lease != null && lease.isValid()) lease.close();
         savedSlot = -1;
     }
 
+    private boolean acquireSlotLease(final EntityPlayerSP player) {
+        if (slotLease != null) return slotLease.renew(2);
+        final int originalSlot = player.inventory.currentItem;
+        slotLease = getScope().acquire(ResourceArbiter.Resource.HOTBAR_SLOT, 400, 2, new Runnable() {
+            @Override
+            public void run() {
+                if (!returnToSlot.isEnabled() || mc.thePlayer != player || originalSlot < 0 || originalSlot > 8) return;
+                player.inventory.currentItem = originalSlot;
+                if (mc.playerController != null) mc.playerController.syncCurrentPlayItem();
+            }
+        });
+        return slotLease != null;
+    }
+
     private void clearRotationState() {
+        clearSilentModelRotation();
         rotationActive = false;
         targetYaw = 0.0F;
         targetPitch = 0.0F;
         rotationHeldTicks = 0;
-        ClientRotationHelper.get().clearRequestedRotations();
+        ClientRotationHelper helper = ClientRotationHelper.get();
+        if ("Clutch".equals(helper.getRequestedOwner())) helper.clearRequestedRotations();
+    }
+
+    private void updateSilentModelRotation(EntityPlayerSP player) {
+        if (player == null || !silentAim.isEnabled() || !rotationActive) {
+            clearSilentModelRotation();
+            return;
+        }
+
+        ClientRotationHelper.get().requestRotations("Clutch", 95, currentYaw, currentPitch);
+        if (!acquireModelRotationLease()) {
+            restoreModelRenderSwap();
+            modelRotationActive = false;
+            return;
+        }
+
+        if (modelRotationActive) {
+            previousSilentYaw = lastSilentYaw;
+            previousSilentPitch = lastSilentPitch;
+            lastSilentYaw = ClientRotationHelper.unwrapYaw(currentYaw, lastSilentYaw);
+        } else {
+            lastSilentYaw = ClientRotationHelper.unwrapYaw(currentYaw, player.rotationYawHead);
+            previousSilentYaw = ClientRotationHelper.unwrapYaw(player.prevRotationYawHead, lastSilentYaw);
+            previousSilentPitch = player.prevRotationPitch;
+        }
+        lastSilentPitch = MathHelper.clamp_float(currentPitch, -90.0F, 90.0F);
+        modelRotationActive = true;
+    }
+
+    private boolean acquireModelRotationLease() {
+        if (modelRotationLease != null && modelRotationLease.renew(2)) return true;
+        modelRotationLease = getScope().acquire(ResourceArbiter.Resource.MODEL_ROTATION, 95, 2, new Runnable() {
+            @Override
+            public void run() {
+                restoreModelRenderSwap();
+            }
+        });
+        return modelRotationLease != null;
+    }
+
+    private void beginModelRenderSwap(EntityPlayerSP player) {
+        restoreModelRenderSwap();
+        if (player == null
+            || !isEnabled()
+            || !silentAim.isEnabled()
+            || !modelRotationActive
+            || modelRotationLease == null
+            || !modelRotationLease.isValid()) {
+            return;
+        }
+
+        modelRenderPlayer = player;
+        savedRenderYawHead = player.rotationYawHead;
+        savedPrevRenderYawHead = player.prevRotationYawHead;
+        savedRenderYawOffset = player.renderYawOffset;
+        savedPrevRenderYawOffset = player.prevRenderYawOffset;
+        savedRenderPitch = player.rotationPitch;
+        savedPrevRenderPitch = player.prevRotationPitch;
+
+        player.rotationYawHead = lastSilentYaw;
+        player.prevRotationYawHead = previousSilentYaw;
+        player.renderYawOffset = lastSilentYaw;
+        player.prevRenderYawOffset = previousSilentYaw;
+        player.rotationPitch = lastSilentPitch;
+        player.prevRotationPitch = previousSilentPitch;
+        modelRenderSwapActive = true;
+    }
+
+    private void restoreModelRenderSwap() {
+        EntityPlayerSP player = modelRenderPlayer;
+        if (modelRenderSwapActive && player != null) {
+            player.rotationYawHead = savedRenderYawHead;
+            player.prevRotationYawHead = savedPrevRenderYawHead;
+            player.renderYawOffset = savedRenderYawOffset;
+            player.prevRenderYawOffset = savedPrevRenderYawOffset;
+            player.rotationPitch = savedRenderPitch;
+            player.prevRotationPitch = savedPrevRenderPitch;
+        }
+        modelRenderSwapActive = false;
+        modelRenderPlayer = null;
+    }
+
+    private void clearSilentModelRotation() {
+        restoreModelRenderSwap();
+        ResourceArbiter.Lease lease = modelRotationLease;
+        modelRotationLease = null;
+        if (lease != null && lease.isValid()) lease.close();
+        modelRotationActive = false;
+        previousSilentYaw = 0.0F;
+        lastSilentYaw = 0.0F;
+        previousSilentPitch = 0.0F;
+        lastSilentPitch = 0.0F;
     }
 
     private void resetState() {
+        ResourceArbiter.Lease lease = slotLease;
+        if (lease != null && lease.isValid()) lease.close();
         blocksPlaced = 0;
+        slotLease = null;
         savedSlot = -1;
         moveFreezeTicks = 0;
         groundedClutchTicks = 0;
@@ -1201,13 +1392,19 @@ public final class ClutchModule extends Module {
     }
 
     private void abortClutch(EntityPlayerSP player) {
-        if (!clutching && !rotationActive && savedSlot == -1 && bridgePath == null && !slotSwitchPending) {
+        if (!clutching && !rotationActive && savedSlot == -1 && slotLease == null
+                && bridgePath == null && !slotSwitchPending) {
             return;
         }
 
         restoreSavedSlot(player);
         resetState();
         clearRotationState();
+    }
+
+    @Override
+    public String getHudInfo() {
+        return clutching ? blocksPlaced + "/" + maxBlocks.getValue() : "Ready";
     }
 
     private void abortActiveClutch(EntityPlayerSP player) {

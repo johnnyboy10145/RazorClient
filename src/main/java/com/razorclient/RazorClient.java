@@ -1,6 +1,7 @@
 package com.razorclient;
 
 import com.razorclient.feature.module.ModuleManager;
+import com.razorclient.combat.ClientRotationHelper;
 import com.razorclient.feature.module.impl.HudModule;
 import com.razorclient.gui.ClickGuiScreen;
 import com.razorclient.gui.HudEditorScreen;
@@ -30,6 +31,7 @@ public final class RazorClient {
     private final PacketDelayManager packetDelayManager = new PacketDelayManager(moduleManager);
     private final KnockbackDelayBuffer knockbackDelayBuffer = new KnockbackDelayBuffer();
     private final ClickGuiScreen clickGuiScreen = new ClickGuiScreen(moduleManager);
+    private boolean tickDispatchActive;
 
     public static RazorClient getInstance() {
         return instance;
@@ -44,9 +46,10 @@ public final class RazorClient {
         if (minecraft != null && (minecraft.currentScreen == client.clickGuiScreen || minecraft.currentScreen instanceof HudEditorScreen)) {
             minecraft.displayGuiScreen(null);
         }
-        client.packetDelayManager.flushAll();
-        client.moduleManager.shutdownForUnload();
         client.moduleManager.getConfigManager().saveCurrent();
+        client.packetDelayManager.closeForUnload();
+        client.moduleManager.shutdownForUnload();
+        ClientRotationHelper.get().stop();
         instance = null;
     }
 
@@ -69,6 +72,7 @@ public final class RazorClient {
 
     @EventHandler
     public void onInit(FMLInitializationEvent event) {
+        ClientRotationHelper.get().start();
         KeybindHandler.register(moduleManager);
         net.minecraftforge.common.MinecraftForge.EVENT_BUS.register(this);
         Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
@@ -81,12 +85,15 @@ public final class RazorClient {
 
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
-        moduleManager.onClientTick(event);
-
-        if (event.phase != TickEvent.Phase.END) {
+        if (event.phase == TickEvent.Phase.START) {
+            moduleManager.pollLifecycleState();
+            tickDispatchActive = moduleManager.beginRealTick();
+            if (tickDispatchActive) moduleManager.onClientTick(event);
             return;
         }
-
+        if (!tickDispatchActive) return;
+        tickDispatchActive = false;
+        moduleManager.onClientTick(event);
         moduleManager.onClientTick();
         knockbackDelayBuffer.onClientTick();
         packetDelayManager.onClientTick();
@@ -139,6 +146,7 @@ public final class RazorClient {
 
     @SubscribeEvent
     public void onRenderWorld(RenderWorldLastEvent event) {
+        moduleManager.beginFrame(event.partialTicks);
         moduleManager.onRenderWorld(event);
     }
 

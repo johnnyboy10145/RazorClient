@@ -1,7 +1,6 @@
 package com.razorclient.feature.module.impl;
 
-import java.lang.reflect.Field;
-import java.util.List;
+import com.razorclient.combat.CombatTargetService;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.renderer.GlStateManager;
@@ -15,6 +14,7 @@ import net.minecraft.network.Packet;
 import net.minecraft.network.play.client.C02PacketUseEntity;
 import net.minecraft.network.play.client.C00PacketKeepAlive;
 import net.minecraft.network.play.client.C03PacketPlayer;
+import net.minecraft.network.play.client.C0BPacketEntityAction;
 import net.minecraft.network.play.client.C07PacketPlayerDigging;
 import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
 import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
@@ -116,8 +116,53 @@ final class LagModuleSupport {
         if (packet instanceof S12PacketEntityVelocity) {
             return ((S12PacketEntityVelocity) packet).getEntityID();
         }
-        Integer id = firstIntField(packet);
-        return id == null ? -1 : id.intValue();
+        if (packet instanceof S14PacketEntity) {
+            return ((S14PacketEntity) packet).entityId;
+        }
+        if (packet instanceof S18PacketEntityTeleport) {
+            return ((S18PacketEntityTeleport) packet).entityId;
+        }
+        return -1;
+    }
+
+    static ServerPosition entityServerPosition(Entity entity) {
+        if (entity == null) {
+            return null;
+        }
+        return new ServerPosition(
+            entity.getEntityId(),
+            entity.serverPosX / 32.0D,
+            entity.serverPosY / 32.0D,
+            entity.serverPosZ / 32.0D
+        );
+    }
+
+    static ServerPosition decodeServerPosition(Packet<?> packet, ServerPosition previous) {
+        int entityId = getPacketEntityId(packet);
+        if (entityId < 0) {
+            return null;
+        }
+        if (packet instanceof S18PacketEntityTeleport) {
+            S18PacketEntityTeleport teleport = (S18PacketEntityTeleport) packet;
+            return new ServerPosition(
+                entityId,
+                teleport.posX / 32.0D,
+                teleport.posY / 32.0D,
+                teleport.posZ / 32.0D
+            );
+        }
+        if (!(packet instanceof S14PacketEntity)
+            || previous == null
+            || previous.entityId != entityId) {
+            return null;
+        }
+        S14PacketEntity movement = (S14PacketEntity) packet;
+        return new ServerPosition(
+            entityId,
+            previous.x + movement.posX / 32.0D,
+            previous.y + movement.posY / 32.0D,
+            previous.z + movement.posZ / 32.0D
+        );
     }
 
     static EntityPlayer closestCombatTarget(Minecraft minecraft, double maxDistance) {
@@ -127,13 +172,9 @@ final class LagModuleSupport {
 
         EntityPlayer best = null;
         double bestDistance = Double.MAX_VALUE;
-        List<?> players = minecraft.theWorld.playerEntities;
-        for (Object object : players) {
-            if (!(object instanceof EntityPlayer)) {
-                continue;
-            }
-
-            EntityPlayer player = (EntityPlayer) object;
+        for (EntityLivingBase candidate : CombatTargetService.candidates(minecraft)) {
+            if (!(candidate instanceof EntityPlayer)) continue;
+            EntityPlayer player = (EntityPlayer) candidate;
             if (player == minecraft.thePlayer
                 || player.isDead
                 || player.getHealth() <= 0.0F
@@ -157,12 +198,9 @@ final class LagModuleSupport {
 
         EntityPlayer best = null;
         double bestAngle = Double.MAX_VALUE;
-        for (Object object : minecraft.theWorld.playerEntities) {
-            if (!(object instanceof EntityPlayer)) {
-                continue;
-            }
-
-            EntityPlayer player = (EntityPlayer) object;
+        for (EntityLivingBase candidate : CombatTargetService.candidates(minecraft)) {
+            if (!(candidate instanceof EntityPlayer)) continue;
+            EntityPlayer player = (EntityPlayer) candidate;
             if (player == minecraft.thePlayer
                 || player.isDead
                 || player.getHealth() <= 0.0F
@@ -203,11 +241,8 @@ final class LagModuleSupport {
     }
 
     static boolean sprintResetPacket(Packet<?> packet) {
-        if (!isMovementPacket(packet)) {
-            return false;
-        }
-        Minecraft minecraft = Minecraft.getMinecraft();
-        return inGame(minecraft) && minecraft.thePlayer.isSprinting() && minecraft.thePlayer.moveForward <= 0.0F;
+        return packet instanceof C0BPacketEntityAction
+            && ((C0BPacketEntityAction) packet).getAction() == C0BPacketEntityAction.Action.STOP_SPRINTING;
     }
 
     static boolean splashPotionUse(Packet<?> packet) {
@@ -251,11 +286,32 @@ final class LagModuleSupport {
             return;
         }
 
+        drawEntityBoxAt(entity, entity.posX, entity.posY, entity.posZ, event, red, green, blue);
+    }
+
+    static void drawEntityBoxAt(
+        EntityLivingBase entity,
+        double x,
+        double y,
+        double z,
+        RenderWorldLastEvent event,
+        float red,
+        float green,
+        float blue
+    ) {
+        if (entity == null
+            || !Double.isFinite(x)
+            || !Double.isFinite(y)
+            || !Double.isFinite(z)) {
+            return;
+        }
+
         Minecraft minecraft = Minecraft.getMinecraft();
         double renderX = minecraft.getRenderManager().viewerPosX;
         double renderY = minecraft.getRenderManager().viewerPosY;
         double renderZ = minecraft.getRenderManager().viewerPosZ;
-        AxisAlignedBB box = entity.getEntityBoundingBox().offset(-renderX, -renderY, -renderZ);
+        AxisAlignedBB box = entity.getEntityBoundingBox()
+            .offset(x - entity.posX - renderX, y - entity.posY - renderY, z - entity.posZ - renderZ);
 
         GlStateManager.pushMatrix();
         try {
@@ -287,35 +343,6 @@ final class LagModuleSupport {
         return (float) (Math.atan2(dz, dx) * 180.0D / Math.PI) - 90.0F;
     }
 
-    private static Integer firstIntField(Object object) {
-        int[] values = intFields(object);
-        return values.length == 0 ? null : Integer.valueOf(values[0]);
-    }
-
-    private static int[] intFields(Object object) {
-        if (object == null) {
-            return new int[0];
-        }
-
-        Field[] fields = object.getClass().getDeclaredFields();
-        int[] values = new int[fields.length];
-        int count = 0;
-        for (Field field : fields) {
-            if (field.getType() != Integer.TYPE) {
-                continue;
-            }
-            try {
-                field.setAccessible(true);
-                values[count++] = field.getInt(object);
-            } catch (Exception ignored) {
-            }
-        }
-
-        int[] compact = new int[count];
-        System.arraycopy(values, 0, compact, 0, count);
-        return compact;
-    }
-
     private static void drawOutlinedBox(AxisAlignedBB box) {
         GL11.glBegin(GL11.GL_LINES);
         vertex(box.minX, box.minY, box.minZ); vertex(box.maxX, box.minY, box.minZ);
@@ -337,5 +364,19 @@ final class LagModuleSupport {
 
     private static void vertex(double x, double y, double z) {
         GL11.glVertex3d(x, y, z);
+    }
+
+    static final class ServerPosition {
+        final int entityId;
+        final double x;
+        final double y;
+        final double z;
+
+        ServerPosition(int entityId, double x, double y, double z) {
+            this.entityId = entityId;
+            this.x = x;
+            this.y = y;
+            this.z = z;
+        }
     }
 }

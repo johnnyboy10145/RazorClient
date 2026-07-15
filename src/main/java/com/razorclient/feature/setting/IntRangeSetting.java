@@ -5,8 +5,8 @@ import com.razorclient.config.ConfigManager;
 public final class IntRangeSetting extends Setting {
     private final int min;
     private final int max;
-    private int low;
-    private int high;
+    private volatile int low;
+    private volatile int high;
 
     public IntRangeSetting(String name, int low, int high, int min, int max) {
         super(name);

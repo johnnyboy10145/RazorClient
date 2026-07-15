@@ -23,6 +23,11 @@ public final class PingFixModule extends Module {
         return shown + "ms";
     }
 
+    public String getQueueDiagnostics() {
+        PacketDelayManager manager = PacketDelayManager.getInstance();
+        return manager == null ? "Unavailable" : manager.getQueueStatus();
+    }
+
     @Override
     public int getHudInfoColor() {
         RazorClient client = RazorClient.getInstance();

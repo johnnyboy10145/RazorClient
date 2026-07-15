@@ -3,7 +3,7 @@ package com.razorclient.feature.setting;
 import com.razorclient.config.ConfigManager;
 
 public final class BooleanSetting extends Setting {
-    private boolean enabled;
+    private volatile boolean enabled;
 
     public BooleanSetting(String name, boolean enabled) {
         super(name);
