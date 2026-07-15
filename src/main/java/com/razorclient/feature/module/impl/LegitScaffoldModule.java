@@ -6,6 +6,7 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import com.razorclient.runtime.ResourceArbiter;
 import net.minecraft.block.Block;
 import net.minecraft.block.material.Material;
 import net.minecraft.block.state.IBlockState;
@@ -44,6 +45,10 @@ public final class LegitScaffoldModule extends Module {
     private boolean moduleSneaking;
     private boolean diagonalMovement;
     private Status status = Status.READY;
+    private ResourceArbiter.Lease sneakLease;
+    private final Runnable restoreSneak = new Runnable() {
+        @Override public void run() { restorePhysicalSneak(); }
+    };
 
     public LegitScaffoldModule() {
         super("LegitScaffold", "Sneaks at block edges and can assist normal block placement.", Category.MOVEMENT, Keyboard.KEY_NONE);
@@ -81,6 +86,12 @@ public final class LegitScaffoldModule extends Module {
         long now = System.nanoTime();
 
         if (unsafe) {
+            sneakLease = getScope().acquire(ResourceArbiter.Resource.SNEAK_INPUT, 250, 2, restoreSneak);
+            if (sneakLease == null) {
+                moduleSneaking = false;
+                status = Status.READY;
+                return;
+            }
             moduleSneaking = true;
             status = diagonalMovement ? Status.DIAGONAL : Status.EDGE;
             KeyBinding.setKeyBindState(sneakKey, true);
@@ -97,14 +108,23 @@ public final class LegitScaffoldModule extends Module {
         }
 
         if (moduleSneaking && now < sneakReleaseTime) {
+            if (sneakLease == null || !sneakLease.renew(2)) {
+                sneakLease = null;
+                moduleSneaking = false;
+                sneakReleaseTime = 0L;
+                status = Status.READY;
+                return;
+            }
             KeyBinding.setKeyBindState(sneakKey, true);
             return;
         }
 
+        boolean hadSneakLease = sneakLease != null;
+        releaseSneakLease();
         moduleSneaking = false;
         sneakReleaseTime = 0L;
         status = Status.READY;
-        KeyBinding.setKeyBindState(sneakKey, physicalSneak);
+        if (!hadSneakLease) KeyBinding.setKeyBindState(sneakKey, physicalSneak);
     }
 
     @Override
@@ -225,15 +245,25 @@ public final class LegitScaffoldModule extends Module {
     }
 
     private void clearState(Minecraft minecraft) {
+        releaseSneakLease();
         sneakReleaseTime = 0L;
         nextPlacementTime = 0L;
         moduleSneaking = false;
         diagonalMovement = false;
         status = Status.READY;
-        if (minecraft != null && minecraft.gameSettings != null) {
-            int key = minecraft.gameSettings.keyBindSneak.getKeyCode();
-            KeyBinding.setKeyBindState(key, isPhysicalKeyDown(key));
-        }
+    }
+
+    private void releaseSneakLease() {
+        ResourceArbiter.Lease lease = sneakLease;
+        sneakLease = null;
+        if (lease != null && lease.isValid()) lease.close();
+    }
+
+    private void restorePhysicalSneak() {
+        Minecraft minecraft = Minecraft.getMinecraft();
+        if (minecraft == null || minecraft.gameSettings == null) return;
+        int key = minecraft.gameSettings.keyBindSneak.getKeyCode();
+        KeyBinding.setKeyBindState(key, isPhysicalKeyDown(key));
     }
 
     private boolean isPhysicalKeyDown(int keyCode) {

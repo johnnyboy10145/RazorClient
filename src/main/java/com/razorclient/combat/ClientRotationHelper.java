@@ -1,10 +1,13 @@
 package com.razorclient.combat;
 
+import com.razorclient.RazorClient;
 import com.razorclient.event.ClientRotationEvent;
 import com.razorclient.event.JumpEvent;
 import com.razorclient.event.StrafeEvent;
+import com.razorclient.runtime.ResourceArbiter;
 import net.minecraft.client.Minecraft;
 import net.minecraft.entity.Entity;
+import net.minecraft.network.play.client.C03PacketPlayer;
 import net.minecraft.util.MathHelper;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
@@ -16,7 +19,8 @@ public final class ClientRotationHelper {
 
     private Float serverYaw;
     private Float serverPitch;
-    private boolean setRotations;
+    private volatile RotationSnapshot publishedRotation;
+    private volatile boolean setRotations;
     private boolean rotationsUpdatedThisTick;
     private float savedYaw;
     private float savedPitch;
@@ -25,15 +29,29 @@ public final class ClientRotationHelper {
 
     public boolean swappedForMouseOver;
     private boolean swappedForWalkingUpdate;
-    private String requestedOwner = "None";
-    private int requestedPriority = Integer.MIN_VALUE;
+    private volatile String requestedOwner = "None";
+    private volatile int requestedPriority = Integer.MIN_VALUE;
+    private ResourceArbiter.Lease rotationLease;
+    private boolean registered;
 
     private ClientRotationHelper() {
-        MinecraftForge.EVENT_BUS.register(this);
     }
 
     public static ClientRotationHelper get() {
         return INSTANCE;
+    }
+
+    public synchronized void start() {
+        if (registered) return;
+        MinecraftForge.EVENT_BUS.register(this);
+        registered = true;
+    }
+
+    public synchronized void stop() {
+        clearRequestedRotations();
+        if (!registered) return;
+        MinecraftForge.EVENT_BUS.unregister(this);
+        registered = false;
     }
 
     public static float unwrapYaw(float yaw, float previousYaw) {
@@ -41,44 +59,65 @@ public final class ClientRotationHelper {
     }
 
     public void onRunTickStart() {
-        if (minecraft.thePlayer != null && setRotations && serverYaw != null && !serverYaw.isNaN()) {
-            float serverYawValue = Float.isNaN(KillAuraRotationUtils.serverRotations[0]) ? serverYaw.floatValue() : KillAuraRotationUtils.serverRotations[0];
-            float unwrappedYaw = unwrapYaw(MathHelper.wrapAngleTo180_float(minecraft.thePlayer.rotationYaw), serverYawValue);
-            minecraft.thePlayer.rotationYaw = unwrappedYaw;
-            minecraft.thePlayer.prevRotationYaw = unwrappedYaw;
-        }
-
-        if (minecraft.thePlayer != null && Float.isNaN(KillAuraRotationUtils.serverRotations[0])) {
+        if (minecraft.thePlayer != null && !Float.isFinite(KillAuraRotationUtils.serverRotations[0])) {
             KillAuraRotationUtils.serverRotations[0] = minecraft.thePlayer.rotationYaw;
             KillAuraRotationUtils.serverRotations[1] = minecraft.thePlayer.rotationPitch;
         }
 
         serverYaw = null;
         serverPitch = null;
+        publishedRotation = null;
         setRotations = false;
         rotationsUpdatedThisTick = false;
         swappedForMouseOver = false;
         swappedForWalkingUpdate = false;
         requestedOwner = "None";
         requestedPriority = Integer.MIN_VALUE;
+        rotationLease = null;
     }
 
     public void clearRequestedRotations() {
+        ResourceArbiter arbiter = getArbiter();
+        if (arbiter != null) arbiter.clear(ResourceArbiter.Resource.SERVER_ROTATION);
         serverYaw = null;
         serverPitch = null;
+        publishedRotation = null;
         setRotations = false;
         requestedOwner = "None";
         requestedPriority = Integer.MIN_VALUE;
+        rotationLease = null;
+    }
+
+    public void clearRequestedRotations(String owner) {
+        if (owner == null || !owner.equals(requestedOwner)) return;
+        ResourceArbiter arbiter = getArbiter();
+        if (arbiter != null) arbiter.releaseOwner(owner, ResourceArbiter.Resource.SERVER_ROTATION);
+        serverYaw = null;
+        serverPitch = null;
+        publishedRotation = null;
+        setRotations = false;
+        requestedOwner = "None";
+        requestedPriority = Integer.MIN_VALUE;
+        rotationLease = null;
     }
 
     public boolean requestRotations(String owner, int priority, float yaw, float pitch) {
-        if (owner == null || priority < requestedPriority || Float.isNaN(yaw) || Float.isNaN(pitch)) {
+        if (owner == null || owner.isEmpty() || priority < requestedPriority
+                || !Float.isFinite(yaw) || !Float.isFinite(pitch)) {
             return false;
+        }
+        ResourceArbiter arbiter = getArbiter();
+        if (arbiter != null) {
+            ResourceArbiter.Lease lease = arbiter.acquire(ResourceArbiter.Resource.SERVER_ROTATION,
+                owner, priority, 1, null);
+            if (lease == null) return false;
+            rotationLease = lease;
         }
         requestedOwner = owner;
         requestedPriority = priority;
         serverYaw = Float.valueOf(yaw);
         serverPitch = Float.valueOf(pitch);
+        publishedRotation = new RotationSnapshot(owner, yaw, pitch);
         setRotations = true;
         return true;
     }
@@ -93,7 +132,7 @@ public final class ClientRotationHelper {
         }
 
         rotationsUpdatedThisTick = true;
-        if (Float.isNaN(KillAuraRotationUtils.serverRotations[0])) {
+        if (!Float.isFinite(KillAuraRotationUtils.serverRotations[0])) {
             KillAuraRotationUtils.serverRotations[0] = minecraft.thePlayer.rotationYaw;
             KillAuraRotationUtils.serverRotations[1] = minecraft.thePlayer.rotationPitch;
         }
@@ -102,27 +141,56 @@ public final class ClientRotationHelper {
         MinecraftForge.EVENT_BUS.post(event);
         serverYaw = event.yaw;
         serverPitch = event.pitch;
+        if ((serverYaw != null && !Float.isFinite(serverYaw.floatValue()))
+                || (serverPitch != null && !Float.isFinite(serverPitch.floatValue()))) {
+            serverYaw = null;
+            serverPitch = null;
+            publishedRotation = null;
+            setRotations = false;
+            return;
+        }
         if (serverYaw == null && serverPitch == null) {
+            publishedRotation = null;
+            setRotations = false;
             return;
         }
 
-        float baseYaw = Float.isNaN(KillAuraRotationUtils.serverRotations[0]) ? minecraft.thePlayer.rotationYaw : KillAuraRotationUtils.serverRotations[0];
-        float basePitch = Float.isNaN(KillAuraRotationUtils.serverRotations[1]) ? minecraft.thePlayer.rotationPitch : KillAuraRotationUtils.serverRotations[1];
+        float baseYaw = Float.isFinite(KillAuraRotationUtils.serverRotations[0])
+            ? KillAuraRotationUtils.serverRotations[0] : minecraft.thePlayer.rotationYaw;
+        float basePitch = Float.isFinite(KillAuraRotationUtils.serverRotations[1])
+            ? KillAuraRotationUtils.serverRotations[1] : minecraft.thePlayer.rotationPitch;
         float[] fixed = KillAuraRotationUtils.fixRotation(
             serverYaw == null ? minecraft.thePlayer.rotationYaw : serverYaw.floatValue(),
             serverPitch == null ? minecraft.thePlayer.rotationPitch : serverPitch.floatValue(),
             baseYaw,
             basePitch
         );
+        if (fixed == null || fixed.length < 2 || !Float.isFinite(fixed[0]) || !Float.isFinite(fixed[1])) {
+            serverYaw = null;
+            serverPitch = null;
+            publishedRotation = null;
+            setRotations = false;
+            return;
+        }
         if (serverYaw != null) {
             serverYaw = Float.valueOf(fixed[0]);
         }
         if (serverPitch != null) {
             serverPitch = Float.valueOf(fixed[1]);
         }
-        if ((serverYaw != null && !serverYaw.isNaN() && serverYaw.floatValue() != minecraft.thePlayer.rotationYaw)
-            || (serverPitch != null && !serverPitch.isNaN() && serverPitch.floatValue() != minecraft.thePlayer.rotationPitch)) {
+        if ((serverYaw != null && Float.isFinite(serverYaw.floatValue()) && serverYaw.floatValue() != minecraft.thePlayer.rotationYaw)
+            || (serverPitch != null && Float.isFinite(serverPitch.floatValue()) && serverPitch.floatValue() != minecraft.thePlayer.rotationPitch)) {
             setRotations = true;
+        }
+        if (setRotations) {
+            float publishedYaw = serverYaw == null ? minecraft.thePlayer.rotationYaw : serverYaw.floatValue();
+            float publishedPitch = serverPitch == null ? minecraft.thePlayer.rotationPitch : serverPitch.floatValue();
+            if (Float.isFinite(publishedYaw) && Float.isFinite(publishedPitch)) {
+                publishedRotation = new RotationSnapshot(requestedOwner, publishedYaw, publishedPitch);
+            } else {
+                publishedRotation = null;
+                setRotations = false;
+            }
         }
     }
 
@@ -132,8 +200,8 @@ public final class ClientRotationHelper {
         }
 
         if (setRotations) {
-            float yaw = serverYaw != null && !serverYaw.isNaN() ? serverYaw.floatValue() : entity.rotationYaw;
-            float pitch = serverPitch != null && !serverPitch.isNaN() ? serverPitch.floatValue() : entity.rotationPitch;
+            float yaw = serverYaw != null && Float.isFinite(serverYaw.floatValue()) ? serverYaw.floatValue() : entity.rotationYaw;
+            float pitch = serverPitch != null && Float.isFinite(serverPitch.floatValue()) ? serverPitch.floatValue() : entity.rotationPitch;
             beginSwap(entity, yaw, pitch, true);
             swappedForWalkingUpdate = true;
             KillAuraRotationUtils.serverRotations[0] = yaw;
@@ -146,7 +214,14 @@ public final class ClientRotationHelper {
     }
 
     public boolean isActive() {
-        return setRotations && (serverYaw != null || serverPitch != null);
+        RotationSnapshot snapshot = publishedRotation;
+        return isActive(snapshot);
+    }
+
+    private boolean isActive(RotationSnapshot snapshot) {
+        if (!setRotations || snapshot == null || snapshot != publishedRotation) return false;
+        ResourceArbiter arbiter = getArbiter();
+        return arbiter == null || arbiter.isOwner(ResourceArbiter.Resource.SERVER_ROTATION, snapshot.owner);
     }
 
     public Float getServerYaw() {
@@ -155,6 +230,15 @@ public final class ClientRotationHelper {
 
     public Float getServerPitch() {
         return serverPitch;
+    }
+
+    /** Applies the active silent rotation to the packet without changing the local camera. */
+    public void rewriteMovementPacket(C03PacketPlayer packet) {
+        RotationSnapshot snapshot = publishedRotation;
+        if (packet == null || !isActive(snapshot)) return;
+        packet.yaw = snapshot.yaw;
+        packet.pitch = MathHelper.clamp_float(snapshot.pitch, -90.0F, 90.0F);
+        packet.rotating = true;
     }
 
     public void beginSwap(Entity entity, float yaw, float pitch, boolean swapPitch) {
@@ -213,7 +297,7 @@ public final class ClientRotationHelper {
                 float predictedForward = predictedForwardRaw * sneakMultiplier;
                 float predictedStrafe = predictedStrafeRaw * sneakMultiplier;
                 double predictedAngle = MathHelper.wrapAngleTo180_double(Math.toDegrees(getDirection(serverYaw.floatValue(), predictedForward, predictedStrafe)));
-                double difference = Math.abs(angle - predictedAngle);
+                double difference = Math.abs(MathHelper.wrapAngleTo180_double(angle - predictedAngle));
                 if (difference < closestDifference) {
                     closestDifference = (float) difference;
                     closestForward = predictedForward;
@@ -241,7 +325,24 @@ public final class ClientRotationHelper {
     }
 
     private boolean canFixMovement() {
-        return setRotations && serverYaw != null && !serverYaw.isNaN();
+        return isActive() && serverYaw != null && Float.isFinite(serverYaw.floatValue());
+    }
+
+    private static final class RotationSnapshot {
+        private final String owner;
+        private final float yaw;
+        private final float pitch;
+
+        private RotationSnapshot(String owner, float yaw, float pitch) {
+            this.owner = owner;
+            this.yaw = yaw;
+            this.pitch = pitch;
+        }
+    }
+
+    private static ResourceArbiter getArbiter() {
+        RazorClient client = RazorClient.getInstance();
+        return client == null ? null : client.getModuleManager().getResourceArbiter();
     }
 
     private static double getDirection(float rotationYaw, double moveForward, double moveStrafing) {

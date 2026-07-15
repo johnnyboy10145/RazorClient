@@ -12,7 +12,6 @@ import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.DecimalSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
-import com.razorclient.util.MouseButtonHelper;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -22,7 +21,6 @@ import java.util.Map;
 import java.util.Random;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.EntityRenderer;
-import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
@@ -56,7 +54,7 @@ public final class KillAuraModule extends Module {
     private final BooleanSetting weaponOnly = new BooleanSetting("Weapon Only", false);
 
     private final Map<Integer, Integer> hitMap = new HashMap<Integer, Integer>();
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
     private final java.lang.reflect.Field pointedEntityField;
 
     private EntityLivingBase target;
@@ -95,14 +93,14 @@ public final class KillAuraModule extends Module {
         unregisterForge();
         hitMap.clear();
         clearTargetState();
-        ClientRotationHelper.get().clearRequestedRotations();
+        ClientRotationHelper.get().clearRequestedRotations("KillAura");
     }
 
     @Override
     public void onSessionReset() {
         hitMap.clear();
         clearTargetState();
-        ClientRotationHelper.get().clearRequestedRotations();
+        ClientRotationHelper.get().clearRequestedRotations("KillAura");
     }
 
     @SubscribeEvent
@@ -160,7 +158,6 @@ public final class KillAuraModule extends Module {
             return;
         }
 
-        int key = minecraft.gameSettings.keyBindAttack.getKeyCode();
         long now = System.nanoTime();
         if (nextClickTime == 0L) {
             nextClickTime = now;
@@ -176,10 +173,14 @@ public final class KillAuraModule extends Module {
             return;
         }
 
-        if (!CombatActionCoordinator.tryAcquire("KillAura")) return;
-        KeyBinding.onTick(key);
-        MouseButtonHelper.setButton(0, true);
-        MouseButtonHelper.setButton(0, false);
+        if (!CombatActionCoordinator.tryAcquire("KillAura", target)) return;
+        if (attackingEntity != null && minecraft.playerController != null) {
+            minecraft.playerController.attackEntity(minecraft.thePlayer, attackingEntity);
+            minecraft.thePlayer.swingItem();
+            recordSuccessfulAttack(minecraft, attackingEntity);
+        } else {
+            minecraft.thePlayer.swingItem();
+        }
     }
 
     public boolean shouldOverrideMouseOver() {
@@ -306,7 +307,7 @@ public final class KillAuraModule extends Module {
 
         EntityLivingBase living = (EntityLivingBase) entity;
         if (!CombatTargetService.isValid(minecraft, living, targetType.getValue().targetsPlayers(),
-                targetType.getValue().targetsMobs(), targetInvis.isEnabled(), false, false, maxRange)) {
+                targetType.getValue().targetsMobs(), targetInvis.isEnabled(), false, true, maxRange)) {
             return null;
         }
 
@@ -337,12 +338,21 @@ public final class KillAuraModule extends Module {
         for (KillAuraTarget candidate : attackTargets) {
             Integer firstHitTick = hitMap.get(Integer.valueOf(candidate.entityId));
             if (firstHitTick == null || ticksExisted >= firstHitTick.intValue() + noHitTicks) {
-                hitMap.put(Integer.valueOf(candidate.entityId), Integer.valueOf(ticksExisted));
                 return candidate;
             }
         }
 
         return null;
+    }
+
+    private void recordSuccessfulAttack(Minecraft minecraft, EntityLivingBase attacked) {
+        int tick = minecraft.thePlayer.ticksExisted;
+        java.util.Iterator<Map.Entry<Integer, Integer>> iterator = hitMap.entrySet().iterator();
+        while (iterator.hasNext()) {
+            if (tick - iterator.next().getValue().intValue() > 200) iterator.remove();
+        }
+        if (hitMap.size() >= 256) hitMap.clear();
+        hitMap.put(Integer.valueOf(attacked.getEntityId()), Integer.valueOf(tick));
     }
 
     private boolean basicCondition(Minecraft minecraft) {

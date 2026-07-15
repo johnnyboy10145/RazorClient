@@ -3,6 +3,7 @@ package com.razorclient.inject;
 import com.razorclient.RazorClient;
 import com.razorclient.combat.ClientRotationHelper;
 import com.razorclient.event.PrePlayerInputEvent;
+import com.razorclient.event.PrePlayerInteractEvent;
 import com.razorclient.event.RunTickStartEvent;
 import net.minecraft.client.Minecraft;
 import net.minecraft.entity.Entity;
@@ -21,31 +22,46 @@ import org.lwjgl.input.Mouse;
 
 public final class ClientHooks {
     private static volatile RazorClient client;
+    private static boolean tickDispatchActive;
 
     static void start() {
+        ClientRotationHelper.get().start();
         client = RazorClient.bootstrap();
     }
 
     static void stop() {
-        ClientRotationHelper.get().clearRequestedRotations();
+        ClientRotationHelper.get().stop();
+        tickDispatchActive = false;
         client = null;
     }
 
     public static void runTickHead() {
         if (client == null) client = RazorClient.bootstrap();
+        RazorClient value = client;
+        if (value == null) {
+            tickDispatchActive = false;
+            return;
+        }
+        value.getModuleManager().pollLifecycleState();
+        if (!value.getModuleManager().beginRealTick()) {
+            tickDispatchActive = false;
+            return;
+        }
+        tickDispatchActive = true;
         ClientRotationHelper.get().onRunTickStart();
         MinecraftForge.EVENT_BUS.post(new RunTickStartEvent());
-        RazorClient value = client;
-        if (value != null) {
-            value.onClientTick(new TickEvent.ClientTickEvent(TickEvent.Phase.START));
-            Minecraft mc = Minecraft.getMinecraft();
-            if (mc.thePlayer != null) value.getModuleManager().onPlayerTick(new TickEvent.PlayerTickEvent(TickEvent.Phase.START, mc.thePlayer));
-        }
+        value.onClientTick(new TickEvent.ClientTickEvent(TickEvent.Phase.START));
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc.thePlayer != null) value.getModuleManager().onPlayerTick(new TickEvent.PlayerTickEvent(TickEvent.Phase.START, mc.thePlayer));
+        ClientRotationHelper.get().updateServerRotations();
     }
 
     public static void runTickTail() {
+        if (!tickDispatchActive) return;
+        tickDispatchActive = false;
         RazorClient value = client;
         if (value != null) {
+            MinecraftForge.EVENT_BUS.post(new PrePlayerInteractEvent());
             value.onClientTick(new TickEvent.ClientTickEvent(TickEvent.Phase.END));
             Minecraft mc = Minecraft.getMinecraft();
             if (mc.thePlayer != null) value.getModuleManager().onPlayerTick(new TickEvent.PlayerTickEvent(TickEvent.Phase.END, mc.thePlayer));
@@ -89,12 +105,18 @@ public final class ClientHooks {
 
     public static void renderFrame(float partialTicks) {
         RazorClient value = client;
-        if (value != null) value.getModuleManager().onRenderTick(new TickEvent.RenderTickEvent(TickEvent.Phase.END, partialTicks));
+        if (value != null) {
+            if (value.getModuleManager().getFrameContext() == null) value.getModuleManager().beginFrame(partialTicks);
+            value.getModuleManager().onRenderTick(new TickEvent.RenderTickEvent(TickEvent.Phase.END, partialTicks));
+        }
     }
 
     public static void renderWorld(float partialTicks) {
         RazorClient value = client;
-        if (value != null) value.getModuleManager().onRenderWorld(new RenderWorldLastEvent(partialTicks));
+        if (value != null) {
+            value.getModuleManager().beginFrame(partialTicks);
+            value.getModuleManager().onRenderWorld(new RenderWorldLastEvent(partialTicks));
+        }
     }
 
     public static void renderOverlay(float partialTicks) {

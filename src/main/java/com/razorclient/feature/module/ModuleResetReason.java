@@ -1,6 +1,7 @@
 package com.razorclient.feature.module;
 
 public enum ModuleResetReason {
+    DISABLED,
     WORLD_CHANGE,
     RESPAWN,
     DISCONNECT,

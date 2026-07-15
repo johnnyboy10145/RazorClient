@@ -5,6 +5,8 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.DecimalSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.client.Minecraft;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.EntityPlayer;
@@ -23,7 +25,9 @@ public final class BacktrackModule extends Module {
 
     private volatile int targetEntityId = -1;
     private volatile long lastDeactivatedAt;
-    private volatile boolean inboundFlushRequested;
+    private final AtomicBoolean inboundFlushRequested = new AtomicBoolean();
+    private final AtomicReference<LagModuleSupport.ServerPosition> realPosition =
+        new AtomicReference<LagModuleSupport.ServerPosition>();
     private volatile int targetHurtTimeMs;
 
     public BacktrackModule() {
@@ -40,20 +44,23 @@ public final class BacktrackModule extends Module {
     @Override
     protected void onEnable() {
         targetEntityId = -1;
-        inboundFlushRequested = false;
+        realPosition.set(null);
+        inboundFlushRequested.set(false);
     }
 
     @Override
     protected void onDisable() {
         lastDeactivatedAt = LagModuleSupport.now();
-        inboundFlushRequested = true;
+        inboundFlushRequested.set(true);
         targetEntityId = -1;
+        realPosition.set(null);
     }
 
     @Override
     public void onSessionReset() {
-        inboundFlushRequested = true;
+        inboundFlushRequested.set(true);
         targetEntityId = -1;
+        realPosition.set(null);
         lastDeactivatedAt = LagModuleSupport.now();
     }
 
@@ -61,23 +68,55 @@ public final class BacktrackModule extends Module {
     public void onClientTick() {
         Minecraft minecraft = Minecraft.getMinecraft();
         if (!LagModuleSupport.activeInGame(minecraft)) {
-            inboundFlushRequested = true;
+            if (targetEntityId != -1) {
+                inboundFlushRequested.set(true);
+            }
             targetEntityId = -1;
+            realPosition.set(null);
             return;
         }
 
         if (disableOnHit.isEnabled() && minecraft.thePlayer.hurtTime > 0) {
-            inboundFlushRequested = true;
+            if (targetEntityId != -1) {
+                inboundFlushRequested.set(true);
+                lastDeactivatedAt = LagModuleSupport.now();
+            }
             targetEntityId = -1;
-            lastDeactivatedAt = LagModuleSupport.now();
+            realPosition.set(null);
             return;
         }
 
         EntityPlayer target = LagModuleSupport.crosshairTarget(minecraft, targetDistance.getValue(), 180.0F);
         int previousTargetId = targetEntityId;
-        targetEntityId = target == null ? -1 : target.getEntityId();
+        int nextTargetId = target == null ? -1 : target.getEntityId();
+        if (previousTargetId != nextTargetId) {
+            realPosition.set(LagModuleSupport.entityServerPosition(target));
+        }
+        targetEntityId = nextTargetId;
         targetHurtTimeMs = target == null ? 0 : Math.max(0, target.hurtResistantTime) * 50;
-        if (previousTargetId != -1 && previousTargetId != targetEntityId) inboundFlushRequested = true;
+        if (previousTargetId != -1 && previousTargetId != targetEntityId) {
+            inboundFlushRequested.set(true);
+            lastDeactivatedAt = LagModuleSupport.now();
+        }
+    }
+
+    @Override
+    public void onInboundPacket(Packet<?> packet) {
+        int entityId = LagModuleSupport.getPacketEntityId(packet);
+        if (entityId < 0 || entityId != targetEntityId || !LagModuleSupport.isEntityPositionPacket(packet)) {
+            return;
+        }
+
+        while (true) {
+            LagModuleSupport.ServerPosition previous = realPosition.get();
+            LagModuleSupport.ServerPosition next = LagModuleSupport.decodeServerPosition(packet, previous);
+            if (next == null || next.entityId != targetEntityId) {
+                return;
+            }
+            if (realPosition.compareAndSet(previous, next)) {
+                return;
+            }
+        }
     }
 
     @Override
@@ -100,11 +139,7 @@ public final class BacktrackModule extends Module {
 
     @Override
     public boolean consumeInboundFlushRequest() {
-        if (!inboundFlushRequested) {
-            return false;
-        }
-        inboundFlushRequested = false;
-        return true;
+        return inboundFlushRequested.getAndSet(false);
     }
 
     @Override
@@ -121,7 +156,20 @@ public final class BacktrackModule extends Module {
             return;
         }
         EntityPlayer target = (EntityPlayer) entity;
-        LagModuleSupport.drawEntityBox(target, event, 0.65F, 0.35F, 1.0F);
+        LagModuleSupport.ServerPosition position = realPosition.get();
+        if (position == null || position.entityId != targetEntityId) {
+            return;
+        }
+        LagModuleSupport.drawEntityBoxAt(
+            target,
+            position.x,
+            position.y,
+            position.z,
+            event,
+            0.65F,
+            0.35F,
+            1.0F
+        );
     }
 
     @Override

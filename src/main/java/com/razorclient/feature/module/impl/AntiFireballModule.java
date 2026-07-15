@@ -1,5 +1,6 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.RazorClient;
 import com.razorclient.combat.ClientRotationHelper;
 import com.razorclient.combat.CombatActionCoordinator;
 import com.razorclient.combat.KillAuraRotationUtils;
@@ -11,26 +12,18 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.DecimalSetting;
 import com.razorclient.feature.setting.NumberSetting;
-import com.razorclient.util.MouseButtonHelper;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashSet;
-import java.util.List;
+import com.razorclient.runtime.EntitySnapshotService.ProjectileSnapshot;
+import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
 import java.util.Random;
-import java.util.Set;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.EntityRenderer;
-import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.entity.Entity;
-import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.entity.projectile.EntityFireball;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.MathHelper;
 import net.minecraft.util.MovingObjectPosition;
 import net.minecraft.util.Vec3;
 import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.event.entity.EntityJoinWorldEvent;
 import net.minecraftforge.fml.common.eventhandler.EventPriority;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
@@ -45,8 +38,7 @@ public final class AntiFireballModule extends Module {
     private final BooleanSetting onGround = new BooleanSetting("On Ground", false);
     private final BooleanSetting sneakWhileActive = new BooleanSetting("Sneak While Active", false);
 
-    private final Set<Entity> trackedFireballs = new HashSet<Entity>();
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
     private final java.lang.reflect.Field pointedEntityField;
 
     private EntityFireball fireball;
@@ -68,9 +60,7 @@ public final class AntiFireballModule extends Module {
     protected void onEnable() {
         nextClickTime = 0L;
         fireball = null;
-        trackedFireballs.clear();
         registerForge();
-        seedTrackedFireballs();
     }
 
     @Override
@@ -78,17 +68,14 @@ public final class AntiFireballModule extends Module {
         unregisterForge();
         nextClickTime = 0L;
         fireball = null;
-        trackedFireballs.clear();
-        ClientRotationHelper.get().clearRequestedRotations();
+        ClientRotationHelper.get().clearRequestedRotations("AntiFireball");
     }
 
     @Override
     public void onSessionReset() {
         nextClickTime = 0L;
         fireball = null;
-        trackedFireballs.clear();
-        ClientRotationHelper.get().clearRequestedRotations();
-        seedTrackedFireballs();
+        ClientRotationHelper.get().clearRequestedRotations("AntiFireball");
     }
 
     @Override
@@ -119,7 +106,7 @@ public final class AntiFireballModule extends Module {
 
         float baseYaw = event.yaw != null ? event.yaw.floatValue() : resolveBaseYaw(minecraft);
         float basePitch = event.pitch != null ? event.pitch.floatValue() : resolveBasePitch(minecraft);
-        float[] targetRotations = computeAimRotations(minecraft, baseYaw, basePitch);
+        float[] targetRotations = computeAimRotations(baseYaw, basePitch);
         if (targetRotations == null) {
             return;
         }
@@ -161,43 +148,17 @@ public final class AntiFireballModule extends Module {
             return;
         }
 
-        MovingObjectPosition mouseOver = minecraft.objectMouseOver;
-        if (mouseOver == null
-            || mouseOver.typeOfHit != MovingObjectPosition.MovingObjectType.ENTITY
-            || mouseOver.entityHit != fireball) {
-            nextClickTime = 0L;
-            return;
-        }
-
         long now = System.nanoTime();
         if (nextClickTime == 0L) {
             nextClickTime = now;
         }
 
-        int key = minecraft.gameSettings.keyBindAttack.getKeyCode();
         if (nextClickTime > now) return;
         if (!CombatActionCoordinator.tryAcquire("AntiFireball")) return;
-        KeyBinding.onTick(key);
-        MouseButtonHelper.setButton(0, true);
-        MouseButtonHelper.setButton(0, false);
+        if (minecraft.playerController == null || fireball == null || fireball.isDead) return;
+        minecraft.playerController.attackEntity(minecraft.thePlayer, fireball);
+        minecraft.thePlayer.swingItem();
         nextClickTime = now + (nextDelay() * 1000000L);
-    }
-
-    @SubscribeEvent
-    public void onEntityJoinWorld(EntityJoinWorldEvent event) {
-        Minecraft minecraft = Minecraft.getMinecraft();
-        if (minecraft.thePlayer == null) {
-            return;
-        }
-
-        if (event.entity == minecraft.thePlayer) {
-            trackedFireballs.clear();
-            return;
-        }
-
-        if (event.entity instanceof EntityFireball && minecraft.thePlayer.getDistanceSqToEntity(event.entity) > 16.0D) {
-            trackedFireballs.add(event.entity);
-        }
     }
 
     public void modifyMouseOverFromGetMouseOver(float partialTicks) {
@@ -264,49 +225,40 @@ public final class AntiFireballModule extends Module {
         return shouldAim(minecraft);
     }
 
-    private void seedTrackedFireballs() {
-        Minecraft minecraft = Minecraft.getMinecraft();
-        if (minecraft.thePlayer == null || minecraft.theWorld == null) {
-            return;
-        }
-
-        for (Object object : minecraft.theWorld.loadedEntityList) {
-            if (!(object instanceof EntityFireball)) {
-                continue;
-            }
-
-            Entity entity = (Entity) object;
-            if (minecraft.thePlayer.getDistanceSqToEntity(entity) > 16.0D) {
-                trackedFireballs.add(entity);
-            }
-        }
-    }
-
     private EntityFireball findFireball(Minecraft minecraft) {
+        RazorClient client = RazorClient.getInstance();
+        if (client == null) {
+            return null;
+        }
+
         double rangeSq = range.getValue() * range.getValue();
         float fovValue = (float) fov.getValue();
         EntityFireball best = null;
         double bestDistance = Double.MAX_VALUE;
-
-        for (Object object : minecraft.theWorld.loadedEntityList) {
-            if (!(object instanceof EntityFireball)) {
+        SnapshotFrame frame = client.getModuleManager().getEntitySnapshots().current();
+        for (int index = 0; index < frame.getProjectileCount(); index++) {
+            ProjectileSnapshot snapshot = frame.getProjectile(index);
+            if (!snapshot.isFireball() || snapshot.isDead()) {
                 continue;
             }
 
-            EntityFireball candidate = (EntityFireball) object;
-            if (candidate.isDead) {
-                trackedFireballs.remove(candidate);
+            Entity entity = snapshot.getEntity();
+            if (!(entity instanceof EntityFireball)) {
                 continue;
             }
-            if (!trackedFireballs.contains(candidate)) {
+            EntityFireball candidate = (EntityFireball) entity;
+            if (candidate.isDead || candidate.worldObj != minecraft.theWorld) {
                 continue;
             }
 
-            double distanceSq = minecraft.thePlayer.getDistanceSqToEntity(candidate);
+            double distanceSq = snapshot.getDistanceSquared();
             if (distanceSq > rangeSq) {
                 continue;
             }
-            if (fovValue != 360.0F && !isInFov(minecraft, candidate, fovValue)) {
+            float yawDifference = Math.abs(MathHelper.wrapAngleTo180_float(
+                snapshot.getYawToCenter() - minecraft.thePlayer.rotationYaw
+            ));
+            if (fovValue != 360.0F && yawDifference > fovValue * 0.5F) {
                 continue;
             }
 
@@ -319,70 +271,18 @@ public final class AntiFireballModule extends Module {
         return best;
     }
 
-    private boolean isInFov(Minecraft minecraft, Entity entity, float fovValue) {
-        Vec3 eye = minecraft.thePlayer.getPositionEyes(1.0F);
-        Vec3 point = KillAuraRotationUtils.getAimPoint(entity, 100.0D, 100.0D);
-        if (point == null) {
-            AxisAlignedBB box = entity.getEntityBoundingBox();
-            point = new Vec3(
-                (box.minX + box.maxX) * 0.5D,
-                (box.minY + box.maxY) * 0.5D,
-                (box.minZ + box.maxZ) * 0.5D
-            );
-        }
-
-        double deltaX = point.xCoord - eye.xCoord;
-        double deltaZ = point.zCoord - eye.zCoord;
-        float targetYaw = (float) (Math.atan2(deltaZ, deltaX) * 57.295780181884766D) - 90.0F;
-        float yawDifference = Math.abs(MathHelper.wrapAngleTo180_float(targetYaw - minecraft.thePlayer.rotationYaw));
-        return yawDifference <= fovValue * 0.5F;
-    }
-
-    private float[] computeAimRotations(Minecraft minecraft, float baseYaw, float basePitch) {
+    private float[] computeAimRotations(float baseYaw, float basePitch) {
         if (fireball == null) {
             return null;
         }
 
-        Vec3 eye = minecraft.thePlayer.getPositionEyes(1.0F);
         float border = fireball.getCollisionBorderSize();
         AxisAlignedBB fireballBox = fireball.getEntityBoundingBox().expand(border, border, border);
-        double reach = minecraft.playerController == null ? 3.0D : minecraft.playerController.getBlockReachDistance();
-
-        List<EntityPlayer> players = new ArrayList<EntityPlayer>();
-        for (EntityPlayer player : minecraft.theWorld.playerEntities) {
-            if (player == minecraft.thePlayer || player.deathTime != 0 || player.getHealth() <= 0.0F) {
-                continue;
-            }
-            if (AntiBotModule.shouldIgnore(player)) {
-                continue;
-            }
-            players.add(player);
-        }
-
-        Collections.sort(players, Comparator.comparingDouble(new java.util.function.ToDoubleFunction<EntityPlayer>() {
-            @Override
-            public double applyAsDouble(EntityPlayer value) {
-                return minecraft.thePlayer.getDistanceSqToEntity(value);
-            }
-        }));
-
-        for (EntityPlayer player : players) {
-            float[] rotations = KillAuraRotationUtils.getRotationsToPoint(player.posX, player.posY, player.posZ, baseYaw, basePitch);
-            if (rotations != null && hitsFireballBox(eye, rotations[0], rotations[1], fireballBox, reach)) {
-                return rotations;
-            }
-        }
 
         double topY = fireballBox.maxY;
         double centerX = (fireballBox.minX + fireballBox.maxX) * 0.5D;
         double centerZ = (fireballBox.minZ + fireballBox.maxZ) * 0.5D;
         return KillAuraRotationUtils.getRotationsToPoint(centerX, topY, centerZ, baseYaw, basePitch);
-    }
-
-    private boolean hitsFireballBox(Vec3 eye, float yaw, float pitch, AxisAlignedBB box, double range) {
-        Vec3 look = KillAuraRotationUtils.getVectorForRotation(pitch, yaw);
-        Vec3 end = eye.addVector(look.xCoord * range, look.yCoord * range, look.zCoord * range);
-        return box.calculateIntercept(eye, end) != null;
     }
 
     private long nextDelay() {

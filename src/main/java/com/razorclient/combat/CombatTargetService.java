@@ -1,6 +1,9 @@
 package com.razorclient.combat;
 
+import com.razorclient.RazorClient;
 import com.razorclient.feature.module.impl.AntiBotModule;
+import com.razorclient.feature.module.impl.TeamsModule;
+import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
 import java.util.HashMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -32,20 +35,23 @@ public final class CombatTargetService {
                 || entity == minecraft.thePlayer || entity.isDead || entity.deathTime != 0 || entity.getHealth() <= 0.0F) {
             return false;
         }
+        EntitySnapshot snapshot = snapshot(entity);
+        if (snapshot != null && snapshot.isDead()) return false;
         if (entity instanceof EntityPlayer) {
             if (!players || AntiBotModule.shouldIgnore((EntityPlayer) entity)) {
                 return false;
             }
-            if (ignoreTeammates && minecraft.thePlayer.isOnSameTeam(entity)) {
+            if (ignoreTeammates && ((snapshot == null ? minecraft.thePlayer.isOnSameTeam(entity) : snapshot.isTeammate())
+                    || TeamsModule.isTeammate((EntityPlayer) entity))) {
                 return false;
             }
         } else if (!mobs) {
             return false;
         }
-        if (!allowInvisible && entity.isInvisible()) {
+        if (!allowInvisible && (snapshot == null ? entity.isInvisible() : snapshot.isInvisible())) {
             return false;
         }
-        if (requireVisibility && !minecraft.thePlayer.canEntityBeSeen(entity)) {
+        if (requireVisibility && !(snapshot == null ? minecraft.thePlayer.canEntityBeSeen(entity) : snapshot.isVisible())) {
             return false;
         }
         return distanceToHitbox(minecraft, entity) <= maxDistance;
@@ -55,6 +61,8 @@ public final class CombatTargetService {
         if (minecraft == null || minecraft.thePlayer == null || minecraft.theWorld == null || entity == null) {
             return Double.MAX_VALUE;
         }
+        EntitySnapshot snapshot = snapshot(entity);
+        if (snapshot != null) return snapshot.getDistanceToHitbox();
         resetCacheIfNeeded(minecraft);
         Integer id = Integer.valueOf(entity.getEntityId());
         Double cached = DISTANCE_CACHE.get(id);
@@ -75,9 +83,10 @@ public final class CombatTargetService {
         resetCacheIfNeeded(minecraft);
         if (!candidateCacheBuilt) {
             candidateCacheBuilt = true;
-            for (Object object : minecraft.theWorld.loadedEntityList) {
-                if (object instanceof EntityLivingBase && object != minecraft.thePlayer) {
-                    CANDIDATE_CACHE.add((EntityLivingBase) object);
+            RazorClient client = RazorClient.getInstance();
+            if (client != null) {
+                for (EntitySnapshot snapshot : client.getModuleManager().getEntitySnapshots().current()) {
+                    if (snapshot.getEntity() != null) CANDIDATE_CACHE.add(snapshot.getEntity());
                 }
             }
         }
@@ -131,5 +140,12 @@ public final class CombatTargetService {
 
     private static double clamp(double value, double minimum, double maximum) {
         return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    private static EntitySnapshot snapshot(EntityLivingBase entity) {
+        RazorClient client = RazorClient.getInstance();
+        if (client == null || entity == null) return null;
+        EntitySnapshot snapshot = client.getModuleManager().getEntitySnapshots().find(entity.getEntityId());
+        return snapshot != null && snapshot.getEntity() == entity ? snapshot : null;
     }
 }

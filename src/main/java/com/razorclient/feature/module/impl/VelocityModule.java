@@ -5,6 +5,7 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import com.razorclient.network.PacketDelayManager;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -41,7 +42,7 @@ public final class VelocityModule extends Module {
     private final BooleanSetting allowDoubleClicks = new BooleanSetting("Allow Double Clicks", false);
 
     private final Map<Packet<?>, VelocityDecision> decisions = new IdentityHashMap<Packet<?>, VelocityDecision>();
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
     private volatile String status = "Ready";
     private volatile long statusUntil;
     private volatile long clientTick;
@@ -134,14 +135,18 @@ public final class VelocityModule extends Module {
         }
 
         VelocityDecision decision = createDecision(packet, kind, minecraft);
+        boolean needsPostProcess = decision.mode == Mode.JUMP || decision.mode == Mode.REDUCE;
+        if (decision.delayMs > 0 || decision.cancel || needsPostProcess) {
+            if (!cacheDecision(packet, decision)) {
+                setStatus("Failed", 1200L);
+                return;
+            }
+        }
         if (decision.delayMs > 0) {
-            cacheDecision(packet, decision);
             setStatus("Delayed", Math.max(900L, decision.delayMs + 500L));
             return;
         }
-
-        if (decision.cancel) {
-            cacheDecision(packet, decision);
+        if (decision.cancel || needsPostProcess) {
             return;
         }
 
@@ -152,7 +157,11 @@ public final class VelocityModule extends Module {
     public int getInboundPacketDelay(Packet<?> packet) {
         VelocityDecision decision;
         synchronized (decisions) { decision = decisions.get(packet); }
-        return decision == null ? 0 : decision.delayMs;
+        if (decision == null) return 0;
+        // Jump/Reduce must run after vanilla applies the packet. A one-millisecond
+        // client-thread envelope gives the transport a reliable post-process phase.
+        if (decision.delayMs <= 0 && (decision.mode == Mode.JUMP || decision.mode == Mode.REDUCE)) return 1;
+        return decision.delayMs;
     }
 
     @Override
@@ -170,9 +179,22 @@ public final class VelocityModule extends Module {
         if (decision.cancel) {
             return;
         }
+        if (decision.mode == Mode.JUMP || decision.mode == Mode.REDUCE) {
+            return;
+        }
 
         synchronized (decisions) { decisions.remove(packet); }
         applyDecision(packet, decision);
+    }
+
+    @Override
+    public void onInboundPacketProcessed(Packet<?> packet) {
+        VelocityDecision decision;
+        synchronized (decisions) { decision = decisions.remove(packet); }
+        if (decision == null || decision.cancel) return;
+        if (decision.mode == Mode.JUMP || decision.mode == Mode.REDUCE) {
+            applyDecision(packet, decision);
+        }
     }
 
     @Override
@@ -251,17 +273,12 @@ public final class VelocityModule extends Module {
 
     private void applyDecision(Packet<?> packet, VelocityDecision decision) {
         if (decision.mode == Mode.JUMP) {
-            LagModuleSupport.jumpReset(Minecraft.getMinecraft());
-            setStatus("Jump", 1200L);
+            runClientPlayerAction(decision);
             return;
         }
 
         if (decision.mode == Mode.REDUCE) {
-            if (!applyReduce(decision)) {
-                setStatus("Skipped", 900L);
-                return;
-            }
-            setStatus("Reduced", 1200L);
+            runClientPlayerAction(decision);
             return;
         }
 
@@ -276,6 +293,31 @@ public final class VelocityModule extends Module {
             setStatus("Ignored", 1200L);
         } else {
             setStatus("Scaled", 1200L);
+        }
+    }
+
+    private void runClientPlayerAction(final VelocityDecision decision) {
+        final Minecraft minecraft = Minecraft.getMinecraft();
+        Runnable action = new Runnable() {
+            @Override
+            public void run() {
+                if (!isEnabled() || !LagModuleSupport.inGame(minecraft)) {
+                    return;
+                }
+                if (decision.mode == Mode.JUMP) {
+                    LagModuleSupport.jumpReset(minecraft);
+                    setStatus("Jump", 1200L);
+                } else if (applyReduce(decision)) {
+                    setStatus("Reduced", 1200L);
+                } else {
+                    setStatus("Skipped", 900L);
+                }
+            }
+        };
+        if (minecraft.isCallingFromMinecraftThread()) {
+            action.run();
+        } else {
+            minecraft.addScheduledTask(action);
         }
     }
 
@@ -360,20 +402,24 @@ public final class VelocityModule extends Module {
         this.statusUntil = LagModuleSupport.now() + durationMs;
     }
 
-    private void cacheDecision(Packet<?> packet, VelocityDecision decision) {
+    private boolean cacheDecision(Packet<?> packet, VelocityDecision decision) {
         long now = LagModuleSupport.now();
         synchronized (decisions) {
             if (decisions.size() >= MAX_CACHED_DECISIONS) cleanupExpiredDecisions(now);
-            if (decisions.size() >= MAX_CACHED_DECISIONS) decisions.clear();
+            if (decisions.size() >= MAX_CACHED_DECISIONS) return false;
             decisions.put(packet, decision);
+            return true;
         }
     }
 
     private void cleanupExpiredDecisions(long now) {
-        Iterator<VelocityDecision> iterator = decisions.values().iterator();
+        PacketDelayManager transport = PacketDelayManager.getInstance();
+        Iterator<Map.Entry<Packet<?>, VelocityDecision>> iterator = decisions.entrySet().iterator();
         while (iterator.hasNext()) {
-            VelocityDecision decision = iterator.next();
-            if (now - decision.createdAtMs > DECISION_TTL_MS) {
+            Map.Entry<Packet<?>, VelocityDecision> entry = iterator.next();
+            VelocityDecision decision = entry.getValue();
+            boolean queued = transport != null && transport.isInboundQueued(entry.getKey());
+            if (!queued && now - decision.createdAtMs > DECISION_TTL_MS) {
                 iterator.remove();
             }
         }

@@ -25,10 +25,17 @@ public final class FastPlaceModule extends Module {
     @Override
     public void onClientTick() {
         Minecraft minecraft = Minecraft.getMinecraft();
-        if (RIGHT_CLICK_DELAY == null || minecraft.thePlayer == null || minecraft.theWorld == null
-                || minecraft.currentScreen != null || !minecraft.inGameHasFocus) return;
+        if (RIGHT_CLICK_DELAY == null) return;
+        if (minecraft.thePlayer == null || minecraft.theWorld == null
+                || minecraft.currentScreen != null || !minecraft.inGameHasFocus) {
+            setDelay(minecraft, 4);
+            return;
+        }
         ItemStack held = minecraft.thePlayer.getHeldItem();
-        if (blocksOnly.isEnabled() && (held == null || !(held.getItem() instanceof ItemBlock))) return;
+        if (blocksOnly.isEnabled() && (held == null || !(held.getItem() instanceof ItemBlock))) {
+            setDelay(minecraft, 4);
+            return;
+        }
         setDelay(minecraft, delay.getValue());
     }
 

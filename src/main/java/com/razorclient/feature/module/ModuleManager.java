@@ -4,6 +4,11 @@ import com.razorclient.config.ConfigManager;
 import com.razorclient.combat.CombatTargetService;
 import com.razorclient.combat.CombatActionCoordinator;
 import com.razorclient.util.MouseButtonHelper;
+import com.razorclient.runtime.EntitySnapshotService;
+import com.razorclient.runtime.FrameContext;
+import com.razorclient.runtime.ResourceArbiter;
+import com.razorclient.runtime.RuntimeCore;
+import com.razorclient.runtime.TickContext;
 import com.razorclient.feature.module.impl.AimAssistModule;
 import com.razorclient.feature.module.impl.AutoClickerModule;
 import com.razorclient.feature.module.impl.AntiBotModule;
@@ -24,14 +29,20 @@ import com.razorclient.feature.module.impl.LegitScaffoldModule;
 import com.razorclient.feature.module.impl.NoJumpDelayModule;
 import com.razorclient.feature.module.impl.FastPlaceModule;
 import com.razorclient.feature.module.impl.AutoToolModule;
+import com.razorclient.feature.module.impl.AutoWeaponModule;
+import com.razorclient.feature.module.impl.CriticalsModule;
+import com.razorclient.feature.module.impl.HitSelectModule;
 import com.razorclient.feature.module.impl.ItemPhysicsModule;
 import com.razorclient.feature.module.impl.FullbrightModule;
+import com.razorclient.feature.module.impl.NoHitDelayModule;
 import com.razorclient.feature.module.impl.PingFixModule;
 import com.razorclient.feature.module.impl.PlayerEspModule;
 import com.razorclient.feature.module.impl.ReachModule;
 import com.razorclient.feature.module.impl.RightClickerModule;
 import com.razorclient.feature.module.impl.SelfDestructModule;
 import com.razorclient.feature.module.impl.SprintModule;
+import com.razorclient.feature.module.impl.SprintResetModule;
+import com.razorclient.feature.module.impl.TeamsModule;
 import com.razorclient.feature.module.impl.TrajectoriesModule;
 import com.razorclient.feature.module.impl.VelocityModule;
 import java.util.ArrayList;
@@ -52,6 +63,7 @@ public final class ModuleManager {
     private final Map<Category, List<Module>> modulesByCategory = new EnumMap<Category, List<Module>>(Category.class);
     private final ConfigManager configManager;
     private final ConfigModule configModule;
+    private final RuntimeCore runtimeCore = new RuntimeCore();
     private Object lastWorld;
     private Object lastPlayer;
     private boolean lastPlayerDead;
@@ -68,13 +80,19 @@ public final class ModuleManager {
         register(new NoJumpDelayModule());
         register(new FastPlaceModule());
         register(new AutoToolModule());
+        register(new AutoWeaponModule());
+        register(new HitSelectModule());
+        register(new NoHitDelayModule());
         register(new AutoClickerModule());
         register(new RightClickerModule());
         register(new ReachModule());
         register(new AntiBotModule());
+        register(new TeamsModule());
         register(new AntiFireballModule());
         register(new AimAssistModule());
         register(new KillAuraModule());
+        register(new SprintResetModule());
+        register(new CriticalsModule());
         register(new KnockbackDelayModule());
         register(new VelocityModule());
         register(new FakeLagModule());
@@ -82,7 +100,7 @@ public final class ModuleManager {
         register(new BacktrackModule());
         register(new LagRangeModule());
         register(new PingFixModule());
-        register(ClutchModule.getInstance());
+        register(new ClutchModule());
         register(new ClickRecorderModule());
         register(new ClickGuiModule());
         register(new PlayerEspModule());
@@ -98,6 +116,7 @@ public final class ModuleManager {
     }
 
     private void register(Module module) {
+        module.attachRuntime(runtimeCore.getResourceArbiter());
         modules.add(module);
         modulesByCategory.get(module.getCategory()).add(module);
     }
@@ -123,10 +142,30 @@ public final class ModuleManager {
         updateLifecycleState();
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onClientTick();
+                invokeCallback(module, CallbackKind.CLIENT_TICK, null);
             }
         }
+        ConfigManager.flushPendingSave();
     }
+
+    /** Runs on every live pulse so paused ticks cannot retain input/slot/timer state. */
+    public void pollLifecycleState() {
+        updateLifecycleState();
+    }
+
+    /** Returns true once per actual Minecraft tick, even when the live scheduler pulses faster. */
+    public boolean beginRealTick() {
+        return runtimeCore.beginRealTick(Minecraft.getMinecraft());
+    }
+
+    public FrameContext beginFrame(float partialTicks) {
+        return runtimeCore.beginFrame(Minecraft.getMinecraft(), partialTicks);
+    }
+
+    public TickContext getTickContext() { return runtimeCore.getTickContext(); }
+    public FrameContext getFrameContext() { return runtimeCore.getFrameContext(); }
+    public EntitySnapshotService getEntitySnapshots() { return runtimeCore.getEntitySnapshots(); }
+    public ResourceArbiter getResourceArbiter() { return runtimeCore.getResourceArbiter(); }
 
     private void updateLifecycleState() {
         Minecraft minecraft = Minecraft.getMinecraft();
@@ -153,7 +192,10 @@ public final class ModuleManager {
             CombatActionCoordinator.clear();
             MouseButtonHelper.releaseAllSynthetic();
             for (Module module : modules) {
-                if (module.isEnabled()) module.onInputContextLost(reason);
+                if (module.isEnabled()) {
+                    module.cleanupInputScope(reason);
+                    invokeCallback(module, CallbackKind.INPUT_CONTEXT_LOST, reason);
+                }
             }
         }
         inputContextLost = lost;
@@ -164,14 +206,17 @@ public final class ModuleManager {
         CombatActionCoordinator.clear();
         MouseButtonHelper.releaseAllSynthetic();
         for (Module module : modules) {
-            if (module.isEnabled()) module.onSessionReset(reason);
+            if (module.isEnabled()) {
+                module.resetScope(reason);
+                invokeCallback(module, CallbackKind.SESSION_RESET, reason);
+            }
         }
     }
 
     public void onClientTick(TickEvent.ClientTickEvent event) {
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onClientTick(event);
+                invokeCallback(module, CallbackKind.CLIENT_TICK_EVENT, event);
             }
         }
     }
@@ -179,7 +224,7 @@ public final class ModuleManager {
     public void onPlayerTick(TickEvent.PlayerTickEvent event) {
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onPlayerTick(event);
+                invokeCallback(module, CallbackKind.PLAYER_TICK, event);
             }
         }
     }
@@ -187,7 +232,7 @@ public final class ModuleManager {
     public void onMouseEvent(MouseEvent event) {
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onMouseEvent(event);
+                invokeCallback(module, CallbackKind.MOUSE, event);
             }
         }
     }
@@ -195,7 +240,7 @@ public final class ModuleManager {
     public void onPlayerJump(LivingEvent.LivingJumpEvent event) {
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onPlayerJump(event);
+                invokeCallback(module, CallbackKind.PLAYER_JUMP, event);
             }
         }
     }
@@ -203,7 +248,7 @@ public final class ModuleManager {
     public void onRenderTick(TickEvent.RenderTickEvent event) {
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onRenderTick(event);
+                invokeCallback(module, CallbackKind.RENDER_TICK, event);
             }
         }
     }
@@ -211,7 +256,7 @@ public final class ModuleManager {
     public void onRenderWorld(RenderWorldLastEvent event) {
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onRenderWorld(event);
+                invokeCallback(module, CallbackKind.RENDER_WORLD, event);
             }
         }
     }
@@ -219,7 +264,7 @@ public final class ModuleManager {
     public void onRenderOverlay(RenderGameOverlayEvent.Text event) {
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onRenderOverlay(event);
+                invokeCallback(module, CallbackKind.RENDER_OVERLAY, event);
             }
         }
     }
@@ -246,12 +291,20 @@ public final class ModuleManager {
                 continue;
             }
 
-            int delay = outbound ? module.getOutboundPacketDelay(packet) : module.getInboundPacketDelay(packet);
-            boolean hold = outbound ? module.shouldHoldOutboundPacket(packet) : module.shouldHoldInboundPacket(packet);
+            int delay;
+            boolean hold;
+            int priority;
+            try {
+                delay = outbound ? module.getOutboundPacketDelay(packet) : module.getInboundPacketDelay(packet);
+                hold = outbound ? module.shouldHoldOutboundPacket(packet) : module.shouldHoldInboundPacket(packet);
+                priority = outbound ? module.getOutboundPacketDelayPriority(packet) : module.getInboundPacketDelayPriority(packet);
+            } catch (Throwable failure) {
+                runtimeCore.getFaultBarrier().report(module, outbound ? "outbound-delay" : "inbound-delay", failure);
+                continue;
+            }
             if (delay <= 0 && !hold) {
                 continue;
             }
-            int priority = outbound ? module.getOutboundPacketDelayPriority(packet) : module.getInboundPacketDelayPriority(packet);
             if (selected == null || priority > selectedPriority) {
                 selected = module;
                 selectedDelay = delay;
@@ -265,7 +318,7 @@ public final class ModuleManager {
     public void onOutboundPacket(Packet<?> packet) {
         for (Module module : modules) {
             if (module.isEnabled()) {
-                module.onOutboundPacket(packet);
+                invokePacketCallback(module, "outbound-packet", packet, 0);
             }
         }
     }
@@ -273,15 +326,19 @@ public final class ModuleManager {
     public void onInboundPacket(Packet<?> packet) {
         for (Module module : modules) {
             if (module.isEnabled() || module.receivesInboundPacketsWhenDisabled()) {
-                module.onInboundPacket(packet);
+                invokePacketCallback(module, "inbound-packet", packet, 1);
             }
         }
     }
 
     public boolean shouldCancelInboundPacket(Packet<?> packet) {
         for (Module module : modules) {
-            if (module.isEnabled() && module.shouldCancelInboundPacket(packet)) {
-                return true;
+            if (module.isEnabled()) {
+                try {
+                    if (module.shouldCancelInboundPacket(packet)) return true;
+                } catch (Throwable failure) {
+                    runtimeCore.getFaultBarrier().report(module, "cancel-inbound", failure);
+                }
             }
         }
         return false;
@@ -289,13 +346,61 @@ public final class ModuleManager {
 
     public void onInboundPacketQueued(Packet<?> packet) {
         for (Module module : modules) {
-            module.onInboundPacketQueued(packet);
+            invokePacketCallback(module, "inbound-queued", packet, 2);
         }
     }
 
     public void onInboundPacketReleased(Packet<?> packet) {
         for (Module module : modules) {
-            module.onInboundPacketReleased(packet);
+            invokePacketCallback(module, "inbound-released", packet, 3);
+        }
+    }
+
+    public void onInboundPacketProcessed(Packet<?> packet) {
+        for (Module module : modules) {
+            invokePacketCallback(module, "inbound-processed", packet, 4);
+        }
+    }
+
+    public int consumePacketFlushRequests(Module module) {
+        if (module == null) return 0;
+        try {
+            int requests = module.consumeFlushRequest() ? 1 : 0;
+            if (module.consumeOutboundFlushRequest()) requests |= 2;
+            if (module.consumeInboundFlushRequest()) requests |= 4;
+            return requests;
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, "consume-packet-flush", failure);
+            return 0;
+        }
+    }
+
+    public boolean isPacketDelayOwnerActive(Module module, boolean outbound) {
+        if (module == null || !module.isEnabled()) return false;
+        try {
+            return outbound ? module.isOutboundPacketDelayActive() : module.isInboundPacketDelayActive();
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, "packet-owner-active", failure);
+            return false;
+        }
+    }
+
+    public boolean shouldBypassOutboundOrdering(Module module, Packet<?> packet) {
+        if (module == null) return false;
+        try {
+            return module.shouldBypassOutboundOrdering(packet);
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, "packet-order-bypass", failure);
+            return false;
+        }
+    }
+
+    public void onPacketDelayOverflow(Module module, boolean outbound) {
+        if (module == null) return;
+        try {
+            module.onPacketDelayOverflow(outbound);
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, "packet-overflow", failure);
         }
     }
 
@@ -305,8 +410,12 @@ public final class ModuleManager {
 
     public boolean isPacketDelayActive() {
         for (Module module : modules) {
-            if (module.isEnabled() && module.isPacketDelayActive()) {
-                return true;
+            if (module.isEnabled()) {
+                try {
+                    if (module.isPacketDelayActive()) return true;
+                } catch (Throwable failure) {
+                    runtimeCore.getFaultBarrier().report(module, "packet-delay-active", failure);
+                }
             }
         }
         return false;
@@ -314,8 +423,25 @@ public final class ModuleManager {
 
     public boolean isOutboundPacketDelayActive() {
         for (Module module : modules) {
-            if (module.isEnabled() && module.isOutboundPacketDelayActive()) {
-                return true;
+            if (module.isEnabled()) {
+                try {
+                    if (module.isOutboundPacketDelayActive()) return true;
+                } catch (Throwable failure) {
+                    runtimeCore.getFaultBarrier().report(module, "outbound-delay-active", failure);
+                }
+            }
+        }
+        return false;
+    }
+
+    public boolean isOutboundPacketDelayOwnerActive(String ownerName) {
+        for (Module module : modules) {
+            if (module.isEnabled() && module.getName().equals(ownerName)) {
+                try {
+                    if (module.isOutboundPacketDelayActive()) return true;
+                } catch (Throwable failure) {
+                    runtimeCore.getFaultBarrier().report(module, "outbound-owner-active", failure);
+                }
             }
         }
         return false;
@@ -323,8 +449,25 @@ public final class ModuleManager {
 
     public boolean isInboundPacketDelayActive() {
         for (Module module : modules) {
-            if (module.isEnabled() && module.isInboundPacketDelayActive()) {
-                return true;
+            if (module.isEnabled()) {
+                try {
+                    if (module.isInboundPacketDelayActive()) return true;
+                } catch (Throwable failure) {
+                    runtimeCore.getFaultBarrier().report(module, "inbound-delay-active", failure);
+                }
+            }
+        }
+        return false;
+    }
+
+    public boolean isInboundPacketDelayOwnerActive(String ownerName) {
+        for (Module module : modules) {
+            if (module.isEnabled() && module.getName().equals(ownerName)) {
+                try {
+                    if (module.isInboundPacketDelayActive()) return true;
+                } catch (Throwable failure) {
+                    runtimeCore.getFaultBarrier().report(module, "inbound-owner-active", failure);
+                }
             }
         }
         return false;
@@ -332,8 +475,10 @@ public final class ModuleManager {
 
     public boolean consumeFlushRequest() {
         for (Module module : modules) {
-            if (module.consumeFlushRequest()) {
-                return true;
+            try {
+                if (module.consumeFlushRequest()) return true;
+            } catch (Throwable failure) {
+                runtimeCore.getFaultBarrier().report(module, "consume-flush", failure);
             }
         }
         return false;
@@ -341,8 +486,10 @@ public final class ModuleManager {
 
     public boolean consumeOutboundFlushRequest() {
         for (Module module : modules) {
-            if (module.consumeOutboundFlushRequest()) {
-                return true;
+            try {
+                if (module.consumeOutboundFlushRequest()) return true;
+            } catch (Throwable failure) {
+                runtimeCore.getFaultBarrier().report(module, "consume-outbound-flush", failure);
             }
         }
         return false;
@@ -350,8 +497,10 @@ public final class ModuleManager {
 
     public boolean consumeInboundFlushRequest() {
         for (Module module : modules) {
-            if (module.consumeInboundFlushRequest()) {
-                return true;
+            try {
+                if (module.consumeInboundFlushRequest()) return true;
+            } catch (Throwable failure) {
+                runtimeCore.getFaultBarrier().report(module, "consume-inbound-flush", failure);
             }
         }
         return false;
@@ -365,12 +514,97 @@ public final class ModuleManager {
         configModule.rebuildSettings();
     }
 
+    private void invokeCallback(Module module, CallbackKind callback, Object argument) {
+        try {
+            switch (callback) {
+                case CLIENT_TICK:
+                    module.onClientTick();
+                    break;
+                case CLIENT_TICK_EVENT:
+                    module.onClientTick((TickEvent.ClientTickEvent) argument);
+                    break;
+                case PLAYER_TICK:
+                    module.onPlayerTick((TickEvent.PlayerTickEvent) argument);
+                    break;
+                case MOUSE:
+                    module.onMouseEvent((MouseEvent) argument);
+                    break;
+                case PLAYER_JUMP:
+                    module.onPlayerJump((LivingEvent.LivingJumpEvent) argument);
+                    break;
+                case RENDER_TICK:
+                    module.onRenderTick((TickEvent.RenderTickEvent) argument);
+                    break;
+                case RENDER_WORLD:
+                    module.onRenderWorld((RenderWorldLastEvent) argument);
+                    break;
+                case RENDER_OVERLAY:
+                    module.onRenderOverlay((RenderGameOverlayEvent.Text) argument);
+                    break;
+                case SESSION_RESET:
+                    module.onSessionReset((ModuleResetReason) argument);
+                    break;
+                case INPUT_CONTEXT_LOST:
+                    module.onInputContextLost((ModuleResetReason) argument);
+                    break;
+                default:
+                    break;
+            }
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, callback.label, failure);
+        }
+    }
+
+    private void invokePacketCallback(Module module, String callback, Packet<?> packet, int kind) {
+        try {
+            switch (kind) {
+                case 0:
+                    module.onOutboundPacket(packet);
+                    break;
+                case 1:
+                    module.onInboundPacket(packet);
+                    break;
+                case 2:
+                    module.onInboundPacketQueued(packet);
+                    break;
+                case 3:
+                    module.onInboundPacketReleased(packet);
+                    break;
+                case 4:
+                    module.onInboundPacketProcessed(packet);
+                    break;
+                default:
+                    break;
+            }
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, callback, failure);
+        }
+    }
+
     public void shutdownForUnload() {
+        ConfigManager.flushPendingSaveNow();
         CombatActionCoordinator.clear();
         MouseButtonHelper.releaseAllSynthetic();
         for (Module module : new ArrayList<Module>(modules)) {
             module.forceDisableForUnload();
         }
+        runtimeCore.reset();
+    }
+
+    private enum CallbackKind {
+        CLIENT_TICK("client-tick"),
+        CLIENT_TICK_EVENT("client-tick-event"),
+        PLAYER_TICK("player-tick"),
+        MOUSE("mouse"),
+        PLAYER_JUMP("player-jump"),
+        RENDER_TICK("render-tick"),
+        RENDER_WORLD("render-world"),
+        RENDER_OVERLAY("render-overlay"),
+        SESSION_RESET("session-reset"),
+        INPUT_CONTEXT_LOST("input-context-lost");
+
+        private final String label;
+        CallbackKind(String label) { this.label = label; }
     }
 
     public static final class PacketDelaySelection {

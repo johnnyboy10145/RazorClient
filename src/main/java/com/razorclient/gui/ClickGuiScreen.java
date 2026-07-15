@@ -99,6 +99,7 @@ public final class ClickGuiScreen extends GuiScreen {
         for (CategoryPanel panel : panels) {
             panel.cancelInteraction();
         }
+        ConfigManager.flushPendingSaveNow();
         super.onGuiClosed();
         GuiCursor.exitGui();
     }

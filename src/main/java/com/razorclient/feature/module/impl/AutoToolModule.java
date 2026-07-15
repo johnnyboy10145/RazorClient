@@ -3,6 +3,7 @@ package com.razorclient.feature.module.impl;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
+import com.razorclient.runtime.ResourceArbiter;
 import net.minecraft.block.Block;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityPlayerSP;
@@ -17,6 +18,7 @@ public final class AutoToolModule extends Module {
     private int savedSlot = -1;
     private boolean selecting;
     private EntityPlayerSP selectingPlayer;
+    private ResourceArbiter.Lease slotLease;
 
     public AutoToolModule() {
         super("Auto Tool", "Selects the strongest hotbar tool while mining.", Category.PLAYER, Keyboard.KEY_NONE);
@@ -27,7 +29,7 @@ public final class AutoToolModule extends Module {
     public void onClientTick() {
         Minecraft minecraft = Minecraft.getMinecraft();
         if (!canSelect(minecraft)) {
-            stopSelecting(minecraft);
+            stopSelecting();
             return;
         }
 
@@ -36,26 +38,37 @@ public final class AutoToolModule extends Module {
         int bestSlot = findBestSlot(minecraft, block);
         if (bestSlot < 0) return;
         if (!selecting) {
-            savedSlot = minecraft.thePlayer.inventory.currentItem;
-            selectingPlayer = minecraft.thePlayer;
+            if (bestSlot == minecraft.thePlayer.inventory.currentItem) return;
+            final EntityPlayerSP player = minecraft.thePlayer;
+            final int originalSlot = player.inventory.currentItem;
+            slotLease = getScope().acquire(ResourceArbiter.Resource.HOTBAR_SLOT, 100, 2, new Runnable() {
+                @Override public void run() { restoreSlot(player, originalSlot); }
+            });
+            if (slotLease == null) return;
+            savedSlot = originalSlot;
+            selectingPlayer = player;
             selecting = true;
+        } else if (slotLease == null || !slotLease.renew(2)) {
+            clearSelectionState();
+            return;
         }
         minecraft.thePlayer.inventory.currentItem = bestSlot;
+        if (minecraft.playerController != null) minecraft.playerController.syncCurrentPlayItem();
     }
 
     @Override
     protected void onDisable() {
-        stopSelecting(Minecraft.getMinecraft());
+        stopSelecting();
     }
 
     @Override
     public void onSessionReset() {
-        stopSelecting(Minecraft.getMinecraft());
+        stopSelecting();
     }
 
     @Override
     public void onInputContextLost() {
-        stopSelecting(Minecraft.getMinecraft());
+        stopSelecting();
     }
 
     @Override
@@ -88,13 +101,24 @@ public final class AutoToolModule extends Module {
         return stack == null || block == null ? 1.0F : stack.getStrVsBlock(block);
     }
 
-    private void stopSelecting(Minecraft minecraft) {
-        if (selecting && returnToSlot.isEnabled() && savedSlot >= 0 && savedSlot < 9
-                && minecraft != null && minecraft.thePlayer == selectingPlayer) {
-            minecraft.thePlayer.inventory.currentItem = savedSlot;
-        }
+    private void stopSelecting() {
+        ResourceArbiter.Lease lease = slotLease;
+        slotLease = null;
+        if (lease != null && lease.isValid()) lease.close();
+        clearSelectionState();
+    }
+
+    private void clearSelectionState() {
         savedSlot = -1;
         selecting = false;
         selectingPlayer = null;
+    }
+
+    private void restoreSlot(EntityPlayerSP player, int slot) {
+        Minecraft minecraft = Minecraft.getMinecraft();
+        if (!returnToSlot.isEnabled() || player == null || slot < 0 || slot >= 9
+                || minecraft == null || minecraft.thePlayer != player) return;
+        player.inventory.currentItem = slot;
+        if (minecraft.playerController != null) minecraft.playerController.syncCurrentPlayItem();
     }
 }

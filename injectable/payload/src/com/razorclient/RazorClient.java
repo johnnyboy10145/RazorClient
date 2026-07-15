@@ -5,6 +5,7 @@ import com.razorclient.feature.module.ModuleManager;
 import com.razorclient.feature.module.impl.HudModule;
 import com.razorclient.gui.ClickGuiScreen;
 import com.razorclient.gui.HudEditorScreen;
+import com.razorclient.gui.GuiCursor;
 import com.razorclient.network.KnockbackDelayBuffer;
 import com.razorclient.network.PacketDelayManager;
 import net.minecraft.client.Minecraft;
@@ -15,6 +16,7 @@ public final class RazorClient {
     public static final String NAME = "\u00AE\uFE0FazorClient";
     public static final String VERSION = "2.0.0-injectable";
     private static volatile RazorClient instance;
+    private static Thread shutdownHook;
 
     private final ModuleManager moduleManager = new ModuleManager();
     private final PacketDelayManager packetDelayManager = new PacketDelayManager(moduleManager);
@@ -24,7 +26,14 @@ public final class RazorClient {
     public static synchronized RazorClient bootstrap() {
         if (instance == null) {
             instance = new RazorClient();
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> instance.moduleManager.getConfigManager().saveCurrent(), "RazorClient-ConfigSave"));
+            shutdownHook = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    RazorClient client = instance;
+                    if (client != null) client.moduleManager.getConfigManager().saveCurrent();
+                }
+            }, "RazorClient-ConfigSave");
+            Runtime.getRuntime().addShutdownHook(shutdownHook);
         }
         return instance;
     }
@@ -41,10 +50,20 @@ public final class RazorClient {
         if (mc != null && (mc.currentScreen == client.clickGuiScreen || mc.currentScreen instanceof HudEditorScreen)) {
             mc.displayGuiScreen(null);
         }
-        client.packetDelayManager.flushAll();
-        client.moduleManager.shutdownForUnload();
         client.moduleManager.getConfigManager().saveCurrent();
+        client.packetDelayManager.closeForUnload();
+        client.moduleManager.shutdownForUnload();
+        GuiCursor.shutdown();
         instance = null;
+        Thread hook = shutdownHook;
+        shutdownHook = null;
+        if (hook != null) {
+            try {
+                Runtime.getRuntime().removeShutdownHook(hook);
+            } catch (IllegalStateException | SecurityException ignored) {
+                // JVM shutdown has already started or hook removal is unavailable.
+            }
+        }
     }
 
     public void onClientTick(TickEvent.ClientTickEvent event) {
@@ -64,7 +83,7 @@ public final class RazorClient {
     public void toggleClickGui() {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.currentScreen == clickGuiScreen) mc.displayGuiScreen(null);
-        else mc.displayGuiScreen(clickGuiScreen);
+        else if (mc.currentScreen == null) mc.displayGuiScreen(clickGuiScreen);
     }
 
     public void openHudEditor() {

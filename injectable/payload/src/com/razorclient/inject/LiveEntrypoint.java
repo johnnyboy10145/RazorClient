@@ -5,9 +5,10 @@ import com.razorclient.feature.module.Module;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.channel.ChannelOutboundHandlerAdapter;
+import io.netty.channel.ChannelOutboundHandler;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.ChannelPromise;
+import java.net.SocketAddress;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -17,6 +18,7 @@ import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.network.INetHandler;
 import net.minecraft.network.NetworkManager;
 import net.minecraft.network.Packet;
+import net.minecraft.network.play.client.C03PacketPlayer;
 import net.minecraftforge.client.event.MouseEvent;
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
@@ -25,8 +27,7 @@ import org.lwjgl.opengl.GL11;
 public final class LiveEntrypoint {
     private static final AtomicBoolean STARTED = new AtomicBoolean();
     private static final AtomicBoolean SCHEDULED = new AtomicBoolean();
-    private static final String INBOUND_HANDLER_NAME = "razorclient_live_inbound";
-    private static final String OUTBOUND_HANDLER_NAME = "razorclient_live_outbound";
+    private static final String PACKET_HANDLER_NAME = "razorclient_live_transport";
     private static volatile boolean running;
     private static volatile String injectionId;
     private static volatile NetworkManager installedManager;
@@ -55,13 +56,35 @@ public final class LiveEntrypoint {
             return;
         }
         try {
+            Minecraft minecraft = Minecraft.getMinecraft();
+            if (minecraft == null) throw new IllegalStateException("Minecraft instance unavailable");
+            minecraft.addScheduledTask(new Runnable() {
+                @Override
+                public void run() {
+                    startOnClientThread();
+                }
+            });
+            InjectionStatus.write("JAVA_START_SCHEDULED", "waiting for Minecraft client thread");
+        } catch (Throwable failure) {
+            STARTED.set(false);
+            reportStartupFailure(failure);
+            throw failure;
+        }
+    }
+
+    private static void startOnClientThread() {
+        boolean hooksStarted = false;
+        boolean bridgeInstalled = false;
+        try {
             unloadParentEntrypoint();
             injectionId = UUID.randomUUID().toString();
             running = true;
+            hooksStarted = true;
             ClientHooks.start();
             if (!installNativeRenderBridge()) {
                 throw new IllegalStateException("Native render bridge installation failed");
             }
+            bridgeInstalled = true;
             System.setProperty("razorclient.live.injected", "true");
             System.setProperty("razorclient.live.epoch", injectionId);
             AgentLog.info("LiveEntrypoint started with loader " + LiveEntrypoint.class.getClassLoader());
@@ -84,12 +107,32 @@ public final class LiveEntrypoint {
             loop.start();
         } catch (Throwable failure) {
             running = false;
+            if (bridgeInstalled) {
+                try {
+                    uninstallNativeRenderBridge();
+                } catch (Throwable rollbackFailure) {
+                    AgentLog.error("Render bridge startup rollback failed", rollbackFailure);
+                }
+            }
+            if (hooksStarted) {
+                try {
+                    RazorClient.shutdownForUnload();
+                } finally {
+                    ClientHooks.stop();
+                }
+            }
+            if (isCurrentEpoch()) {
+                System.clearProperty("razorclient.live.injected");
+                System.clearProperty("razorclient.live.epoch");
+            }
             STARTED.set(false);
-            System.clearProperty("razorclient.live.injected");
-            InjectionStatus.write("FAILED", "LiveEntrypoint startup failed: " + failure);
-            AgentLog.error("LiveEntrypoint startup failed", failure);
-            throw failure;
+            reportStartupFailure(failure);
         }
+    }
+
+    private static void reportStartupFailure(Throwable failure) {
+        InjectionStatus.write("FAILED", "LiveEntrypoint startup failed: " + failure);
+        AgentLog.error("LiveEntrypoint startup failed", failure);
     }
 
     public static void unload() {
@@ -114,8 +157,6 @@ public final class LiveEntrypoint {
             mc.addScheduledTask(new Runnable() {
                 @Override
                 public void run() {
-                    RazorClient client = RazorClient.getInstance();
-                    if (client != null) client.getPacketDelayManager().flushAll();
                     RazorClient.shutdownForUnload();
                     ClientHooks.stop();
                     downKeys.clear();
@@ -128,7 +169,12 @@ public final class LiveEntrypoint {
                 }
             });
         } else {
-            InjectionStatus.write("UNLOADED", "Minecraft instance unavailable");
+            RazorClient.shutdownForUnload();
+            ClientHooks.stop();
+            downKeys.clear();
+            for (int i = 0; i < downMouseButtons.length; i++) downMouseButtons[i] = false;
+            SCHEDULED.set(false);
+            InjectionStatus.write("UNLOADED", "client shutdown completed without Minecraft instance");
         }
     }
 
@@ -185,14 +231,13 @@ public final class LiveEntrypoint {
         ClientHooks.runTickTail();
     }
 
-    public static void renderNativeFrame() {
-        if (!running || !isCurrentEpoch() || !RENDERING.compareAndSet(false, true)) return;
-        Minecraft mc = Minecraft.getMinecraft();
-        if (mc == null || mc.theWorld == null || mc.thePlayer == null || mc.currentScreen != null) {
-            RENDERING.set(false);
-            return;
-        }
+    public static boolean renderNativeFrame() {
+        if (!running || !isCurrentEpoch() || !RENDERING.compareAndSet(false, true)) return false;
+        boolean rendered = false;
         try {
+            Minecraft mc = Minecraft.getMinecraft();
+            if (mc == null || !mc.isCallingFromMinecraftThread() || mc.theWorld == null
+                    || mc.thePlayer == null || mc.currentScreen != null) return false;
             if (!renderBridgeLogged) {
                 renderBridgeLogged = true;
                 AgentLog.info("Live render bridge active");
@@ -204,11 +249,13 @@ public final class LiveEntrypoint {
             GL11.glMatrixMode(GL11.GL_MODELVIEW);
             GL11.glPushMatrix();
             try {
-                mc.entityRenderer.setupCameraTransform(1.0F, 0);
-                ClientHooks.renderWorld(1.0F);
+                float partialTicks = mc.timer == null ? 0.0F : Math.max(0.0F, Math.min(1.0F, mc.timer.renderPartialTicks));
+                mc.entityRenderer.setupCameraTransform(partialTicks, 0);
+                ClientHooks.renderWorld(partialTicks);
                 mc.entityRenderer.setupOverlayRendering();
-                ClientHooks.renderOverlay(1.0F);
-                ClientHooks.renderFrame(1.0F);
+                ClientHooks.renderOverlay(partialTicks);
+                ClientHooks.renderFrame(partialTicks);
+                rendered = true;
             } finally {
                 GL11.glMatrixMode(GL11.GL_MODELVIEW);
                 GL11.glPopMatrix();
@@ -226,6 +273,7 @@ public final class LiveEntrypoint {
         } finally {
             RENDERING.set(false);
         }
+        return rendered;
     }
 
     private static void pollKeybinds(RazorClient client) {
@@ -307,14 +355,12 @@ public final class LiveEntrypoint {
                 try {
                     if (!running || !isCurrentEpoch() || pendingManager != manager) return;
                     ChannelPipeline pipeline = channel.pipeline();
-                    if (pipeline.get(INBOUND_HANDLER_NAME) != null) {
-                        pipeline.remove(INBOUND_HANDLER_NAME);
-                    }
-                    if (pipeline.get(OUTBOUND_HANDLER_NAME) != null) {
-                        pipeline.remove(OUTBOUND_HANDLER_NAME);
-                    }
-                    pipeline.addFirst(INBOUND_HANDLER_NAME, new LiveInboundHandler(manager));
-                    pipeline.addFirst(OUTBOUND_HANDLER_NAME, new LiveOutboundHandler());
+                    if (pipeline.get(PACKET_HANDLER_NAME) != null) pipeline.remove(PACKET_HANDLER_NAME);
+                    ChannelHandlerContext managerContext = pipeline.context(manager);
+                    String anchor = managerContext == null ? null : managerContext.name();
+                    if (anchor == null && pipeline.get("packet_handler") != null) anchor = "packet_handler";
+                    if (anchor == null) throw new IllegalStateException("NetworkManager pipeline anchor not found");
+                    pipeline.addBefore(anchor, PACKET_HANDLER_NAME, new LivePacketHandler(manager));
                     AgentLog.info("Installed live Netty packet handler");
                     InjectionStatus.write("NETTY_HANDLER_INSTALLED", "manager=" + manager);
                     installedManager = manager;
@@ -357,11 +403,8 @@ public final class LiveEntrypoint {
             public void run() {
                 try {
                     ChannelPipeline pipeline = manager.channel.pipeline();
-                    if (pipeline.get(INBOUND_HANDLER_NAME) != null) {
-                        pipeline.remove(INBOUND_HANDLER_NAME);
-                    }
-                    if (pipeline.get(OUTBOUND_HANDLER_NAME) != null) {
-                        pipeline.remove(OUTBOUND_HANDLER_NAME);
+                    if (pipeline.get(PACKET_HANDLER_NAME) != null) {
+                        pipeline.remove(PACKET_HANDLER_NAME);
                         AgentLog.info("Removed live Netty packet handler");
                     }
                 } catch (Throwable failure) {
@@ -371,22 +414,28 @@ public final class LiveEntrypoint {
         });
     }
 
-    private static final class LiveOutboundHandler extends ChannelOutboundHandlerAdapter {
-        @Override
-        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-            if (msg instanceof Packet && ClientHooks.outbound((Packet<?>) msg)) {
-                if (promise != null) promise.setSuccess();
-                return;
-            }
-            super.write(ctx, msg, promise);
-        }
-    }
-
-    private static final class LiveInboundHandler extends ChannelInboundHandlerAdapter {
+    private static final class LivePacketHandler extends ChannelInboundHandlerAdapter implements ChannelOutboundHandler {
         private final NetworkManager manager;
 
-        private LiveInboundHandler(NetworkManager manager) {
+        private LivePacketHandler(NetworkManager manager) {
             this.manager = manager;
+        }
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+            if (msg instanceof Packet) {
+                RazorClient client = RazorClient.getInstance();
+                boolean releaseWrite = client != null
+                    && client.getPacketDelayManager().isReleasingOutbound((Packet<?>) msg);
+                if (msg instanceof C03PacketPlayer && !releaseWrite) {
+                    com.razorclient.combat.ClientRotationHelper.get().rewriteMovementPacket((C03PacketPlayer) msg);
+                }
+                if (client != null
+                    && client.getPacketDelayManager().interceptOutbound((Packet<?>) msg, null, promise, manager)) {
+                    return;
+                }
+            }
+            ctx.write(msg, promise);
         }
 
         @Override
@@ -394,11 +443,47 @@ public final class LiveEntrypoint {
             if (msg instanceof Packet) {
                 INetHandler listener = manager.packetListener;
                 if (listener != null && RazorClient.getInstance() != null
-                    && RazorClient.getInstance().getPacketDelayManager().interceptInbound((Packet<?>) msg, listener)) {
+                    && RazorClient.getInstance().getPacketDelayManager().interceptInbound((Packet<?>) msg, listener, ctx, manager)) {
                     return;
                 }
             }
-            super.channelRead(ctx, msg);
+            ctx.fireChannelRead(msg);
+        }
+
+        @Override
+        public void bind(ChannelHandlerContext ctx, SocketAddress localAddress, ChannelPromise promise) {
+            ctx.bind(localAddress, promise);
+        }
+
+        @Override
+        public void connect(ChannelHandlerContext ctx, SocketAddress remoteAddress,
+                SocketAddress localAddress, ChannelPromise promise) {
+            ctx.connect(remoteAddress, localAddress, promise);
+        }
+
+        @Override
+        public void disconnect(ChannelHandlerContext ctx, ChannelPromise promise) {
+            ctx.disconnect(promise);
+        }
+
+        @Override
+        public void close(ChannelHandlerContext ctx, ChannelPromise promise) {
+            ctx.close(promise);
+        }
+
+        @Override
+        public void deregister(ChannelHandlerContext ctx, ChannelPromise promise) {
+            ctx.deregister(promise);
+        }
+
+        @Override
+        public void read(ChannelHandlerContext ctx) {
+            ctx.read();
+        }
+
+        @Override
+        public void flush(ChannelHandlerContext ctx) {
+            ctx.flush();
         }
     }
 

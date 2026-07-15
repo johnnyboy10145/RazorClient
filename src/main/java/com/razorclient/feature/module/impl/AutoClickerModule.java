@@ -25,7 +25,7 @@ import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
 
 public final class AutoClickerModule extends Module {
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
     private final Method guiClickMethod;
     private final Field leftClickCounterField;
 
@@ -43,6 +43,7 @@ public final class AutoClickerModule extends Module {
     private final NumberSetting inventoryCps = new NumberSetting("Inventory CPS", 1, 20, 1, 10);
 
     private long lastClick;
+    private long nextClickAt;
     private long holdUntil;
     private long recordNextClickTime;
     private int burstTicks;
@@ -122,7 +123,6 @@ public final class AutoClickerModule extends Module {
             return;
         }
 
-        Mouse.poll();
         if (!Mouse.isButtonDown(0)) {
             resetPhysicalState();
             return;
@@ -145,19 +145,15 @@ public final class AutoClickerModule extends Module {
             return;
         }
 
-        applyJitter(minecraft);
-
         if (mode.getValue() == Mode.RECORD) {
-            recordClick();
+            recordClick(minecraft);
             return;
         }
 
-        normalClick();
+        normalClick(minecraft);
     }
 
-    private void normalClick() {
-        long delay = computeDelayNanos();
-        long holdLength = Math.max(1000000L, delay / (clickPattern.getValue() == ClickPattern.BUTTERFLY ? 4L : 2L));
+    private void normalClick(Minecraft minecraft) {
         long now = System.nanoTime();
 
         if (leftDown) {
@@ -168,16 +164,21 @@ public final class AutoClickerModule extends Module {
             return;
         }
 
-        if (now - lastClick >= delay) {
-            if (!CombatActionCoordinator.tryAcquire("LeftClicker")) return;
-            lastClick = now;
-            holdUntil = now + holdLength;
-            sendClick(true);
-            leftDown = true;
-        }
+        if (nextClickAt == 0L) nextClickAt = now;
+        if (now < nextClickAt || !CombatActionCoordinator.tryAcquire(
+                "LeftClicker", CombatModuleSupport.crosshairLivingTarget(minecraft))) return;
+
+        long delay = computeDelayNanos();
+        long holdLength = Math.max(1000000L, delay / (clickPattern.getValue() == ClickPattern.BUTTERFLY ? 4L : 2L));
+        lastClick = now;
+        nextClickAt = now + delay;
+        holdUntil = now + holdLength;
+        applyJitter(minecraft);
+        sendClick(true);
+        leftDown = true;
     }
 
-    private void recordClick() {
+    private void recordClick(Minecraft minecraft) {
         int delayCount = ClickPatternStore.size();
         if (delayCount == 0) {
             if (!recordNoticeShown) {
@@ -196,7 +197,9 @@ public final class AutoClickerModule extends Module {
             return;
         }
 
-        if (!CombatActionCoordinator.tryAcquire("LeftClicker")) return;
+        if (!CombatActionCoordinator.tryAcquire(
+                "LeftClicker", CombatModuleSupport.crosshairLivingTarget(minecraft))) return;
+        applyJitter(minecraft);
         sendClick(true);
         sendClick(false);
 
@@ -227,7 +230,10 @@ public final class AutoClickerModule extends Module {
 
         int key = minecraft.gameSettings.keyBindAttack.getKeyCode();
         KeyBinding.setKeyBindState(key, true);
-        KeyBinding.onTick(key);
+        if (leftDown) {
+            MouseButtonHelper.setButton(0, false);
+            leftDown = false;
+        }
         return true;
     }
 
@@ -306,8 +312,7 @@ public final class AutoClickerModule extends Module {
             cps -= 0.8D + random.nextDouble();
         }
         cps = Math.max(1.0D, cps);
-        long delay = Math.max(1000000L, Math.round(1000000000.0D / cps));
-        return clickPattern.getValue() == ClickPattern.BUTTERFLY ? Math.max(10000000L, delay / 2L) : delay;
+        return Math.max(1000000L, Math.round(1000000000.0D / cps));
     }
 
     private boolean isKillAuraAttacking() {
@@ -338,6 +343,7 @@ public final class AutoClickerModule extends Module {
 
     private void resetClickState() {
         lastClick = 0L;
+        nextClickAt = 0L;
         holdUntil = 0L;
         recordIndex = 0;
         recordNextClickTime = -1L;
@@ -346,8 +352,17 @@ public final class AutoClickerModule extends Module {
     }
 
     private void resetPhysicalState() {
+        if (leftDown) {
+            MouseButtonHelper.setButton(0, false);
+        }
         leftDown = false;
-        sendClick(false);
+        Minecraft minecraft = Minecraft.getMinecraft();
+        if (minecraft != null && minecraft.gameSettings != null) {
+            KeyBinding.setKeyBindState(
+                minecraft.gameSettings.keyBindAttack.getKeyCode(),
+                Mouse.isCreated() && Mouse.isButtonDown(0)
+            );
+        }
     }
 
     private void normalizeRanges() {

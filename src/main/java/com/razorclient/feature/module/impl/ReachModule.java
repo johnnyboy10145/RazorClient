@@ -24,7 +24,7 @@ public final class ReachModule extends Module {
 
     private final DecimalSetting reach = new DecimalSetting("Reach", VANILLA_REACH, 6.0D, 0.1D, VANILLA_REACH);
     private final NumberSetting chance = new NumberSetting("Chance", 0, 100, 1, 100);
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
 
     public ReachModule() {
         super("Reach", "Extends attack range. Patched on any decent anticheat.", Category.COMBAT, Keyboard.KEY_NONE);
@@ -61,7 +61,7 @@ public final class ReachModule extends Module {
         }
 
         EntityLivingBase living = (EntityLivingBase) target;
-        if (!CombatTargetService.isValid(minecraft, living, true, true, false, false, false, configuredReach)
+        if (!CombatTargetService.isValid(minecraft, living, true, true, false, false, true, configuredReach)
                 || isBlocked(minecraft, living)) {
             return;
         }
@@ -71,9 +71,10 @@ public final class ReachModule extends Module {
             return;
         }
 
-        if (!CombatActionCoordinator.tryAcquire("Reach")) return;
+        if (!CombatActionCoordinator.tryAcquire("Reach", living)) return;
         minecraft.playerController.attackEntity(minecraft.thePlayer, target);
         minecraft.thePlayer.swingItem();
+        minecraft.leftClickCounter = Math.max(1, minecraft.leftClickCounter);
         event.setCanceled(true);
     }
 

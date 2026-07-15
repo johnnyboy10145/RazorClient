@@ -1,13 +1,13 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.RazorClient;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import com.razorclient.runtime.FrameContext;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.Iterator;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockBed;
 import net.minecraft.block.material.Material;
@@ -31,13 +32,15 @@ import net.minecraft.init.Blocks;
 import net.minecraft.util.BlockPos;
 import net.minecraft.util.MathHelper;
 import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
 import org.lwjgl.input.Keyboard;
 import org.lwjgl.opengl.GL11;
 
 public final class BedPlatesModule extends Module {
     private static final int FALLBACK_RESCAN_INTERVAL_TICKS = 240;
-    private static final int FALLBACK_RESCAN_CHUNKS_PER_TICK = 1;
+    private static final int FALLBACK_RESCAN_CHUNKS_PER_TICK = 2;
+    private static final int BLOCK_SCAN_BUDGET_PER_TICK = 16384;
     private static final float LABEL_BASE_SCALE = 0.026F;
     private static final float LABEL_DISTANCE_REFERENCE = 32.0F;
     private static final float LABEL_DISTANCE_MULTIPLIER = 6.0F;
@@ -52,6 +55,8 @@ public final class BedPlatesModule extends Module {
     private final Set<Long> scannedChunks = new HashSet<Long>();
     private final Deque<Long> rescanQueue = new ArrayDeque<Long>();
     private final Set<Long> queuedChunks = new HashSet<Long>();
+    private final List<BedRenderInfo> renderPool = new ArrayList<BedRenderInfo>();
+    private ChunkScanTask activeScan;
 
     private WorldClient cachedWorld;
     private int ticksSinceFallback;
@@ -131,28 +136,51 @@ public final class BedPlatesModule extends Module {
             return;
         }
 
-        List<BedRenderInfo> beds = new ArrayList<BedRenderInfo>();
+        int renderCount = 0;
         double maxDistanceSq = range.getValue() * range.getValue();
         for (CachedBed cachedBed : bedCache.values()) {
             double distanceSq = getDistanceSq(player, cachedBed.first, cachedBed.second);
             if (distanceSq <= maxDistanceSq) {
-                beds.add(new BedRenderInfo(cachedBed.first, cachedBed.second, cachedBed.defenses, distanceSq));
+                BedRenderInfo renderInfo;
+                if (renderCount < renderPool.size()) {
+                    renderInfo = renderPool.get(renderCount);
+                } else {
+                    renderInfo = new BedRenderInfo();
+                    renderPool.add(renderInfo);
+                }
+                renderInfo.set(cachedBed.first, cachedBed.second, cachedBed.defenses, distanceSq);
+                renderCount++;
             }
         }
 
-        if (beds.isEmpty()) {
-            return;
+        if (renderCount == 0) return;
+        sortRenderPool(renderCount);
+
+        RazorClient client = RazorClient.getInstance();
+        FrameContext frame = client == null ? null : client.getModuleManager().getFrameContext();
+        GL11.glPushAttrib(GL11.GL_ALL_ATTRIB_BITS);
+        try {
+            for (int i = 0; i < renderCount; i++) renderLabel(mc, frame, renderPool.get(i));
+        } finally {
+            GlStateManager.disableBlend();
+            GlStateManager.enableDepth();
+            GlStateManager.depthMask(true);
+            GlStateManager.enableTexture2D();
+            GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
+            GL11.glLineWidth(1.0F);
+            GL11.glPopAttrib();
         }
+    }
 
-        Collections.sort(beds, new Comparator<BedRenderInfo>() {
-            @Override
-            public int compare(BedRenderInfo left, BedRenderInfo right) {
-                return Double.compare(left.distanceSq, right.distanceSq);
+    private void sortRenderPool(int count) {
+        for (int i = 1; i < count; i++) {
+            BedRenderInfo value = renderPool.get(i);
+            int insert = i;
+            while (insert > 0 && renderPool.get(insert - 1).distanceSq > value.distanceSq) {
+                renderPool.set(insert, renderPool.get(insert - 1));
+                insert--;
             }
-        });
-
-        for (BedRenderInfo bed : beds) {
-            renderLabel(mc, bed);
+            renderPool.set(insert, value);
         }
     }
 
@@ -164,33 +192,27 @@ public final class BedPlatesModule extends Module {
         for (int chunkX = playerChunkX - chunkRadius; chunkX <= playerChunkX + chunkRadius; chunkX++) {
             for (int chunkZ = playerChunkZ - chunkRadius; chunkZ <= playerChunkZ + chunkRadius; chunkZ++) {
                 long chunkKey = makeChunkKey(chunkX, chunkZ);
-                if (scannedChunks.contains(chunkKey) || !isChunkLoaded(world, chunkX, chunkZ)) {
+                if (scannedChunks.contains(chunkKey) || queuedChunks.contains(chunkKey)
+                        || !isChunkLoaded(world, chunkX, chunkZ)) {
                     continue;
                 }
-                scanChunk(world, chunkX, chunkZ);
+                queueChunk(chunkKey);
             }
         }
     }
 
     private boolean removeBrokenBeds(WorldClient world) {
         boolean removed = false;
-        List<String> staleKeys = new ArrayList<String>();
-        for (Map.Entry<String, CachedBed> entry : bedCache.entrySet()) {
+        Iterator<Map.Entry<String, CachedBed>> iterator = bedCache.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, CachedBed> entry = iterator.next();
             CachedBed bed = entry.getValue();
-            if (!isBedBlock(world, bed.first) || !isBedBlock(world, bed.second)) {
-                staleKeys.add(entry.getKey());
-            }
-        }
-
-        for (String staleKey : staleKeys) {
-            CachedBed removedBed = bedCache.remove(staleKey);
-            if (removedBed == null) {
-                continue;
-            }
-            long ownerChunkKey = getOwnerChunkKey(removedBed.first);
+            if (isBedBlock(world, bed.first) && isBedBlock(world, bed.second)) continue;
+            iterator.remove();
+            long ownerChunkKey = getOwnerChunkKey(bed.first);
             Set<String> keys = chunkBeds.get(ownerChunkKey);
             if (keys != null) {
-                keys.remove(staleKey);
+                keys.remove(entry.getKey());
                 if (keys.isEmpty()) {
                     chunkBeds.remove(ownerChunkKey);
                 }
@@ -211,77 +233,119 @@ public final class BedPlatesModule extends Module {
                 if (resetScannedState) {
                     scannedChunks.remove(chunkKey);
                 }
-                if (queuedChunks.add(chunkKey)) {
-                    rescanQueue.addLast(chunkKey);
-                }
+                queueChunk(chunkKey);
             }
         }
     }
 
     private void processQueuedRescans(WorldClient world) {
-        int processed = 0;
-        while (!rescanQueue.isEmpty() && processed < FALLBACK_RESCAN_CHUNKS_PER_TICK) {
-            long chunkKey = rescanQueue.removeFirst();
-            queuedChunks.remove(chunkKey);
-            int chunkX = unpackChunkX(chunkKey);
-            int chunkZ = unpackChunkZ(chunkKey);
-            if (isChunkLoaded(world, chunkX, chunkZ)) {
-                scanChunk(world, chunkX, chunkZ);
-            } else {
-                scannedChunks.remove(chunkKey);
-                chunkBeds.remove(chunkKey);
+        int budget = BLOCK_SCAN_BUDGET_PER_TICK;
+        int completed = 0;
+        while (budget > 0 && completed < FALLBACK_RESCAN_CHUNKS_PER_TICK) {
+            if (activeScan != null && !isChunkLoaded(
+                    world,
+                    unpackChunkX(activeScan.chunkKey),
+                    unpackChunkZ(activeScan.chunkKey))) {
+                queuedChunks.remove(activeScan.chunkKey);
+                scannedChunks.remove(activeScan.chunkKey);
+                removeChunkBeds(activeScan.chunkKey);
+                activeScan = null;
+                completed++;
+                continue;
             }
-            processed++;
+            if (activeScan == null) {
+                if (rescanQueue.isEmpty()) return;
+                long chunkKey = rescanQueue.removeFirst().longValue();
+                int chunkX = unpackChunkX(chunkKey);
+                int chunkZ = unpackChunkZ(chunkKey);
+                if (!isChunkLoaded(world, chunkX, chunkZ)) {
+                    queuedChunks.remove(chunkKey);
+                    scannedChunks.remove(chunkKey);
+                    removeChunkBeds(chunkKey);
+                    completed++;
+                    continue;
+                }
+                activeScan = new ChunkScanTask(chunkKey, world.getChunkFromChunkCoords(chunkX, chunkZ));
+            }
+
+            int consumed = scanChunkSlice(world, activeScan, budget);
+            budget -= consumed;
+            if (!activeScan.complete) return;
+
+            finishChunkScan(activeScan);
+            activeScan = null;
+            completed++;
         }
     }
 
-    private void scanChunk(WorldClient world, int chunkX, int chunkZ) {
-        if (!isChunkLoaded(world, chunkX, chunkZ)) {
-            return;
-        }
+    private int scanChunkSlice(WorldClient world, ChunkScanTask task, int budget) {
+        ExtendedBlockStorage[] sections = task.chunk.getBlockStorageArray();
+        int consumed = 0;
+        while (task.sectionIndex < sections.length && consumed < budget) {
+            ExtendedBlockStorage section = sections[task.sectionIndex];
+            if (section == null || section.isEmpty()) {
+                task.sectionIndex++;
+                task.blockIndex = 0;
+                continue;
+            }
 
-        Chunk chunk = world.getChunkFromChunkCoords(chunkX, chunkZ);
-        long chunkKey = makeChunkKey(chunkX, chunkZ);
-        Set<String> foundBeds = new HashSet<String>();
-        int startX = chunkX << 4;
-        int startZ = chunkZ << 4;
+            while (task.blockIndex < 4096 && consumed < budget) {
+                int index = task.blockIndex++;
+                consumed++;
+                int localX = index & 15;
+                int localZ = (index >>> 4) & 15;
+                int localY = (index >>> 8) & 15;
+                if (!(section.getBlockByExtId(localX, localY, localZ) instanceof BlockBed)) continue;
 
-        for (int localX = 0; localX < 16; localX++) {
-            for (int localZ = 0; localZ < 16; localZ++) {
-                for (int y = 0; y < 256; y++) {
-                    BlockPos pos = new BlockPos(startX + localX, y, startZ + localZ);
-                    Block block = chunk.getBlock(pos);
-                    if (!(block instanceof BlockBed)) {
-                        continue;
-                    }
+                BlockPos pos = new BlockPos(
+                    (task.chunk.xPosition << 4) + localX,
+                    (task.sectionIndex << 4) + localY,
+                    (task.chunk.zPosition << 4) + localZ
+                );
+                BedPair pair = resolveBedPair(world, pos);
+                if (getOwnerChunkKey(pair.first) != task.chunkKey) continue;
+                String bedKey = makeBedKey(pair.first, pair.second);
+                if (!task.foundBeds.add(bedKey)) continue;
+                bedCache.put(bedKey, new CachedBed(
+                    pair.first,
+                    pair.second,
+                    collectDefenseBlocks(world, pair.first, pair.second)
+                ));
+            }
 
-                    BedPair pair = resolveBedPair(world, pos);
-                    if (getOwnerChunkKey(pair.first) != chunkKey) {
-                        continue;
-                    }
-
-                    String bedKey = makeBedKey(pair.first, pair.second);
-                    if (!foundBeds.add(bedKey)) {
-                        continue;
-                    }
-
-                    bedCache.put(bedKey, new CachedBed(pair.first, pair.second, collectDefenseBlocks(world, pair.first, pair.second)));
-                }
+            if (task.blockIndex >= 4096) {
+                task.sectionIndex++;
+                task.blockIndex = 0;
             }
         }
+        task.complete = task.sectionIndex >= sections.length;
+        return consumed;
+    }
 
-        Set<String> previousBeds = chunkBeds.put(chunkKey, foundBeds);
+    private void finishChunkScan(ChunkScanTask task) {
+        Set<String> previousBeds = chunkBeds.put(task.chunkKey, task.foundBeds);
         if (previousBeds != null) {
             for (String previousKey : previousBeds) {
-                if (!foundBeds.contains(previousKey)) {
+                if (!task.foundBeds.contains(previousKey)) {
                     bedCache.remove(previousKey);
                 }
             }
         }
-        if (foundBeds.isEmpty()) {
-            chunkBeds.remove(chunkKey);
+        if (task.foundBeds.isEmpty()) {
+            chunkBeds.remove(task.chunkKey);
         }
-        scannedChunks.add(chunkKey);
+        queuedChunks.remove(task.chunkKey);
+        scannedChunks.add(task.chunkKey);
+    }
+
+    private void queueChunk(long chunkKey) {
+        if (queuedChunks.add(chunkKey)) rescanQueue.addLast(Long.valueOf(chunkKey));
+    }
+
+    private void removeChunkBeds(long chunkKey) {
+        Set<String> keys = chunkBeds.remove(chunkKey);
+        if (keys == null) return;
+        for (String key : keys) bedCache.remove(key);
     }
 
     private BedPair resolveBedPair(WorldClient world, BlockPos pos) {
@@ -366,11 +430,11 @@ public final class BedPlatesModule extends Module {
         return simple.replace('_', ' ');
     }
 
-    private void renderLabel(Minecraft mc, BedRenderInfo bed) {
+    private void renderLabel(Minecraft mc, FrameContext frame, BedRenderInfo bed) {
         FontRenderer font = mc.fontRendererObj;
-        double viewerX = mc.getRenderManager().viewerPosX;
-        double viewerY = mc.getRenderManager().viewerPosY;
-        double viewerZ = mc.getRenderManager().viewerPosZ;
+        double viewerX = frame == null ? mc.getRenderManager().viewerPosX : frame.getCameraX();
+        double viewerY = frame == null ? mc.getRenderManager().viewerPosY : frame.getCameraY();
+        double viewerZ = frame == null ? mc.getRenderManager().viewerPosZ : frame.getCameraZ();
 
         double x = (bed.first.getX() + bed.second.getX()) / 2.0D + 0.5D - viewerX;
         double y = Math.max(bed.first.getY(), bed.second.getY()) + 1.35D - viewerY;
@@ -454,6 +518,7 @@ public final class BedPlatesModule extends Module {
         cachedWorld = null;
         ticksSinceFallback = 0;
         bedCache.clear();
+        renderPool.clear();
         resetChunkTracking();
     }
 
@@ -462,6 +527,7 @@ public final class BedPlatesModule extends Module {
         scannedChunks.clear();
         rescanQueue.clear();
         queuedChunks.clear();
+        activeScan = null;
     }
 
     private long getOwnerChunkKey(BlockPos pos) {
@@ -504,6 +570,20 @@ public final class BedPlatesModule extends Module {
         }
     }
 
+    private static final class ChunkScanTask {
+        private final long chunkKey;
+        private final Chunk chunk;
+        private final Set<String> foundBeds = new HashSet<String>();
+        private int sectionIndex;
+        private int blockIndex;
+        private boolean complete;
+
+        private ChunkScanTask(long chunkKey, Chunk chunk) {
+            this.chunkKey = chunkKey;
+            this.chunk = chunk;
+        }
+    }
+
     private static final class CachedBed {
         private final BlockPos first;
         private final BlockPos second;
@@ -517,12 +597,12 @@ public final class BedPlatesModule extends Module {
     }
 
     private static final class BedRenderInfo {
-        private final BlockPos first;
-        private final BlockPos second;
-        private final Set<String> defenses;
-        private final double distanceSq;
+        private BlockPos first;
+        private BlockPos second;
+        private Set<String> defenses;
+        private double distanceSq;
 
-        private BedRenderInfo(BlockPos first, BlockPos second, Set<String> defenses, double distanceSq) {
+        private void set(BlockPos first, BlockPos second, Set<String> defenses, double distanceSq) {
             this.first = first;
             this.second = second;
             this.defenses = defenses;

@@ -1,8 +1,10 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.RazorClient;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
+import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -24,14 +26,16 @@ public final class ItemPhysicsModule extends Module {
     @Override
     public void onClientTick() {
         Minecraft minecraft = Minecraft.getMinecraft();
-        if (minecraft.theWorld == null || (!noBob.isEnabled() && !noSpin.isEnabled())) {
+        RazorClient client = RazorClient.getInstance();
+        if (client == null || minecraft.theWorld == null || (!noBob.isEnabled() && !noSpin.isEnabled())) {
             restoreAll();
             return;
         }
 
-        for (Object object : minecraft.theWorld.loadedEntityList) {
-            if (!(object instanceof EntityItem)) continue;
-            EntityItem item = (EntityItem) object;
+        SnapshotFrame frame = client.getModuleManager().getEntitySnapshots().current();
+        for (int index = 0; index < frame.getDroppedItemCount(); index++) {
+            EntityItem item = frame.getDroppedItem(index);
+            if (item == null) continue;
             if (!originalPhases.containsKey(item)) originalPhases.put(item, Float.valueOf(item.hoverStart));
             // Minecraft uses /10 for bob and /20 for spin; cancel the selected phase locally.
             item.hoverStart = noBob.isEnabled() ? -(item.age / 10.0F) : -(item.age / 20.0F);

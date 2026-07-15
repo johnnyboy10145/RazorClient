@@ -1,22 +1,24 @@
 package com.razorclient.feature.module.impl;
 
-import com.razorclient.RazorClient;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.IntRangeSetting;
 import com.razorclient.feature.setting.NumberSetting;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.client.Minecraft;
+import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
 import org.lwjgl.input.Keyboard;
 
 public final class KnockbackDelayModule extends Module {
     private final IntRangeSetting airDelay = new IntRangeSetting("delay (ms)", 300, 200, 0, 1000);
     private final NumberSetting chance = new NumberSetting("chance %", 0, 100, 1, 100);
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
 
-    public static volatile long holdPacketsUntil = 0L;
-    public static volatile int cachedPlayerId = -1;
-    public static volatile boolean cachedOnGround = false;
+    private volatile long holdPacketsUntil;
+    private volatile int cachedPlayerId = -1;
+    private final AtomicBoolean inboundFlushRequested = new AtomicBoolean();
 
     public KnockbackDelayModule() {
         super("Knockback Delay", "Buffers all incoming packets when hit, freezing the world until the delay expires", Category.COMBAT, Keyboard.KEY_NONE);
@@ -25,22 +27,22 @@ public final class KnockbackDelayModule extends Module {
     }
 
     @Override
+    protected void onEnable() {
+        holdPacketsUntil = 0L;
+        inboundFlushRequested.set(false);
+    }
+
+    @Override
     protected void onDisable() {
         holdPacketsUntil = 0L;
-
-        RazorClient client = RazorClient.getInstance();
-        if (client != null) {
-            client.getKnockbackDelayBuffer().flushAllIncoming();
-        }
+        inboundFlushRequested.set(true);
     }
 
     @Override
     public void onSessionReset() {
         holdPacketsUntil = 0L;
         cachedPlayerId = -1;
-        cachedOnGround = false;
-        RazorClient client = RazorClient.getInstance();
-        if (client != null) client.getKnockbackDelayBuffer().flushAllIncoming();
+        inboundFlushRequested.set(true);
     }
 
     @Override
@@ -51,10 +53,50 @@ public final class KnockbackDelayModule extends Module {
         }
 
         cachedPlayerId = minecraft.thePlayer.getEntityId();
-        cachedOnGround = minecraft.thePlayer.onGround;
     }
 
-    public void triggerDelay(boolean onGround) {
+    @Override
+    public void onInboundPacket(Packet<?> packet) {
+        if (isHolding() || !(packet instanceof S12PacketEntityVelocity)) {
+            return;
+        }
+
+        S12PacketEntityVelocity velocity = (S12PacketEntityVelocity) packet;
+        if (cachedPlayerId == -1 || velocity.getEntityID() != cachedPlayerId) {
+            return;
+        }
+
+        int percent = chance.getValue();
+        if (percent >= 100 || (percent > 0 && random.nextInt(100) < percent)) {
+            triggerDelay();
+        }
+    }
+
+    @Override
+    public int getInboundPacketDelay(Packet<?> packet) {
+        long remaining = holdPacketsUntil - monotonicMillis();
+        if (!isEnabled() || remaining <= 0L) {
+            return 0;
+        }
+        return remaining >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) remaining;
+    }
+
+    @Override
+    public int getInboundPacketDelayPriority(Packet<?> packet) {
+        return 80;
+    }
+
+    @Override
+    public boolean isInboundPacketDelayActive() {
+        return isHolding();
+    }
+
+    @Override
+    public boolean consumeInboundFlushRequest() {
+        return inboundFlushRequested.getAndSet(false);
+    }
+
+    private void triggerDelay() {
         long now = monotonicMillis();
         if (now < holdPacketsUntil) {
             return;

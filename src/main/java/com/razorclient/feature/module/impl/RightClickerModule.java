@@ -17,7 +17,7 @@ import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
 
 public final class RightClickerModule extends Module {
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
 
     private final EnumSetting<Mode> mode = new EnumSetting<Mode>("Mode", Mode.values(), Mode.NORMAL);
     private final BooleanSetting onlyBlocks = new BooleanSetting("Only Blocks", true);
@@ -30,6 +30,7 @@ public final class RightClickerModule extends Module {
     private final BooleanSetting notUsingItem = new BooleanSetting("Not Using Item", false);
 
     private long lastClick;
+    private long nextClickAt;
     private long holdUntil;
     private long recordNextClickTime;
     private int burstTicks;
@@ -101,7 +102,6 @@ public final class RightClickerModule extends Module {
             return;
         }
 
-        Mouse.poll();
         if (!Mouse.isButtonDown(1)) {
             resetPhysicalState();
             return;
@@ -116,17 +116,14 @@ public final class RightClickerModule extends Module {
             return;
         }
 
-        applyJitter(minecraft);
         if (mode.getValue() == Mode.RECORD) {
-            recordClick();
+            recordClick(minecraft);
             return;
         }
-        normalClick();
+        normalClick(minecraft);
     }
 
-    private void normalClick() {
-        long delay = computeDelayNanos();
-        long holdLength = Math.max(1000000L, delay / (clickPattern.getValue() == ClickPattern.BUTTERFLY ? 4L : 2L));
+    private void normalClick(Minecraft minecraft) {
         long now = System.nanoTime();
 
         if (rightDown) {
@@ -137,13 +134,17 @@ public final class RightClickerModule extends Module {
             return;
         }
 
-        if (now - lastClick >= delay) {
-            if (!CombatActionCoordinator.tryAcquire("RightClicker")) return;
-            lastClick = now;
-            holdUntil = now + holdLength;
-            sendClick(true);
-            rightDown = true;
-        }
+        if (nextClickAt == 0L) nextClickAt = now;
+        if (now < nextClickAt || !CombatActionCoordinator.tryAcquire("RightClicker")) return;
+
+        long delay = computeDelayNanos();
+        long holdLength = Math.max(1000000L, delay / (clickPattern.getValue() == ClickPattern.BUTTERFLY ? 4L : 2L));
+        lastClick = now;
+        nextClickAt = now + delay;
+        holdUntil = now + holdLength;
+        applyJitter(minecraft);
+        sendClick(true);
+        rightDown = true;
     }
 
     private void sendClick(boolean pressed) {
@@ -156,7 +157,7 @@ public final class RightClickerModule extends Module {
         }
     }
 
-    private void recordClick() {
+    private void recordClick(Minecraft minecraft) {
         int delayCount = ClickPatternStore.size();
         if (delayCount == 0) {
             if (!recordNoticeShown) {
@@ -176,6 +177,7 @@ public final class RightClickerModule extends Module {
         }
 
         if (!CombatActionCoordinator.tryAcquire("RightClicker")) return;
+        applyJitter(minecraft);
         sendClick(true);
         sendClick(false);
 
@@ -216,12 +218,12 @@ public final class RightClickerModule extends Module {
             cps -= 0.8D + random.nextDouble();
         }
         cps = Math.max(1.0D, cps);
-        long delay = Math.max(1000000L, Math.round(1000000000.0D / cps));
-        return clickPattern.getValue() == ClickPattern.BUTTERFLY ? Math.max(10000000L, delay / 2L) : delay;
+        return Math.max(1000000L, Math.round(1000000000.0D / cps));
     }
 
     private void resetClickState() {
         lastClick = 0L;
+        nextClickAt = 0L;
         holdUntil = 0L;
         recordNextClickTime = -1L;
         recordIndex = 0;
@@ -239,8 +241,11 @@ public final class RightClickerModule extends Module {
     }
 
     private void resetPhysicalState() {
+        if (rightDown) {
+            MouseButtonHelper.setButton(1, false);
+        }
         rightDown = false;
-        sendClick(false);
+        syncUseItemKey(Mouse.isCreated() && Mouse.isButtonDown(1));
     }
 
     private void syncUseItemKey(boolean physicalDown) {

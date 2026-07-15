@@ -6,6 +6,7 @@ import com.razorclient.feature.module.ModuleResetReason;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.Packet;
 import org.lwjgl.input.Keyboard;
@@ -22,8 +23,8 @@ public final class BlinkModule extends Module {
 
     private long enabledAt;
     private long statusUntil;
-    private volatile boolean outboundFlushRequested;
-    private volatile boolean inboundFlushRequested;
+    private final AtomicBoolean outboundFlushRequested = new AtomicBoolean();
+    private final AtomicBoolean inboundFlushRequested = new AtomicBoolean();
     private volatile boolean heldOutboundPackets;
     private volatile boolean heldInboundPackets;
     private volatile boolean disablePending;
@@ -45,8 +46,8 @@ public final class BlinkModule extends Module {
     protected void onEnable() {
         enabledAt = LagModuleSupport.now();
         statusUntil = 0L;
-        outboundFlushRequested = false;
-        inboundFlushRequested = false;
+        outboundFlushRequested.set(false);
+        inboundFlushRequested.set(false);
         heldOutboundPackets = false;
         heldInboundPackets = false;
         disablePending = false;
@@ -110,11 +111,11 @@ public final class BlinkModule extends Module {
             || (disableOnBlockInteract.isEnabled() && LagModuleSupport.isBlockInteractPacket(packet))
             || (disableOnBlockDig.isEnabled() && LagModuleSupport.isBlockDigPacket(packet))) {
             status = Status.FLUSHING;
-            // Netty invokes this callback. Defer module/config mutation to the client thread,
-            // but let the triggering action pass after requesting an ordered outbound flush.
+            // Queue the triggering action behind the held lane. The next client tick disables
+            // Blink and releases the complete lane in original order.
             triggerBypassPacket = packet;
             disablePending = true;
-            outboundFlushRequested = true;
+            outboundFlushRequested.set(true);
         }
     }
 
@@ -122,13 +123,19 @@ public final class BlinkModule extends Module {
     public boolean shouldHoldOutboundPacket(Packet<?> packet) {
         if (packet == triggerBypassPacket) {
             triggerBypassPacket = null;
-            return false;
+            heldOutboundPackets = true;
+            return true;
         }
         if (disablePending) return false;
         if (!activeDirection.outbound || bypassesProtocolPacket(packet)) return false;
         heldOutboundPackets = true;
         if (statusUntil == 0L) status = Status.HOLDING;
         return true;
+    }
+
+    @Override
+    public boolean shouldBypassOutboundOrdering(Packet<?> packet) {
+        return isEnabled() && !disablePending && activeDirection.outbound && bypassesProtocolPacket(packet);
     }
 
     @Override
@@ -141,9 +148,9 @@ public final class BlinkModule extends Module {
 
     @Override public int getOutboundPacketDelayPriority(Packet<?> packet) { return 60; }
     @Override public int getInboundPacketDelayPriority(Packet<?> packet) { return 60; }
-    @Override public boolean isPacketDelayActive() { return activeDirection.outbound || activeDirection.inbound; }
-    @Override public boolean isOutboundPacketDelayActive() { return activeDirection.outbound; }
-    @Override public boolean isInboundPacketDelayActive() { return activeDirection.inbound; }
+    @Override public boolean isPacketDelayActive() { return !disablePending && (activeDirection.outbound || activeDirection.inbound); }
+    @Override public boolean isOutboundPacketDelayActive() { return !disablePending && activeDirection.outbound; }
+    @Override public boolean isInboundPacketDelayActive() { return !disablePending && activeDirection.inbound; }
 
     @Override
     public void onPacketDelayOverflow(boolean outbound) {
@@ -154,16 +161,12 @@ public final class BlinkModule extends Module {
 
     @Override
     public boolean consumeOutboundFlushRequest() {
-        if (!outboundFlushRequested) return false;
-        outboundFlushRequested = false;
-        return true;
+        return outboundFlushRequested.getAndSet(false);
     }
 
     @Override
     public boolean consumeInboundFlushRequest() {
-        if (!inboundFlushRequested) return false;
-        inboundFlushRequested = false;
-        return true;
+        return inboundFlushRequested.getAndSet(false);
     }
 
     @Override
@@ -189,8 +192,8 @@ public final class BlinkModule extends Module {
     }
 
     private void requestFlush(Direction heldDirection) {
-        if (heldDirection.outbound || heldOutboundPackets) outboundFlushRequested = true;
-        if (heldDirection.inbound || heldInboundPackets) inboundFlushRequested = true;
+        if (heldDirection.outbound || heldOutboundPackets) outboundFlushRequested.set(true);
+        if (heldDirection.inbound || heldInboundPackets) inboundFlushRequested.set(true);
         heldOutboundPackets = false;
         heldInboundPackets = false;
     }

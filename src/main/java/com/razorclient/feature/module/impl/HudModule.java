@@ -1,6 +1,7 @@
 package com.razorclient.feature.module.impl;
 
 import com.razorclient.RazorClient;
+import com.razorclient.combat.CombatTargetService;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.ActionSetting;
@@ -9,6 +10,9 @@ import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
 import com.razorclient.gui.GuiEffects;
 import com.razorclient.gui.GuiTheme;
+import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
+import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
+import com.razorclient.runtime.FrameContext;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -18,7 +22,6 @@ import net.minecraft.client.gui.FontRenderer;
 import net.minecraft.client.gui.Gui;
 import net.minecraft.client.gui.ScaledResolution;
 import net.minecraft.entity.Entity;
-import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.util.MathHelper;
 import net.minecraft.util.MovingObjectPosition;
@@ -90,9 +93,9 @@ public final class HudModule extends Module {
     private OverlayComponent draggingComponent;
     private int dragOffsetX;
     private int dragOffsetY;
-    private EntityLivingBase lastTarget;
     private int lastTargetId = -1;
     private float lastTargetHealth;
+    private float lastPlayerHealth;
     private int targetCombo;
     private int targetHitsTaken;
 
@@ -114,9 +117,9 @@ public final class HudModule extends Module {
     @Override
     public void onSessionReset() {
         draggingComponent = null;
-        lastTarget = null;
         lastTargetId = -1;
         lastTargetHealth = 0.0F;
+        lastPlayerHealth = 0.0F;
         targetCombo = 0;
         targetHitsTaken = 0;
     }
@@ -245,23 +248,23 @@ public final class HudModule extends Module {
 
     private void updateTargetTracker(Minecraft minecraft) {
         if (minecraft == null || minecraft.theWorld == null || minecraft.thePlayer == null) {
-            lastTarget = null;
             lastTargetId = -1;
             lastTargetHealth = 0.0F;
+            lastPlayerHealth = 0.0F;
             targetCombo = 0;
             targetHitsTaken = 0;
             return;
         }
 
-        EntityLivingBase current = resolveCurrentTarget(minecraft);
+        EntitySnapshot current = resolveCurrentTarget(minecraft);
         if (current == null) {
             return;
         }
 
         if (current.getEntityId() != lastTargetId) {
-            lastTarget = current;
             lastTargetId = current.getEntityId();
             lastTargetHealth = current.getHealth();
+            lastPlayerHealth = minecraft.thePlayer.getHealth();
             targetCombo = 0;
             targetHitsTaken = 0;
             return;
@@ -270,40 +273,51 @@ public final class HudModule extends Module {
         float health = current.getHealth();
         if (health < lastTargetHealth - 0.05F) {
             targetCombo++;
-        } else if (health > lastTargetHealth + 0.05F) {
+        }
+        float playerHealth = minecraft.thePlayer.getHealth();
+        if (lastPlayerHealth > 0.0F && playerHealth < lastPlayerHealth - 0.05F) {
             targetHitsTaken++;
         }
         lastTargetHealth = health;
-        lastTarget = current;
+        lastPlayerHealth = playerHealth;
     }
 
-    private EntityLivingBase resolveCurrentTarget(Minecraft minecraft) {
+    private EntitySnapshot resolveCurrentTarget(Minecraft minecraft) {
+        RazorClient client = RazorClient.getInstance();
+        if (client == null) return null;
         if (targetHovered.isEnabled()) {
-            EntityLivingBase hovered = getHoveredLiving(minecraft);
+            EntitySnapshot hovered = getHoveredLiving(minecraft, client);
             if (hovered != null) {
                 return hovered;
             }
         }
-        if (lastTarget != null && !lastTarget.isDead && lastTarget.getHealth() > 0.0F && minecraft.theWorld.loadedEntityList.contains(lastTarget)) {
-            return lastTarget;
+        int publishedTargetId = CombatTargetService.getPublishedTargetId(minecraft);
+        if (publishedTargetId >= 0) {
+            EntitySnapshot published = client.getModuleManager().getEntitySnapshots().find(publishedTargetId);
+            if (isValidTargetSnapshot(published)) return published;
         }
-        return null;
+        EntitySnapshot previous = client.getModuleManager().getEntitySnapshots().find(lastTargetId);
+        return isValidTargetSnapshot(previous) ? previous : null;
     }
 
-    private EntityLivingBase getHoveredLiving(Minecraft minecraft) {
+    private EntitySnapshot getHoveredLiving(Minecraft minecraft, RazorClient client) {
         MovingObjectPosition mouseOver = minecraft.objectMouseOver;
         if (mouseOver == null || mouseOver.typeOfHit != MovingObjectPosition.MovingObjectType.ENTITY) {
             return null;
         }
         Entity entity = mouseOver.entityHit;
-        if (!(entity instanceof EntityLivingBase) || entity == minecraft.thePlayer || entity.isDead) {
+        if (entity == null || entity == minecraft.thePlayer || entity.isDead) {
             return null;
         }
         if (entity instanceof EntityPlayer && AntiBotModule.shouldIgnore((EntityPlayer) entity)) {
             return null;
         }
-        EntityLivingBase living = (EntityLivingBase) entity;
-        return living.getHealth() <= 0.0F ? null : living;
+        EntitySnapshot snapshot = client.getModuleManager().getEntitySnapshots().find(entity.getEntityId());
+        return isValidTargetSnapshot(snapshot) ? snapshot : null;
+    }
+
+    private boolean isValidTargetSnapshot(EntitySnapshot snapshot) {
+        return snapshot != null && !snapshot.isDead() && snapshot.getHealth() > 0.0F;
     }
 
     private List<String> getEnabledModuleNames() {
@@ -317,18 +331,22 @@ public final class HudModule extends Module {
             if (!module.isEnabled() || module == this) {
                 continue;
             }
-            String hudInfo = module.getHudInfo();
-            if (suffixMode.getValue() == SuffixMode.NONE || hudInfo == null || hudInfo.isEmpty()) {
-                moduleNames.add(module.getName());
-            } else if (suffixMode.getValue() == SuffixMode.BASIC) {
-                moduleNames.add(module.getName() + " " + hudInfo);
-            } else {
-                moduleNames.add(module.getName() + " [" + hudInfo + "]");
-            }
+            moduleNames.add(formatModuleName(module));
         }
 
         sortText(moduleNames);
         return moduleNames;
+    }
+
+    private String formatModuleName(Module module) {
+        String hudInfo = module.getHudInfo();
+        if (suffixMode.getValue() == SuffixMode.NONE || hudInfo == null || hudInfo.isEmpty()) {
+            return module.getName();
+        }
+        if (suffixMode.getValue() == SuffixMode.BASIC) {
+            return module.getName() + " " + hudInfo;
+        }
+        return module.getName() + " [" + hudInfo + "]";
     }
 
     private void sortText(final List<String> moduleNames) {
@@ -643,7 +661,8 @@ public final class HudModule extends Module {
                 Collections.sort(modules, new Comparator<Module>() {
                     @Override
                     public int compare(Module left, Module right) {
-                        return fontRenderer.getStringWidth(right.getName()) - fontRenderer.getStringWidth(left.getName());
+                        return fontRenderer.getStringWidth(formatModuleName(right))
+                            - fontRenderer.getStringWidth(formatModuleName(left));
                     }
                 });
             }
@@ -709,12 +728,12 @@ public final class HudModule extends Module {
         @Override
         protected void render(int x, int y, boolean editorOpen) {
             Minecraft minecraft = Minecraft.getMinecraft();
-            EntityLivingBase target = editorOpen ? null : resolveCurrentTarget(minecraft);
+            EntitySnapshot target = editorOpen ? null : resolveCurrentTarget(minecraft);
             String name = target == null ? "Target" : target.getName();
             float health = target == null ? 17.0F : Math.max(0.0F, target.getHealth());
             float maxHealth = target == null ? 20.0F : Math.max(1.0F, target.getMaxHealth());
-            int armor = target == null ? 0 : target.getTotalArmorValue();
-            int distance = target == null || minecraft.thePlayer == null ? 0 : Math.round(minecraft.thePlayer.getDistanceToEntity(target));
+            int armor = target == null ? 0 : target.getArmor();
+            int distance = target == null ? 0 : (int) Math.round(target.getDistanceToHitbox());
             int accent = ClickGuiModule.getAccentColor();
 
             if (targetBackground.isEnabled()) {
@@ -813,32 +832,39 @@ public final class HudModule extends Module {
                 return;
             }
 
+            RazorClient client = RazorClient.getInstance();
+            if (client == null) return;
+            SnapshotFrame snapshots = client.getModuleManager().getEntitySnapshots().current();
+            FrameContext frame = client.getModuleManager().getFrameContext();
+            float partialTicks = frame == null ? 1.0F : frame.getPartialTicks();
+            double localX = minecraft.thePlayer.lastTickPosX
+                + (minecraft.thePlayer.posX - minecraft.thePlayer.lastTickPosX) * partialTicks;
+            double localZ = minecraft.thePlayer.lastTickPosZ
+                + (minecraft.thePlayer.posZ - minecraft.thePlayer.lastTickPosZ) * partialTicks;
+            double yaw = Math.toRadians(MathHelper.wrapAngleTo180_float(minecraft.thePlayer.rotationYaw));
+            double sin = Math.sin(yaw);
+            double cos = Math.cos(yaw);
+            double radarScaleValue = (half - 6) / (double) Math.max(1, radarRange.getValue());
             int index = 0;
-            for (Object object : minecraft.theWorld.playerEntities) {
-                if (!(object instanceof EntityPlayer)) {
+            for (int snapshotIndex = 0; snapshotIndex < snapshots.size(); snapshotIndex++) {
+                EntitySnapshot snapshot = snapshots.get(snapshotIndex);
+                if (!snapshot.isPlayer() || snapshot.isDead() || snapshot.isInvisible()) {
                     continue;
                 }
+                EntityPlayer player = (EntityPlayer) snapshot.getEntity();
+                if (AntiBotModule.shouldIgnore(player)) continue;
 
-                EntityPlayer player = (EntityPlayer) object;
-                if (player == minecraft.thePlayer || player.isDead || player.isInvisible() || AntiBotModule.shouldIgnore(player)) {
-                    continue;
-                }
-
-                double dx = player.posX - minecraft.thePlayer.posX;
-                double dz = player.posZ - minecraft.thePlayer.posZ;
+                double dx = snapshot.interpolateX(partialTicks) - localX;
+                double dz = snapshot.interpolateZ(partialTicks) - localZ;
                 double distance = Math.sqrt((dx * dx) + (dz * dz));
                 if (distance > radarRange.getValue() && !radarClamp.isEnabled()) {
                     continue;
                 }
 
-                double yaw = Math.toRadians(MathHelper.wrapAngleTo180_float(minecraft.thePlayer.rotationYaw));
-                double sin = Math.sin(yaw);
-                double cos = Math.cos(yaw);
                 double rotatedX = (dx * cos) - (dz * sin);
                 double rotatedZ = (dx * sin) + (dz * cos);
-                double scale = (half - 6) / (double) Math.max(1, radarRange.getValue());
-                int dotX = x + half + (int) Math.round(rotatedX * scale);
-                int dotY = y + half + (int) Math.round(rotatedZ * scale);
+                int dotX = x + half + (int) Math.round(rotatedX * radarScaleValue);
+                int dotY = y + half + (int) Math.round(rotatedZ * radarScaleValue);
 
                 if (radarClamp.isEnabled()) {
                     dotX = Math.max(x + 3, Math.min(x + size - 4, dotX));

@@ -1,5 +1,6 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.RazorClient;
 import com.razorclient.combat.CombatTargetService;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
@@ -8,22 +9,19 @@ import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
 import java.util.Locale;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.FontRenderer;
 import net.minecraft.client.gui.Gui;
 import net.minecraft.client.gui.ScaledResolution;
 import net.minecraft.client.renderer.GlStateManager;
-import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.monster.EntityMob;
 import net.minecraft.entity.passive.EntityAnimal;
 import net.minecraft.entity.player.EntityPlayer;
-import net.minecraft.item.ItemStack;
 import net.minecraft.scoreboard.Team;
-import net.minecraft.util.AxisAlignedBB;
+import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
+import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
+import com.razorclient.runtime.FrameContext;
 import net.minecraftforge.client.event.RenderGameOverlayEvent;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
 import org.lwjgl.BufferUtils;
@@ -71,8 +69,13 @@ public final class PlayerEspModule extends Module {
     private final FloatBuffer projection = BufferUtils.createFloatBuffer(16);
     private final IntBuffer viewport = BufferUtils.createIntBuffer(16);
     private final FloatBuffer projectedPoint = BufferUtils.createFloatBuffer(3);
-    private final List<ProjectedSnapshot> projected = new ArrayList<ProjectedSnapshot>();
-    private volatile List<EspSnapshot> snapshots = Collections.emptyList();
+    private final EntitySnapshot[] renderSnapshots = new EntitySnapshot[MAX_SNAPSHOTS];
+    private final int[] renderTeamColors = new int[MAX_SNAPSHOTS];
+    private final ProjectedSnapshot[] projected = new ProjectedSnapshot[MAX_SNAPSHOTS];
+    private volatile SnapshotFrame snapshots;
+    private int renderSnapshotCount;
+    private int projectedCount;
+    private int activeTargetId = -1;
     private volatile int renderedCount;
 
     public PlayerEspModule() {
@@ -96,67 +99,71 @@ public final class PlayerEspModule extends Module {
     @Override
     public void onClientTick() {
         Minecraft mc = Minecraft.getMinecraft();
-        if (mc.theWorld == null || mc.thePlayer == null) {
+        RazorClient client = RazorClient.getInstance();
+        if (client == null || mc.theWorld == null || mc.thePlayer == null) {
             clearRenderState();
             return;
         }
-        List<EspSnapshot> next = new ArrayList<EspSnapshot>(Math.min(MAX_SNAPSHOTS, mc.theWorld.loadedEntityList.size()));
-        int activeTarget = CombatTargetService.getPublishedTargetId(mc);
-        double limit = maxDistance.getValue();
-        for (Object value : mc.theWorld.loadedEntityList) {
-            if (next.size() >= MAX_SNAPSHOTS || !(value instanceof EntityLivingBase)) continue;
-            EntityLivingBase entity = (EntityLivingBase) value;
-            if (!isEligible(mc, entity, limit)) continue;
-            AxisAlignedBB box = entity.getEntityBoundingBox();
-            if (box == null) continue;
-            boolean visible = mc.thePlayer.canEntityBeSeen(entity);
-            if (!throughWalls.isEnabled() && !visible) continue;
-            ItemStack held = entity.getHeldItem();
-            String heldName = held == null ? "" : held.getDisplayName();
-            int teamColor = entity instanceof EntityPlayer ? getTeamColor((EntityPlayer) entity) : -1;
-            next.add(new EspSnapshot(entity.getEntityId(), entity.getName(), entity instanceof EntityPlayer,
-                box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ,
-                entity.getHealth(), Math.max(1.0F, entity.getMaxHealth()), entity.getTotalArmorValue(),
-                heldName, mc.thePlayer.getDistanceToEntity(entity), visible, entity.getEntityId() == activeTarget, teamColor));
-        }
-        snapshots = Collections.unmodifiableList(next);
+        snapshots = client.getModuleManager().getEntitySnapshots().current();
     }
 
     @Override
     public void onRenderWorld(RenderWorldLastEvent event) {
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.theWorld == null || mc.thePlayer == null || mc.getRenderManager() == null) return;
-        List<EspSnapshot> frame = snapshots;
-        renderedCount = frame.size();
-        projected.clear();
-        if (projectionMode.getValue().draws3d()) render3d(mc, frame);
-        if (projectionMode.getValue().draws2d()) project2d(mc, frame);
+        prepareRenderSnapshots(mc);
+        projectedCount = 0;
+        RazorClient client = RazorClient.getInstance();
+        FrameContext frame = client == null ? null : client.getModuleManager().getFrameContext();
+        if (projectionMode.getValue().draws3d()) render3d(mc, frame, event.partialTicks);
+        if (projectionMode.getValue().draws2d()) project2d(mc, frame, event.partialTicks);
     }
 
     @Override
     public void onRenderOverlay(RenderGameOverlayEvent.Text event) {
-        if (!projectionMode.getValue().draws2d() || projected.isEmpty()) return;
+        if (!projectionMode.getValue().draws2d() || projectedCount == 0) return;
         Minecraft mc = Minecraft.getMinecraft();
         if (mc.currentScreen != null || mc.fontRendererObj == null) return;
-        render2d(mc, new ScaledResolution(mc));
+        render2d(mc, event.resolution);
     }
 
     @Override protected void onDisable() { clearRenderState(); }
     @Override public void onSessionReset() { clearRenderState(); }
-    @Override public void onInputContextLost() { projected.clear(); }
+    @Override public void onInputContextLost() { projectedCount = 0; }
 
-    private boolean isEligible(Minecraft mc, EntityLivingBase entity, double limit) {
-        if (entity == mc.thePlayer || entity.isDead || entity.deathTime != 0 || entity.getHealth() <= 0.0F) return false;
-        boolean player = entity instanceof EntityPlayer;
-        boolean mob = entity instanceof EntityMob || entity instanceof EntityAnimal;
+    private boolean isEligible(Minecraft mc, EntitySnapshot snapshot, double limit) {
+        if (snapshot == null || snapshot.isDead()) return false;
+        boolean player = snapshot.isPlayer();
+        boolean mob = snapshot.getEntity() instanceof EntityMob || snapshot.getEntity() instanceof EntityAnimal;
         if ((player && !targetType.getValue().players) || (mob && !targetType.getValue().mobs) || (!player && !mob)) return false;
-        return CombatTargetService.isValid(mc, entity, player, mob, seeInvis.isEnabled(), false, false, limit);
+        if (snapshot.getDistanceToHitbox() > limit || (!throughWalls.isEnabled() && !snapshot.isVisible())) return false;
+        return CombatTargetService.isValid(mc, snapshot.getEntity(), player, mob, seeInvis.isEnabled(), false, false, limit);
     }
 
-    private void render3d(Minecraft mc, List<EspSnapshot> frame) {
-        double viewX = mc.getRenderManager().viewerPosX;
-        double viewY = mc.getRenderManager().viewerPosY;
-        double viewZ = mc.getRenderManager().viewerPosZ;
+    private void prepareRenderSnapshots(Minecraft mc) {
+        renderSnapshotCount = 0;
+        SnapshotFrame frame = snapshots;
+        if (frame == null) {
+            renderedCount = 0;
+            return;
+        }
+        activeTargetId = CombatTargetService.getPublishedTargetId(mc);
+        double limit = maxDistance.getValue();
+        for (int i = 0; i < frame.size() && renderSnapshotCount < MAX_SNAPSHOTS; i++) {
+            EntitySnapshot snapshot = frame.get(i);
+            if (!isEligible(mc, snapshot, limit)) continue;
+            renderSnapshots[renderSnapshotCount] = snapshot;
+            renderTeamColors[renderSnapshotCount] = snapshot.isPlayer()
+                ? getTeamColor((EntityPlayer) snapshot.getEntity()) : -1;
+            renderSnapshotCount++;
+        }
+        renderedCount = renderSnapshotCount;
+    }
+
+    private void render3d(Minecraft mc, FrameContext frame, float partialTicks) {
+        double viewX = frame == null ? mc.getRenderManager().viewerPosX : frame.getCameraX();
+        double viewY = frame == null ? mc.getRenderManager().viewerPosY : frame.getCameraY();
+        double viewZ = frame == null ? mc.getRenderManager().viewerPosZ : frame.getCameraZ();
         GL11.glPushAttrib(GL11.GL_ALL_ATTRIB_BITS);
         GL11.glPushMatrix();
         try {
@@ -165,15 +172,23 @@ public final class PlayerEspModule extends Module {
             GlStateManager.disableLighting(); GlStateManager.disableCull();
             if (throughWalls.isEnabled()) { GlStateManager.disableDepth(); GlStateManager.depthMask(false); }
             GL11.glLineWidth(lineWidth.getValue());
-            for (EspSnapshot snapshot : frame) {
-                int color = colorFor(snapshot);
+            for (int index = 0; index < renderSnapshotCount; index++) {
+                EntitySnapshot snapshot = renderSnapshots[index];
+                int color = colorFor(snapshot, renderTeamColors[index]);
                 float r = ((color >>> 16) & 255) / 255.0F;
                 float g = ((color >>> 8) & 255) / 255.0F;
                 float b = (color & 255) / 255.0F;
-                AxisAlignedBB box = new AxisAlignedBB(snapshot.minX - viewX, snapshot.minY - viewY, snapshot.minZ - viewZ,
-                    snapshot.maxX - viewX, snapshot.maxY - viewY, snapshot.maxZ - viewZ).expand(0.04D, 0.08D, 0.04D);
-                if (renderMode.getValue().fill) drawFilledBox(box, r, g, b, fillAlpha.getValue() / 100.0F);
-                if (renderMode.getValue().outline) drawOutlinedBox(box, r, g, b, 1.0F);
+                double offsetX = snapshot.interpolateX(partialTicks) - snapshot.getX();
+                double offsetY = snapshot.interpolateY(partialTicks) - snapshot.getY();
+                double offsetZ = snapshot.interpolateZ(partialTicks) - snapshot.getZ();
+                double minX = snapshot.getMinX() + offsetX - viewX - 0.04D;
+                double minY = snapshot.getMinY() + offsetY - viewY - 0.08D;
+                double minZ = snapshot.getMinZ() + offsetZ - viewZ - 0.04D;
+                double maxX = snapshot.getMaxX() + offsetX - viewX + 0.04D;
+                double maxY = snapshot.getMaxY() + offsetY - viewY + 0.08D;
+                double maxZ = snapshot.getMaxZ() + offsetZ - viewZ + 0.04D;
+                if (renderMode.getValue().fill) drawFilledBox(minX, minY, minZ, maxX, maxY, maxZ, r, g, b, fillAlpha.getValue() / 100.0F);
+                if (renderMode.getValue().outline) drawOutlinedBox(minX, minY, minZ, maxX, maxY, maxZ, r, g, b, 1.0F);
             }
         } finally {
             GlStateManager.depthMask(true); GlStateManager.enableDepth(); GlStateManager.enableCull();
@@ -183,32 +198,46 @@ public final class PlayerEspModule extends Module {
         }
     }
 
-    private void project2d(Minecraft mc, List<EspSnapshot> frame) {
+    private void project2d(Minecraft mc, FrameContext frame, float partialTicks) {
+        if (frame == null || !frame.isProjectionValid()) {
+            projectedCount = 0;
+            return;
+        }
+
         modelView.clear(); projection.clear(); viewport.clear();
-        GL11.glGetFloat(GL11.GL_MODELVIEW_MATRIX, modelView);
-        GL11.glGetFloat(GL11.GL_PROJECTION_MATRIX, projection);
-        GL11.glGetInteger(GL11.GL_VIEWPORT, viewport);
-        ScaledResolution scaled = new ScaledResolution(mc);
-        double viewerX = mc.getRenderManager().viewerPosX;
-        double viewerY = mc.getRenderManager().viewerPosY;
-        double viewerZ = mc.getRenderManager().viewerPosZ;
-        for (EspSnapshot snapshot : frame) {
+        for (int i = 0; i < 16; i++) modelView.put(frame.getModelView(i));
+        for (int i = 0; i < 16; i++) projection.put(frame.getProjection(i));
+        for (int i = 0; i < 4; i++) viewport.put(frame.getViewport(i));
+        modelView.flip(); projection.flip(); viewport.flip();
+        int scaledWidth = frame.getScaledWidth();
+        int scaledHeight = frame.getScaledHeight();
+        double viewerX = frame.getCameraX();
+        double viewerY = frame.getCameraY();
+        double viewerZ = frame.getCameraZ();
+        for (int index = 0; index < renderSnapshotCount; index++) {
+            EntitySnapshot snapshot = renderSnapshots[index];
+            double offsetX = snapshot.interpolateX(partialTicks) - snapshot.getX();
+            double offsetY = snapshot.interpolateY(partialTicks) - snapshot.getY();
+            double offsetZ = snapshot.interpolateZ(partialTicks) - snapshot.getZ();
             float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
             boolean any = false;
             for (int corner = 0; corner < 8; corner++) {
-                double x = ((corner & 1) == 0 ? snapshot.minX : snapshot.maxX) - viewerX;
-                double y = ((corner & 2) == 0 ? snapshot.minY : snapshot.maxY) - viewerY;
-                double z = ((corner & 4) == 0 ? snapshot.minZ : snapshot.maxZ) - viewerZ;
+                double x = ((corner & 1) == 0 ? snapshot.getMinX() : snapshot.getMaxX()) + offsetX - viewerX;
+                double y = ((corner & 2) == 0 ? snapshot.getMinY() : snapshot.getMaxY()) + offsetY - viewerY;
+                double z = ((corner & 4) == 0 ? snapshot.getMinZ() : snapshot.getMaxZ()) + offsetZ - viewerZ;
                 projectedPoint.clear();
                 if (!GLU.gluProject((float) x, (float) y, (float) z, modelView, projection, viewport, projectedPoint)) continue;
                 float depth = projectedPoint.get(2);
                 if (depth < 0.0F || depth > 1.0F) continue;
-                float sx = projectedPoint.get(0) * scaled.getScaledWidth() / Math.max(1.0F, mc.displayWidth);
-                float sy = (mc.displayHeight - projectedPoint.get(1)) * scaled.getScaledHeight() / Math.max(1.0F, mc.displayHeight);
+                float sx = projectedPoint.get(0) * scaledWidth / Math.max(1.0F, mc.displayWidth);
+                float sy = (mc.displayHeight - projectedPoint.get(1)) * scaledHeight / Math.max(1.0F, mc.displayHeight);
                 minX = Math.min(minX, sx); minY = Math.min(minY, sy); maxX = Math.max(maxX, sx); maxY = Math.max(maxY, sy); any = true;
             }
-            if (any && maxX >= 0 && maxY >= 0 && minX <= scaled.getScaledWidth() && minY <= scaled.getScaledHeight()) {
-                projected.add(new ProjectedSnapshot(snapshot, minX, minY, maxX, maxY));
+            if (any && maxX >= 0 && maxY >= 0 && minX <= scaledWidth && minY <= scaledHeight) {
+                ProjectedSnapshot output = projected[projectedCount];
+                if (output == null) projected[projectedCount] = output = new ProjectedSnapshot();
+                output.set(snapshot, renderTeamColors[index], minX, minY, maxX, maxY);
+                projectedCount++;
             }
         }
     }
@@ -216,11 +245,13 @@ public final class PlayerEspModule extends Module {
     private void render2d(Minecraft mc, ScaledResolution resolution) {
         FontRenderer font = mc.fontRendererObj;
         GL11.glPushAttrib(GL11.GL_ALL_ATTRIB_BITS);
+        GL11.glPushMatrix();
         try {
             GlStateManager.enableBlend(); GlStateManager.disableDepth(); GlStateManager.depthMask(false);
-            for (ProjectedSnapshot projection : projected) {
-                EspSnapshot snapshot = projection.snapshot;
-                int color = 0xFF000000 | colorFor(snapshot);
+            for (int index = 0; index < projectedCount; index++) {
+                ProjectedSnapshot projection = projected[index];
+                EntitySnapshot snapshot = projection.snapshot;
+                int color = 0xFF000000 | colorFor(snapshot, projection.teamColor);
                 int translucent = (fillAlpha.getValue() * 255 / 100 << 24) | (color & 0xFFFFFF);
                 int x1 = Math.round(projection.minX), y1 = Math.round(projection.minY);
                 int x2 = Math.round(projection.maxX), y2 = Math.round(projection.maxY);
@@ -232,25 +263,26 @@ public final class PlayerEspModule extends Module {
             }
         } finally {
             GlStateManager.depthMask(true); GlStateManager.enableDepth(); GlStateManager.disableBlend();
-            GlStateManager.enableTexture2D(); GlStateManager.color(1, 1, 1, 1); GL11.glPopAttrib();
+            GlStateManager.enableTexture2D(); GlStateManager.color(1, 1, 1, 1);
+            GL11.glLineWidth(1.0F); GL11.glPopMatrix(); GL11.glPopAttrib();
         }
     }
 
-    private void drawInformation(FontRenderer font, EspSnapshot s, int x1, int y1, int x2, int y2, int color) {
+    private void drawInformation(FontRenderer font, EntitySnapshot s, int x1, int y1, int x2, int y2, int color) {
         StringBuilder top = new StringBuilder();
-        if (showNames.isEnabled()) top.append(s.name);
-        if (showHealth.isEnabled() && healthValue.isEnabled()) append(top, Math.round(s.health) + "hp");
-        if (showDistance.isEnabled()) append(top, String.format(Locale.ROOT, "%.1fm", s.distance));
+        if (showNames.isEnabled()) top.append(s.getName());
+        if (showHealth.isEnabled() && healthValue.isEnabled()) append(top, Math.round(s.getHealth()) + "hp");
+        if (showDistance.isEnabled()) append(top, String.format(Locale.ROOT, "%.1fm", s.getDistanceToHitbox()));
         if (top.length() > 0) font.drawStringWithShadow(top.toString(), (x1 + x2 - font.getStringWidth(top.toString())) / 2.0F, y1 - 10, color);
         StringBuilder bottom = new StringBuilder();
-        if (showArmor.isEnabled()) append(bottom, "Armor " + s.armor);
-        if (showHeldItem.isEnabled() && !s.heldItem.isEmpty()) append(bottom, s.heldItem);
+        if (showArmor.isEnabled()) append(bottom, "Armor " + s.getArmor());
+        if (showHeldItem.isEnabled() && !s.getHeldItemName().isEmpty()) append(bottom, s.getHeldItemName());
         if (bottom.length() > 0) font.drawStringWithShadow(bottom.toString(), (x1 + x2 - font.getStringWidth(bottom.toString())) / 2.0F, y2 + 2, 0xFFFFFFFF);
     }
 
     private void append(StringBuilder builder, String value) { if (builder.length() > 0) builder.append(" | "); builder.append(value); }
-    private void drawHealthBar(EspSnapshot s, int x, int top, int bottom) {
-        float ratio = Math.max(0.0F, Math.min(1.0F, s.health / s.maxHealth));
+    private void drawHealthBar(EntitySnapshot s, int x, int top, int bottom) {
+        float ratio = Math.max(0.0F, Math.min(1.0F, s.getHealth() / Math.max(1.0F, s.getMaxHealth())));
         int filled = Math.round((bottom - top) * ratio);
         int healthColor = ratio > 0.5F ? 0xFF42D66A : ratio > 0.25F ? 0xFFFFB340 : 0xFFFF4B4B;
         Gui.drawRect(x - 4, top - 1, x - 2, bottom + 1, 0xAA000000);
@@ -267,12 +299,12 @@ public final class PlayerEspModule extends Module {
         GlStateManager.enableTexture2D();
     }
 
-    private int colorFor(EspSnapshot snapshot) {
-        if (targetHighlight.isEnabled() && snapshot.target) return rgb(targetRed, targetGreen, targetBlue);
-        if (!snapshot.visible) return rgb(hiddenRed, hiddenGreen, hiddenBlue);
-        if (useTeamColors.isEnabled() && snapshot.teamColor >= 0) return snapshot.teamColor;
+    private int colorFor(EntitySnapshot snapshot, int teamColor) {
+        if (targetHighlight.isEnabled() && snapshot.getEntityId() == activeTargetId) return rgb(targetRed, targetGreen, targetBlue);
+        if (!snapshot.isVisible()) return rgb(hiddenRed, hiddenGreen, hiddenBlue);
+        if (useTeamColors.isEnabled() && teamColor >= 0) return teamColor;
         if (mode.getValue() == Mode.MODERN) {
-            float wave = (float) ((Math.sin(System.nanoTime() / 340000000.0D + snapshot.id * 0.35D) + 1.0D) * 0.5D);
+            float wave = (float) ((Math.sin(System.nanoTime() / 340000000.0D + snapshot.getEntityId() * 0.35D) + 1.0D) * 0.5D);
             return ClickGuiModule.blendColor(ClickGuiModule.getLightAccentColor(), ClickGuiModule.getDarkAccentColor(), wave);
         }
         return rgb(red, green, blue);
@@ -287,31 +319,49 @@ public final class PlayerEspModule extends Module {
         return index >= 0 ? CHAT_COLORS[index] : -1;
     }
 
-    private void clearRenderState() { snapshots = Collections.emptyList(); projected.clear(); renderedCount = 0; }
+    private void clearRenderState() {
+        snapshots = null;
+        renderSnapshotCount = 0;
+        projectedCount = 0;
+        renderedCount = 0;
+        activeTargetId = -1;
+    }
     @Override public String getHudInfo() { return projectionMode.getValue() + " " + renderedCount; }
 
-    private void drawOutlinedBox(AxisAlignedBB b, float r, float g, float blue, float a) {
+    private void drawOutlinedBox(double minX, double minY, double minZ, double maxX, double maxY, double maxZ,
+            float r, float g, float blue, float a) {
         GlStateManager.color(r, g, blue, a); GL11.glBegin(GL11.GL_LINES);
-        edge(b.minX,b.minY,b.minZ,b.maxX,b.minY,b.minZ); edge(b.maxX,b.minY,b.minZ,b.maxX,b.minY,b.maxZ); edge(b.maxX,b.minY,b.maxZ,b.minX,b.minY,b.maxZ); edge(b.minX,b.minY,b.maxZ,b.minX,b.minY,b.minZ);
-        edge(b.minX,b.maxY,b.minZ,b.maxX,b.maxY,b.minZ); edge(b.maxX,b.maxY,b.minZ,b.maxX,b.maxY,b.maxZ); edge(b.maxX,b.maxY,b.maxZ,b.minX,b.maxY,b.maxZ); edge(b.minX,b.maxY,b.maxZ,b.minX,b.maxY,b.minZ);
-        edge(b.minX,b.minY,b.minZ,b.minX,b.maxY,b.minZ); edge(b.maxX,b.minY,b.minZ,b.maxX,b.maxY,b.minZ); edge(b.maxX,b.minY,b.maxZ,b.maxX,b.maxY,b.maxZ); edge(b.minX,b.minY,b.maxZ,b.minX,b.maxY,b.maxZ); GL11.glEnd();
+        edge(minX,minY,minZ,maxX,minY,minZ); edge(maxX,minY,minZ,maxX,minY,maxZ); edge(maxX,minY,maxZ,minX,minY,maxZ); edge(minX,minY,maxZ,minX,minY,minZ);
+        edge(minX,maxY,minZ,maxX,maxY,minZ); edge(maxX,maxY,minZ,maxX,maxY,maxZ); edge(maxX,maxY,maxZ,minX,maxY,maxZ); edge(minX,maxY,maxZ,minX,maxY,minZ);
+        edge(minX,minY,minZ,minX,maxY,minZ); edge(maxX,minY,minZ,maxX,maxY,minZ); edge(maxX,minY,maxZ,maxX,maxY,maxZ); edge(minX,minY,maxZ,minX,maxY,maxZ); GL11.glEnd();
     }
     private void edge(double a,double b,double c,double d,double e,double f){GL11.glVertex3d(a,b,c);GL11.glVertex3d(d,e,f);}
-    private void drawFilledBox(AxisAlignedBB b,float r,float g,float blue,float a){
+    private void drawFilledBox(double minX, double minY, double minZ, double maxX, double maxY, double maxZ,
+            float r,float g,float blue,float a){
         GlStateManager.color(r,g,blue,a); GL11.glBegin(GL11.GL_QUADS);
-        quad(b.minX,b.minY,b.minZ,b.maxX,b.minY,b.minZ,b.maxX,b.maxY,b.minZ,b.minX,b.maxY,b.minZ); quad(b.minX,b.minY,b.maxZ,b.maxX,b.minY,b.maxZ,b.maxX,b.maxY,b.maxZ,b.minX,b.maxY,b.maxZ);
-        quad(b.minX,b.minY,b.minZ,b.minX,b.minY,b.maxZ,b.minX,b.maxY,b.maxZ,b.minX,b.maxY,b.minZ); quad(b.maxX,b.minY,b.minZ,b.maxX,b.minY,b.maxZ,b.maxX,b.maxY,b.maxZ,b.maxX,b.maxY,b.minZ); GL11.glEnd();
+        quad(minX,minY,minZ,maxX,minY,minZ,maxX,maxY,minZ,minX,maxY,minZ); quad(minX,minY,maxZ,maxX,minY,maxZ,maxX,maxY,maxZ,minX,maxY,maxZ);
+        quad(minX,minY,minZ,minX,minY,maxZ,minX,maxY,maxZ,minX,maxY,minZ); quad(maxX,minY,minZ,maxX,minY,maxZ,maxX,maxY,maxZ,maxX,maxY,minZ);
+        quad(minX,minY,minZ,maxX,minY,minZ,maxX,minY,maxZ,minX,minY,maxZ); quad(minX,maxY,minZ,maxX,maxY,minZ,maxX,maxY,maxZ,minX,maxY,maxZ); GL11.glEnd();
     }
     private void quad(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j,double k,double l){GL11.glVertex3d(a,b,c);GL11.glVertex3d(d,e,f);GL11.glVertex3d(g,h,i);GL11.glVertex3d(j,k,l);}
 
-    private static final class EspSnapshot {
-        final int id; final String name; final boolean player; final double minX,minY,minZ,maxX,maxY,maxZ;
-        final float health,maxHealth; final int armor; final String heldItem; final float distance; final boolean visible,target; final int teamColor;
-        EspSnapshot(int id,String name,boolean player,double minX,double minY,double minZ,double maxX,double maxY,double maxZ,float health,float maxHealth,int armor,String heldItem,float distance,boolean visible,boolean target,int teamColor){
-            this.id=id;this.name=name;this.player=player;this.minX=minX;this.minY=minY;this.minZ=minZ;this.maxX=maxX;this.maxY=maxY;this.maxZ=maxZ;this.health=health;this.maxHealth=maxHealth;this.armor=armor;this.heldItem=heldItem;this.distance=distance;this.visible=visible;this.target=target;this.teamColor=teamColor;
+    private static final class ProjectedSnapshot {
+        private EntitySnapshot snapshot;
+        private int teamColor;
+        private float minX;
+        private float minY;
+        private float maxX;
+        private float maxY;
+
+        private void set(EntitySnapshot snapshot, int teamColor, float minX, float minY, float maxX, float maxY) {
+            this.snapshot = snapshot;
+            this.teamColor = teamColor;
+            this.minX = minX;
+            this.minY = minY;
+            this.maxX = maxX;
+            this.maxY = maxY;
         }
     }
-    private static final class ProjectedSnapshot { final EspSnapshot snapshot; final float minX,minY,maxX,maxY; ProjectedSnapshot(EspSnapshot s,float x1,float y1,float x2,float y2){snapshot=s;minX=x1;minY=y1;maxX=x2;maxY=y2;} }
     private enum Mode { MODERN("Modern"), CLASSIC("Classic"); final String label; Mode(String l){label=l;} @Override public String toString(){return label;} }
     private enum RenderMode { BOX("Box",true,false), OUTLINE("Outline",false,true), BOTH("Both",true,true); final String label; final boolean fill,outline; RenderMode(String l,boolean f,boolean o){label=l;fill=f;outline=o;} @Override public String toString(){return label;} }
     private enum ProjectionMode { TWO_D("2D",true,false), THREE_D("3D",false,true), BOTH("Both",true,true); final String label; final boolean d2,d3; ProjectionMode(String l,boolean a,boolean b){label=l;d2=a;d3=b;} boolean draws2d(){return d2;} boolean draws3d(){return d3;} @Override public String toString(){return label;} }

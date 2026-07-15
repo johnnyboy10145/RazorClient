@@ -55,12 +55,19 @@ public final class AimAssistModule extends Module {
     private final BooleanSetting keepMoveDirection = new BooleanSetting("Keep Move Direction", true);
     private final BooleanSetting ignoreManualAim = new BooleanSetting("Ignore Manual Aim", false);
 
-    private final Random random = new Random();
+    private final Random random = getScope().getRandom();
     private EntityLivingBase lockedTarget;
     private long lastRenderUpdateNanos = -1L;
     private float lastObservedYaw;
     private float lastObservedPitch;
     private boolean haveObservedRotation;
+    private float silentYaw;
+    private float silentPitch;
+    private boolean silentRotationInitialized;
+    private volatile float desiredSilentYaw;
+    private volatile float desiredSilentPitch;
+    private volatile long desiredSilentAtNanos;
+    private volatile boolean desiredSilentRotation;
     private String status = "Ready";
 
     public AimAssistModule() {
@@ -109,6 +116,23 @@ public final class AimAssistModule extends Module {
     }
 
     @Override
+    public void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.START || aimMode.getValue() != AimMode.SILENT
+                || !desiredSilentRotation) return;
+        if (System.nanoTime() - desiredSilentAtNanos > 250_000_000L) {
+            clearSilentRotation();
+            return;
+        }
+        if (ClientRotationHelper.get().requestRotations(
+                "AimAssist", 10, desiredSilentYaw, desiredSilentPitch)) {
+            if (keepMoveDirection.isEnabled()) ClientRotationHelper.get().fixMovementInputs();
+            status = "Silent";
+        } else {
+            status = "Suppressed: " + ClientRotationHelper.get().getRequestedOwner();
+        }
+    }
+
+    @Override
     public void onRenderTick(TickEvent.RenderTickEvent event) {
         if (event.phase != TickEvent.Phase.END) {
             return;
@@ -134,26 +158,43 @@ public final class AimAssistModule extends Module {
             return;
         }
 
+        boolean silent = aimMode.getValue() == AimMode.SILENT;
+        if (silent && (isKillAuraOwningRotation() || (!ignoreManualAim.isEnabled() && userMovedMouse))) {
+            clearSilentRotation();
+            status = isKillAuraOwningRotation()
+                ? "Suppressed: " + ClientRotationHelper.get().getRequestedOwner() : "Manual";
+            return;
+        }
+        if (!silent) {
+            clearSilentRotation();
+        }
+
         TargetSnapshot target = selectTarget(minecraft, currentYaw, currentPitch);
         if (target == null) {
             lockedTarget = null;
+            clearSilentRotation();
+            status = "No target";
             return;
         }
         CombatTargetService.publishTarget(minecraft, target.entity, 50);
 
         float deltaSeconds = consumeDeltaSeconds();
-        Rotation rotation = rotateToward(currentYaw, currentPitch, target.yaw, target.pitch, deltaSeconds);
-        if (aimMode.getValue() == AimMode.SILENT) {
-            if (isKillAuraOwningRotation() || (!ignoreManualAim.isEnabled() && userMovedMouse)) {
-                status = isKillAuraOwningRotation() ? "Suppressed" : "Manual";
-                return;
-            }
-            if (ClientRotationHelper.get().requestRotations("AimAssist", 10, rotation.yaw, rotation.pitch)) {
-                if (keepMoveDirection.isEnabled()) {
-                    ClientRotationHelper.get().fixMovementInputs();
-                }
-                status = "Silent";
-            }
+        if (silent && !silentRotationInitialized) {
+            silentYaw = currentYaw;
+            silentPitch = currentPitch;
+            silentRotationInitialized = true;
+        }
+        float rotationBaseYaw = silent ? silentYaw : currentYaw;
+        float rotationBasePitch = silent ? silentPitch : currentPitch;
+        Rotation rotation = rotateToward(rotationBaseYaw, rotationBasePitch, target.yaw, target.pitch, deltaSeconds);
+        if (silent) {
+            silentYaw = rotation.yaw;
+            silentPitch = rotation.pitch;
+            desiredSilentYaw = rotation.yaw;
+            desiredSilentPitch = rotation.pitch;
+            desiredSilentAtNanos = System.nanoTime();
+            desiredSilentRotation = true;
+            status = "Silent";
             return;
         }
         applyClientRotations(minecraft, rotation.yaw, rotation.pitch);
@@ -344,6 +385,13 @@ public final class AimAssistModule extends Module {
     private void resetTargetTiming() {
         lockedTarget = null;
         lastRenderUpdateNanos = -1L;
+        clearSilentRotation();
+    }
+
+    private void clearSilentRotation() {
+        silentRotationInitialized = false;
+        desiredSilentRotation = false;
+        ClientRotationHelper.get().clearRequestedRotations("AimAssist");
     }
 
     private void resetState() {

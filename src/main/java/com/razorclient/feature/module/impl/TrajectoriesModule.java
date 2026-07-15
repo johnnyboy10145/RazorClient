@@ -1,10 +1,14 @@
 package com.razorclient.feature.module.impl;
 
+import com.razorclient.RazorClient;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.NumberSetting;
 import java.util.ArrayList;
 import java.util.List;
+import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
+import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
+import com.razorclient.runtime.FrameContext;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.renderer.GlStateManager;
@@ -12,7 +16,6 @@ import net.minecraft.client.renderer.Tessellator;
 import net.minecraft.client.renderer.WorldRenderer;
 import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
 import net.minecraft.entity.Entity;
-import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.item.EntityArmorStand;
 import net.minecraft.entity.projectile.EntityFishHook;
 import net.minecraft.item.Item;
@@ -31,6 +34,10 @@ import org.lwjgl.opengl.GL11;
 
 public final class TrajectoriesModule extends Module {
     private static final double SIMULATION_STEP = 0.1D;
+    private static final int MAX_SIMULATION_STEPS = 512;
+    private final List<Vec3> pathBuffer = new ArrayList<Vec3>(MAX_SIMULATION_STEPS + 2);
+    private final float[] aimingColorBuffer = new float[3];
+    private final float[] trajectoryColorBuffer = new float[3];
 
     private final NumberSetting aimingRed = new NumberSetting("Aiming Red", 0, 255, 5, 85);
     private final NumberSetting aimingGreen = new NumberSetting("Aiming Green", 0, 255, 5, 255);
@@ -76,6 +83,7 @@ public final class TrajectoriesModule extends Module {
         }
 
         float[] lineColor = result.entityHit == null ? getTrajectoryColor() : getAimingColor();
+        GL11.glPushAttrib(GL11.GL_ALL_ATTRIB_BITS);
         GL11.glPushMatrix();
         try {
             GlStateManager.disableTexture2D();
@@ -101,6 +109,7 @@ public final class TrajectoriesModule extends Module {
             GlStateManager.color(1.0F, 1.0F, 1.0F, 1.0F);
             GL11.glColor4f(1.0F, 1.0F, 1.0F, 1.0F);
             GL11.glPopMatrix();
+            GL11.glPopAttrib();
         }
     }
 
@@ -143,7 +152,8 @@ public final class TrajectoriesModule extends Module {
     }
 
     private SimulationResult simulatePath(Minecraft minecraft, EntityPlayerSP player, ProjectileProperties properties, float partialTicks) {
-        List<Vec3> points = new ArrayList<Vec3>();
+        List<Vec3> points = pathBuffer;
+        points.clear();
         float pitch = player.prevRotationPitch + (player.rotationPitch - player.prevRotationPitch) * partialTicks;
         float yaw = player.prevRotationYaw + (player.rotationYaw - player.prevRotationYaw) * partialTicks;
         double yawRadians = Math.toRadians(yaw);
@@ -152,28 +162,16 @@ public final class TrajectoriesModule extends Module {
         Vec3 motion = getInitialMotion(yawRadians, pitchRadians, properties.velocity);
 
         points.add(position);
-        Entity hitEntity = null;
-        Vec3 hitVec = null;
-
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 0; i < MAX_SIMULATION_STEPS; i++) {
             Vec3 nextPosition = position.addVector(
                 motion.xCoord * SIMULATION_STEP,
                 motion.yCoord * SIMULATION_STEP,
                 motion.zCoord * SIMULATION_STEP
             );
             MovingObjectPosition blockHit = minecraft.theWorld.rayTraceBlocks(position, nextPosition, false, true, false);
-            EntityHitResult entityHit = findEntityHit(minecraft, player, position, nextPosition);
-
-            if (entityHit != null && (blockHit == null || position.distanceTo(entityHit.hitVec) <= position.distanceTo(blockHit.hitVec))) {
-                points.add(entityHit.hitVec);
-                hitEntity = entityHit.entity;
-                hitVec = entityHit.hitVec;
-                break;
-            }
 
             if (blockHit != null) {
                 points.add(blockHit.hitVec);
-                hitVec = blockHit.hitVec;
                 break;
             }
 
@@ -190,7 +188,15 @@ public final class TrajectoriesModule extends Module {
             }
         }
 
-        return new SimulationResult(points, hitEntity, hitVec);
+        EntityPathHit entityHit = findEntityHit(minecraft, player, points);
+        if (entityHit != null) {
+            while (points.size() > entityHit.segmentIndex + 1) {
+                points.remove(points.size() - 1);
+            }
+            points.add(entityHit.hitVec);
+            return new SimulationResult(points, entityHit.entity);
+        }
+        return new SimulationResult(points, null);
     }
 
     private Vec3 getStartPosition(EntityPlayerSP player, double yawRadians, float partialTicks, ProjectileProperties properties) {
@@ -224,61 +230,80 @@ public final class TrajectoriesModule extends Module {
         return 1.0D - ((1.0D - drag) * SIMULATION_STEP);
     }
 
-    private EntityHitResult findEntityHit(Minecraft minecraft, EntityPlayerSP player, Vec3 start, Vec3 end) {
+    private EntityPathHit findEntityHit(Minecraft minecraft, EntityPlayerSP player, List<Vec3> points) {
+        if (points.size() < 2) return null;
+        double minX = Double.POSITIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double minZ = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        double maxZ = Double.NEGATIVE_INFINITY;
+        for (Vec3 point : points) {
+            minX = Math.min(minX, point.xCoord);
+            minY = Math.min(minY, point.yCoord);
+            minZ = Math.min(minZ, point.zCoord);
+            maxX = Math.max(maxX, point.xCoord);
+            maxY = Math.max(maxY, point.yCoord);
+            maxZ = Math.max(maxZ, point.zCoord);
+        }
+
         Entity bestEntity = null;
         Vec3 bestHitVec = null;
-        double bestDistance = start.distanceTo(end);
-        AxisAlignedBB searchBox = new AxisAlignedBB(
-            Math.min(start.xCoord, end.xCoord),
-            Math.min(start.yCoord, end.yCoord),
-            Math.min(start.zCoord, end.zCoord),
-            Math.max(start.xCoord, end.xCoord),
-            Math.max(start.yCoord, end.yCoord),
-            Math.max(start.zCoord, end.zCoord)
-        ).expand(1.0D, 1.0D, 1.0D);
-
-        for (Object object : minecraft.theWorld.getEntitiesWithinAABBExcludingEntity(player, searchBox)) {
-            if (!(object instanceof Entity)) {
-                continue;
-            }
-
-            Entity entity = (Entity) object;
-            if (!(entity instanceof EntityLivingBase)
-                || entity == player
+        int bestSegment = Integer.MAX_VALUE;
+        double bestDistance = Double.POSITIVE_INFINITY;
+        RazorClient client = RazorClient.getInstance();
+        if (client == null) return null;
+        SnapshotFrame snapshots = client.getModuleManager().getEntitySnapshots().current();
+        for (int snapshotIndex = 0; snapshotIndex < snapshots.size(); snapshotIndex++) {
+            EntitySnapshot snapshot = snapshots.get(snapshotIndex);
+            Entity entity = snapshot.getEntity();
+            if (snapshot.isDead()
                 || entity instanceof EntityFishHook
                 || entity instanceof EntityArmorStand
                 || !entity.canBeCollidedWith()) {
                 continue;
             }
+            if (snapshot.getMaxX() + 1.0D < minX || snapshot.getMinX() - 1.0D > maxX
+                    || snapshot.getMaxY() + 1.0D < minY || snapshot.getMinY() - 1.0D > maxY
+                    || snapshot.getMaxZ() + 1.0D < minZ || snapshot.getMinZ() - 1.0D > maxZ) continue;
 
             float border = Math.max(0.45F, entity.getCollisionBorderSize());
-            AxisAlignedBB box = entity.getEntityBoundingBox().expand(border, border, border);
-            if (box.isVecInside(start)) {
-                return new EntityHitResult(entity, start);
-            }
-            if (box.isVecInside(end)) {
-                return new EntityHitResult(entity, end);
-            }
-            MovingObjectPosition intercept = box.calculateIntercept(start, end);
-            if (intercept == null) {
-                continue;
-            }
-
-            double distance = start.distanceTo(intercept.hitVec);
-            if (distance < bestDistance) {
-                bestDistance = distance;
-                bestEntity = entity;
-                bestHitVec = intercept.hitVec;
+            AxisAlignedBB box = new AxisAlignedBB(snapshot.getMinX(), snapshot.getMinY(), snapshot.getMinZ(),
+                snapshot.getMaxX(), snapshot.getMaxY(), snapshot.getMaxZ()).expand(border, border, border);
+            for (int segment = 0; segment < points.size() - 1; segment++) {
+                if (segment > bestSegment) break;
+                Vec3 start = points.get(segment);
+                Vec3 end = points.get(segment + 1);
+                Vec3 candidate = null;
+                if (box.isVecInside(start)) {
+                    candidate = start;
+                } else if (box.isVecInside(end)) {
+                    candidate = end;
+                } else {
+                    MovingObjectPosition intercept = box.calculateIntercept(start, end);
+                    if (intercept != null) candidate = intercept.hitVec;
+                }
+                if (candidate == null) continue;
+                double distance = start.distanceTo(candidate);
+                if (segment < bestSegment || (segment == bestSegment && distance < bestDistance)) {
+                    bestSegment = segment;
+                    bestDistance = distance;
+                    bestEntity = entity;
+                    bestHitVec = candidate;
+                }
+                break;
             }
         }
 
-        return bestEntity == null ? null : new EntityHitResult(bestEntity, bestHitVec);
+        return bestEntity == null ? null : new EntityPathHit(bestEntity, bestHitVec, bestSegment);
     }
 
     private void renderPath(Minecraft minecraft, List<Vec3> points, float[] color) {
-        double viewerX = minecraft.getRenderManager().viewerPosX;
-        double viewerY = minecraft.getRenderManager().viewerPosY;
-        double viewerZ = minecraft.getRenderManager().viewerPosZ;
+        RazorClient client = RazorClient.getInstance();
+        FrameContext frame = client == null ? null : client.getModuleManager().getFrameContext();
+        double viewerX = frame == null ? minecraft.getRenderManager().viewerPosX : frame.getCameraX();
+        double viewerY = frame == null ? minecraft.getRenderManager().viewerPosY : frame.getCameraY();
+        double viewerZ = frame == null ? minecraft.getRenderManager().viewerPosZ : frame.getCameraZ();
 
         Tessellator tessellator = Tessellator.getInstance();
         WorldRenderer renderer = tessellator.getWorldRenderer();
@@ -291,25 +316,18 @@ public final class TrajectoriesModule extends Module {
         tessellator.draw();
     }
 
-    private void vertex(double x1, double y1, double z1, double x2, double y2, double z2) {
-        GL11.glVertex3d(x1, y1, z1);
-        GL11.glVertex3d(x2, y2, z2);
-    }
-
     private float[] getAimingColor() {
-        return new float[] {
-            aimingRed.getValue() / 255.0F,
-            aimingGreen.getValue() / 255.0F,
-            aimingBlue.getValue() / 255.0F
-        };
+        aimingColorBuffer[0] = aimingRed.getValue() / 255.0F;
+        aimingColorBuffer[1] = aimingGreen.getValue() / 255.0F;
+        aimingColorBuffer[2] = aimingBlue.getValue() / 255.0F;
+        return aimingColorBuffer;
     }
 
     private float[] getTrajectoryColor() {
-        return new float[] {
-            trajectoryRed.getValue() / 255.0F,
-            trajectoryGreen.getValue() / 255.0F,
-            trajectoryBlue.getValue() / 255.0F
-        };
+        trajectoryColorBuffer[0] = trajectoryRed.getValue() / 255.0F;
+        trajectoryColorBuffer[1] = trajectoryGreen.getValue() / 255.0F;
+        trajectoryColorBuffer[2] = trajectoryBlue.getValue() / 255.0F;
+        return trajectoryColorBuffer;
     }
 
     private static final class ProjectileProperties {
@@ -331,22 +349,22 @@ public final class TrajectoriesModule extends Module {
     private static final class SimulationResult {
         private final List<Vec3> points;
         private final Entity entityHit;
-        private final Vec3 hitVec;
 
-        private SimulationResult(List<Vec3> points, Entity entityHit, Vec3 hitVec) {
+        private SimulationResult(List<Vec3> points, Entity entityHit) {
             this.points = points;
             this.entityHit = entityHit;
-            this.hitVec = hitVec;
         }
     }
 
-    private static final class EntityHitResult {
+    private static final class EntityPathHit {
         private final Entity entity;
         private final Vec3 hitVec;
+        private final int segmentIndex;
 
-        private EntityHitResult(Entity entity, Vec3 hitVec) {
+        private EntityPathHit(Entity entity, Vec3 hitVec, int segmentIndex) {
             this.entity = entity;
             this.hitVec = hitVec;
+            this.segmentIndex = segmentIndex;
         }
     }
 }

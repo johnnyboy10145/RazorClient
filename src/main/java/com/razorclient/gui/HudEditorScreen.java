@@ -1,5 +1,6 @@
 package com.razorclient.gui;
 
+import com.razorclient.config.ConfigManager;
 import com.razorclient.feature.module.impl.ClickGuiModule;
 import com.razorclient.feature.module.impl.HudModule;
 import net.minecraft.client.gui.Gui;
@@ -43,6 +44,7 @@ public final class HudEditorScreen extends GuiScreen {
         if (hudModule != null) {
             hudModule.editorMouseReleased();
         }
+        ConfigManager.flushPendingSaveNow();
         super.onGuiClosed();
         GuiCursor.exitGui();
     }

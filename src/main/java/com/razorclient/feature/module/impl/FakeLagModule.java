@@ -5,6 +5,7 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.Packet;
 import org.lwjgl.input.Keyboard;
@@ -22,7 +23,7 @@ public final class FakeLagModule extends Module {
 
     private volatile long enabledAt;
     private volatile long lastAttackAt;
-    private volatile boolean flushRequested;
+    private final AtomicBoolean flushRequested = new AtomicBoolean();
     private volatile boolean delayActive;
     private volatile boolean pulseHoldActive;
 
@@ -43,21 +44,21 @@ public final class FakeLagModule extends Module {
     protected void onEnable() {
         enabledAt = LagModuleSupport.now();
         lastAttackAt = 0L;
-        flushRequested = false;
+        flushRequested.set(false);
         delayActive = false;
         pulseHoldActive = false;
     }
 
     @Override
     protected void onDisable() {
-        flushRequested = true;
+        flushRequested.set(true);
         delayActive = false;
         pulseHoldActive = false;
     }
 
     @Override
     public void onSessionReset() {
-        flushRequested = true;
+        flushRequested.set(true);
         delayActive = false;
         pulseHoldActive = false;
         enabledAt = LagModuleSupport.now();
@@ -78,7 +79,7 @@ public final class FakeLagModule extends Module {
         delayActive = conditionsPass();
         pulseHoldActive = delayActive && mode.getValue() == Mode.PULSE && pulseHolding();
         if ((wasActive && !delayActive) || (wasHolding && !pulseHoldActive)) {
-            flushRequested = true;
+            flushRequested.set(true);
         }
     }
 
@@ -125,11 +126,7 @@ public final class FakeLagModule extends Module {
 
     @Override
     public boolean consumeFlushRequest() {
-        if (!flushRequested) {
-            return false;
-        }
-        flushRequested = false;
-        return true;
+        return flushRequested.getAndSet(false);
     }
 
     @Override
