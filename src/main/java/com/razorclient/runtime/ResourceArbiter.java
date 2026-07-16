@@ -24,9 +24,10 @@ public final class ResourceArbiter {
     private long tickSequence;
     private long generation;
 
-    public Lease acquire(Resource resource, String owner, int priority, int durationTicks,
+    public Lease acquire(Resource resource, OwnerToken owner, int priority, int durationTicks,
             Runnable restoreAction) {
-        if (resource == null || owner == null || owner.isEmpty()) return null;
+        if (resource == null || owner == null) return null;
+        priority = canonicalPriority(resource, owner.getModuleName(), priority);
         Lease displaced = null;
         Lease acquired;
         synchronized (this) {
@@ -52,7 +53,7 @@ public final class ResourceArbiter {
     }
 
     public void advanceTick(long sequence) {
-        List<Lease> expired = new ArrayList<Lease>();
+        List<Lease> expired = null;
         synchronized (this) {
             tickSequence = sequence;
             Iterator<Lease> iterator = leases.values().iterator();
@@ -61,14 +62,15 @@ public final class ResourceArbiter {
                 if (lease.expiresAt <= sequence) {
                     iterator.remove();
                     markInvalid(lease);
+                    if (expired == null) expired = new ArrayList<Lease>();
                     expired.add(lease);
                 }
             }
         }
-        restoreAll(expired);
+        if (expired != null) restoreAll(expired);
     }
 
-    public void releaseOwner(String owner) {
+    public void releaseOwner(OwnerToken owner) {
         if (owner == null) return;
         List<Lease> released = new ArrayList<Lease>();
         synchronized (this) {
@@ -85,7 +87,7 @@ public final class ResourceArbiter {
         restoreAll(released);
     }
 
-    public void releaseOwner(String owner, Resource resource) {
+    public void releaseOwner(OwnerToken owner, Resource resource) {
         Lease released = null;
         synchronized (this) {
             Lease lease = leases.get(resource);
@@ -119,12 +121,17 @@ public final class ResourceArbiter {
 
     public synchronized String getOwner(Resource resource) {
         Lease lease = leases.get(resource);
-        return lease == null || !lease.valid ? "None" : lease.owner;
+        return lease == null || !lease.valid ? "None" : lease.owner.getModuleName();
     }
 
-    public synchronized boolean isOwner(Resource resource, String owner) {
+    public synchronized OwnerToken getOwnerToken(Resource resource) {
         Lease lease = leases.get(resource);
-        return lease != null && lease.valid && lease.owner.equals(owner);
+        return lease == null || !lease.valid ? null : lease.owner;
+    }
+
+    public synchronized boolean isOwner(Resource resource, OwnerToken owner) {
+        Lease lease = leases.get(resource);
+        return owner != null && lease != null && lease.valid && lease.owner.equals(owner);
     }
 
     private synchronized boolean renew(Lease lease, int durationTicks) {
@@ -151,6 +158,33 @@ public final class ResourceArbiter {
         lease.valid = false;
     }
 
+    private static int canonicalPriority(Resource resource, String owner, int fallback) {
+        if (resource == Resource.SERVER_ROTATION || resource == Resource.MODEL_ROTATION) {
+            if ("KillAura".equals(owner)) return 400;
+            if ("Clutch".equals(owner)) return 300;
+            if ("AntiFireball".equals(owner)) return 200;
+            if ("AimAssist".equals(owner)) return 100;
+        } else if (resource == Resource.ATTACK_ACTION) {
+            if ("AntiFireball".equals(owner)) return 400;
+            if ("KillAura".equals(owner)) return 300;
+            if ("Reach".equals(owner)) return 200;
+            if ("LeftClicker".equals(owner)) return 100;
+        } else if (resource == Resource.USE_ACTION) {
+            if ("Clutch".equals(owner)) return 300;
+            if ("LegitScaffold".equals(owner)) return 200;
+            if ("RightClicker".equals(owner)) return 100;
+        } else if (resource == Resource.HOTBAR_SLOT) {
+            if ("Clutch".equals(owner)) return 300;
+            if ("Auto Weapon".equals(owner)) return 200;
+            if ("Auto Tool".equals(owner)) return 100;
+        } else if (resource == Resource.SPRINT_INPUT || resource == Resource.SNEAK_INPUT) {
+            if ("Sprint Reset".equals(owner)) return 300;
+            if ("LegitScaffold".equals(owner)) return 200;
+            if ("Sprint".equals(owner)) return 100;
+        }
+        return fallback;
+    }
+
     private void restoreAll(List<Lease> released) {
         for (Lease lease : released) restore(lease);
     }
@@ -160,21 +194,22 @@ public final class ResourceArbiter {
         try {
             lease.restoreAction.run();
         } catch (Throwable failure) {
-            AgentLog.error("Resource restore failed: " + lease.resource + " owner=" + lease.owner, failure);
+            AgentLog.error("Resource restore failed: " + lease.resource + " owner="
+                + lease.owner.getModuleName(), failure);
         }
     }
 
     public static final class Lease implements AutoCloseable {
         private final ResourceArbiter arbiter;
         private final Resource resource;
-        private final String owner;
+        private final OwnerToken owner;
         private final long generation;
         private int priority;
         private long expiresAt;
         private Runnable restoreAction;
         private volatile boolean valid = true;
 
-        private Lease(ResourceArbiter arbiter, Resource resource, String owner, int priority,
+        private Lease(ResourceArbiter arbiter, Resource resource, OwnerToken owner, int priority,
                 long expiresAt, long generation, Runnable restoreAction) {
             this.arbiter = arbiter;
             this.resource = resource;
@@ -186,7 +221,8 @@ public final class ResourceArbiter {
         }
 
         public Resource getResource() { return resource; }
-        public String getOwner() { return owner; }
+        public String getOwner() { return owner.getModuleName(); }
+        public OwnerToken getOwnerToken() { return owner; }
         public int getPriority() { return priority; }
         public long getGeneration() { return generation; }
         public boolean isValid() { return valid && arbiter.isOwner(resource, owner); }

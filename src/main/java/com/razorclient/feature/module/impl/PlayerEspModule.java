@@ -9,18 +9,19 @@ import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
-import java.util.Locale;
+import com.razorclient.runtime.EntityFrame;
+import com.razorclient.runtime.EntityRecord;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.FontRenderer;
 import net.minecraft.client.gui.Gui;
 import net.minecraft.client.gui.ScaledResolution;
 import net.minecraft.client.renderer.GlStateManager;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityLivingBase;
 import net.minecraft.entity.monster.EntityMob;
 import net.minecraft.entity.passive.EntityAnimal;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.scoreboard.Team;
-import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
-import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
 import com.razorclient.runtime.FrameContext;
 import net.minecraftforge.client.event.RenderGameOverlayEvent;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
@@ -69,14 +70,15 @@ public final class PlayerEspModule extends Module {
     private final FloatBuffer projection = BufferUtils.createFloatBuffer(16);
     private final IntBuffer viewport = BufferUtils.createIntBuffer(16);
     private final FloatBuffer projectedPoint = BufferUtils.createFloatBuffer(3);
-    private final EntitySnapshot[] renderSnapshots = new EntitySnapshot[MAX_SNAPSHOTS];
+    private final EntityRecord[] renderSnapshots = new EntityRecord[MAX_SNAPSHOTS];
     private final int[] renderTeamColors = new int[MAX_SNAPSHOTS];
     private final ProjectedSnapshot[] projected = new ProjectedSnapshot[MAX_SNAPSHOTS];
-    private volatile SnapshotFrame snapshots;
+    private volatile EntityFrame snapshots = EntityFrame.EMPTY;
     private int renderSnapshotCount;
     private int projectedCount;
     private int activeTargetId = -1;
     private volatile int renderedCount;
+    private long animationNanos;
 
     public PlayerEspModule() {
         super("PlayerESP", "Local-only 2D and 3D entity overlay.", Category.RENDER, Keyboard.KEY_NONE);
@@ -104,7 +106,7 @@ public final class PlayerEspModule extends Module {
             clearRenderState();
             return;
         }
-        snapshots = client.getModuleManager().getEntitySnapshots().current();
+        snapshots = client.getModuleManager().getEntityFrame();
     }
 
     @Override
@@ -131,32 +133,37 @@ public final class PlayerEspModule extends Module {
     @Override public void onSessionReset() { clearRenderState(); }
     @Override public void onInputContextLost() { projectedCount = 0; }
 
-    private boolean isEligible(Minecraft mc, EntitySnapshot snapshot, double limit) {
+    private boolean isEligible(Minecraft mc, EntityRecord snapshot, double limit) {
         if (snapshot == null || snapshot.isDead()) return false;
         boolean player = snapshot.isPlayer();
-        boolean mob = snapshot.getEntity() instanceof EntityMob || snapshot.getEntity() instanceof EntityAnimal;
+        Entity entity = mc.theWorld.getEntityByID(snapshot.getEntityId());
+        boolean mob = entity instanceof EntityMob || entity instanceof EntityAnimal;
         if ((player && !targetType.getValue().players) || (mob && !targetType.getValue().mobs) || (!player && !mob)) return false;
         if (snapshot.getDistanceToHitbox() > limit || (!throughWalls.isEnabled() && !snapshot.isVisible())) return false;
-        return CombatTargetService.isValid(mc, snapshot.getEntity(), player, mob, seeInvis.isEnabled(), false, false, limit);
+        return entity instanceof EntityLivingBase
+            && CombatTargetService.isValid(mc, (EntityLivingBase) entity, player, mob,
+                seeInvis.isEnabled(), false, false, limit);
     }
 
     private void prepareRenderSnapshots(Minecraft mc) {
         renderSnapshotCount = 0;
-        SnapshotFrame frame = snapshots;
+        EntityFrame frame = snapshots;
         if (frame == null) {
             renderedCount = 0;
             return;
         }
-        activeTargetId = CombatTargetService.getPublishedTargetId(mc);
+        activeTargetId = getContext().getTargetPublications().activeTarget(getContext().getTick());
         double limit = maxDistance.getValue();
         for (int i = 0; i < frame.size() && renderSnapshotCount < MAX_SNAPSHOTS; i++) {
-            EntitySnapshot snapshot = frame.get(i);
+            EntityRecord snapshot = frame.get(i);
             if (!isEligible(mc, snapshot, limit)) continue;
             renderSnapshots[renderSnapshotCount] = snapshot;
-            renderTeamColors[renderSnapshotCount] = snapshot.isPlayer()
-                ? getTeamColor((EntityPlayer) snapshot.getEntity()) : -1;
+            Entity entity = mc.theWorld.getEntityByID(snapshot.getEntityId());
+            renderTeamColors[renderSnapshotCount] = entity instanceof EntityPlayer
+                ? getTeamColor((EntityPlayer) entity) : -1;
             renderSnapshotCount++;
         }
+        animationNanos = System.nanoTime();
         renderedCount = renderSnapshotCount;
     }
 
@@ -173,7 +180,7 @@ public final class PlayerEspModule extends Module {
             if (throughWalls.isEnabled()) { GlStateManager.disableDepth(); GlStateManager.depthMask(false); }
             GL11.glLineWidth(lineWidth.getValue());
             for (int index = 0; index < renderSnapshotCount; index++) {
-                EntitySnapshot snapshot = renderSnapshots[index];
+                EntityRecord snapshot = renderSnapshots[index];
                 int color = colorFor(snapshot, renderTeamColors[index]);
                 float r = ((color >>> 16) & 255) / 255.0F;
                 float g = ((color >>> 8) & 255) / 255.0F;
@@ -215,7 +222,7 @@ public final class PlayerEspModule extends Module {
         double viewerY = frame.getCameraY();
         double viewerZ = frame.getCameraZ();
         for (int index = 0; index < renderSnapshotCount; index++) {
-            EntitySnapshot snapshot = renderSnapshots[index];
+            EntityRecord snapshot = renderSnapshots[index];
             double offsetX = snapshot.interpolateX(partialTicks) - snapshot.getX();
             double offsetY = snapshot.interpolateY(partialTicks) - snapshot.getY();
             double offsetZ = snapshot.interpolateZ(partialTicks) - snapshot.getZ();
@@ -250,7 +257,7 @@ public final class PlayerEspModule extends Module {
             GlStateManager.enableBlend(); GlStateManager.disableDepth(); GlStateManager.depthMask(false);
             for (int index = 0; index < projectedCount; index++) {
                 ProjectedSnapshot projection = projected[index];
-                EntitySnapshot snapshot = projection.snapshot;
+                EntityRecord snapshot = projection.snapshot;
                 int color = 0xFF000000 | colorFor(snapshot, projection.teamColor);
                 int translucent = (fillAlpha.getValue() * 255 / 100 << 24) | (color & 0xFFFFFF);
                 int x1 = Math.round(projection.minX), y1 = Math.round(projection.minY);
@@ -268,20 +275,31 @@ public final class PlayerEspModule extends Module {
         }
     }
 
-    private void drawInformation(FontRenderer font, EntitySnapshot s, int x1, int y1, int x2, int y2, int color) {
+    private void drawInformation(FontRenderer font, EntityRecord s, int x1, int y1, int x2, int y2, int color) {
         StringBuilder top = new StringBuilder();
         if (showNames.isEnabled()) top.append(s.getName());
         if (showHealth.isEnabled() && healthValue.isEnabled()) append(top, Math.round(s.getHealth()) + "hp");
-        if (showDistance.isEnabled()) append(top, String.format(Locale.ROOT, "%.1fm", s.getDistanceToHitbox()));
-        if (top.length() > 0) font.drawStringWithShadow(top.toString(), (x1 + x2 - font.getStringWidth(top.toString())) / 2.0F, y1 - 10, color);
+        if (showDistance.isEnabled()) append(top, formatDistance(s.getDistanceToHitbox()));
+        if (top.length() > 0) {
+            String value = top.toString();
+            font.drawStringWithShadow(value, (x1 + x2 - font.getStringWidth(value)) / 2.0F, y1 - 10, color);
+        }
         StringBuilder bottom = new StringBuilder();
         if (showArmor.isEnabled()) append(bottom, "Armor " + s.getArmor());
         if (showHeldItem.isEnabled() && !s.getHeldItemName().isEmpty()) append(bottom, s.getHeldItemName());
-        if (bottom.length() > 0) font.drawStringWithShadow(bottom.toString(), (x1 + x2 - font.getStringWidth(bottom.toString())) / 2.0F, y2 + 2, 0xFFFFFFFF);
+        if (bottom.length() > 0) {
+            String value = bottom.toString();
+            font.drawStringWithShadow(value, (x1 + x2 - font.getStringWidth(value)) / 2.0F, y2 + 2, 0xFFFFFFFF);
+        }
+    }
+
+    private static String formatDistance(double distance) {
+        long tenths = Math.max(0L, Math.round(distance * 10.0D));
+        return (tenths / 10L) + "." + (tenths % 10L) + "m";
     }
 
     private void append(StringBuilder builder, String value) { if (builder.length() > 0) builder.append(" | "); builder.append(value); }
-    private void drawHealthBar(EntitySnapshot s, int x, int top, int bottom) {
+    private void drawHealthBar(EntityRecord s, int x, int top, int bottom) {
         float ratio = Math.max(0.0F, Math.min(1.0F, s.getHealth() / Math.max(1.0F, s.getMaxHealth())));
         int filled = Math.round((bottom - top) * ratio);
         int healthColor = ratio > 0.5F ? 0xFF42D66A : ratio > 0.25F ? 0xFFFFB340 : 0xFFFF4B4B;
@@ -299,12 +317,13 @@ public final class PlayerEspModule extends Module {
         GlStateManager.enableTexture2D();
     }
 
-    private int colorFor(EntitySnapshot snapshot, int teamColor) {
+    private int colorFor(EntityRecord snapshot, int teamColor) {
         if (targetHighlight.isEnabled() && snapshot.getEntityId() == activeTargetId) return rgb(targetRed, targetGreen, targetBlue);
         if (!snapshot.isVisible()) return rgb(hiddenRed, hiddenGreen, hiddenBlue);
         if (useTeamColors.isEnabled() && teamColor >= 0) return teamColor;
         if (mode.getValue() == Mode.MODERN) {
-            float wave = (float) ((Math.sin(System.nanoTime() / 340000000.0D + snapshot.getEntityId() * 0.35D) + 1.0D) * 0.5D);
+            float wave = (float) ((Math.sin(animationNanos / 340000000.0D
+                + snapshot.getEntityId() * 0.35D) + 1.0D) * 0.5D);
             return ClickGuiModule.blendColor(ClickGuiModule.getLightAccentColor(), ClickGuiModule.getDarkAccentColor(), wave);
         }
         return rgb(red, green, blue);
@@ -320,7 +339,7 @@ public final class PlayerEspModule extends Module {
     }
 
     private void clearRenderState() {
-        snapshots = null;
+        snapshots = EntityFrame.EMPTY;
         renderSnapshotCount = 0;
         projectedCount = 0;
         renderedCount = 0;
@@ -346,14 +365,14 @@ public final class PlayerEspModule extends Module {
     private void quad(double a,double b,double c,double d,double e,double f,double g,double h,double i,double j,double k,double l){GL11.glVertex3d(a,b,c);GL11.glVertex3d(d,e,f);GL11.glVertex3d(g,h,i);GL11.glVertex3d(j,k,l);}
 
     private static final class ProjectedSnapshot {
-        private EntitySnapshot snapshot;
+        private EntityRecord snapshot;
         private int teamColor;
         private float minX;
         private float minY;
         private float maxX;
         private float maxY;
 
-        private void set(EntitySnapshot snapshot, int teamColor, float minX, float minY, float maxX, float maxY) {
+        private void set(EntityRecord snapshot, int teamColor, float minX, float minY, float maxX, float maxY) {
             this.snapshot = snapshot;
             this.teamColor = teamColor;
             this.minX = minX;

@@ -2,34 +2,24 @@ package com.razorclient.combat;
 
 import com.razorclient.RazorClient;
 import com.razorclient.runtime.ResourceArbiter;
+import com.razorclient.runtime.OwnerToken;
+import com.razorclient.feature.module.Module;
 import com.razorclient.feature.module.impl.HitSelectModule;
 import net.minecraft.client.Minecraft;
 import net.minecraft.entity.EntityLivingBase;
 
 public final class CombatActionCoordinator {
-    private static Object world;
-    private static int tick = Integer.MIN_VALUE;
-    private static String fallbackOwner = "None";
-
     private CombatActionCoordinator() { }
 
     public static synchronized boolean tryAcquire(String requestedOwner) {
         Minecraft minecraft = Minecraft.getMinecraft();
         if (minecraft == null || minecraft.theWorld == null || minecraft.thePlayer == null || requestedOwner == null) return false;
         ResourceArbiter arbiter = getArbiter();
-        if (arbiter != null) {
-            ResourceArbiter.Resource resource = isUseOwner(requestedOwner)
-                ? ResourceArbiter.Resource.USE_ACTION : ResourceArbiter.Resource.ATTACK_ACTION;
-            return arbiter.acquire(resource, requestedOwner, priority(requestedOwner), 1, null) != null;
-        }
-        if (world != minecraft.theWorld || tick != minecraft.thePlayer.ticksExisted) {
-            world = minecraft.theWorld;
-            tick = minecraft.thePlayer.ticksExisted;
-            fallbackOwner = "None";
-        }
-        if (!"None".equals(fallbackOwner)) return false;
-        fallbackOwner = requestedOwner;
-        return true;
+        if (arbiter == null) return false;
+        ResourceArbiter.Resource resource = isUseOwner(requestedOwner)
+            ? ResourceArbiter.Resource.USE_ACTION : ResourceArbiter.Resource.ATTACK_ACTION;
+        OwnerToken token = findOwnerToken(requestedOwner);
+        return token != null && arbiter.acquire(resource, token, priority(requestedOwner), 1, null) != null;
     }
 
     public static boolean tryAcquire(String requestedOwner, EntityLivingBase target) {
@@ -39,7 +29,7 @@ public final class CombatActionCoordinator {
 
     public static synchronized String getOwner() {
         ResourceArbiter arbiter = getArbiter();
-        if (arbiter == null) return fallbackOwner;
+        if (arbiter == null) return "None";
         String attack = arbiter.getOwner(ResourceArbiter.Resource.ATTACK_ACTION);
         return "None".equals(attack) ? arbiter.getOwner(ResourceArbiter.Resource.USE_ACTION) : attack;
     }
@@ -50,14 +40,20 @@ public final class CombatActionCoordinator {
             arbiter.clear(ResourceArbiter.Resource.ATTACK_ACTION);
             arbiter.clear(ResourceArbiter.Resource.USE_ACTION);
         }
-        world = null;
-        tick = Integer.MIN_VALUE;
-        fallbackOwner = "None";
     }
 
     private static ResourceArbiter getArbiter() {
         RazorClient client = RazorClient.getInstance();
         return client == null ? null : client.getModuleManager().getResourceArbiter();
+    }
+
+    private static OwnerToken findOwnerToken(String owner) {
+        RazorClient client = RazorClient.getInstance();
+        if (client == null || owner == null) return null;
+        for (Module module : client.getModuleManager().getModules()) {
+            if (owner.equals(module.getName())) return module.getScope().getOwnerToken();
+        }
+        return null;
     }
 
     private static boolean isUseOwner(String owner) {

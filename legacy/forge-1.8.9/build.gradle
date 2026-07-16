@@ -77,6 +77,8 @@ processResources {
 
 sourceSets {
     main {
+        java.srcDirs = ["../../src/main/java", "src/main/java"]
+        resources.srcDirs = ["src/main/resources"]
         ext.refMap = "mixins.razorclient.refmap.json"
     }
 }

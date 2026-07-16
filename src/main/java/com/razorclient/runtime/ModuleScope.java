@@ -17,6 +17,8 @@ public final class ModuleScope {
     private final List<Runnable> resetActions = new ArrayList<Runnable>();
     private final List<Runnable> inputCleanupActions = new ArrayList<Runnable>();
     private ResourceArbiter arbiter;
+    private ClientThreadScheduler scheduler;
+    private OwnerToken ownerToken;
     private boolean active;
     private int targetEntityId = -1;
     private String status = "Idle";
@@ -25,18 +27,29 @@ public final class ModuleScope {
         this.owner = owner;
     }
 
-    public synchronized void attach(ResourceArbiter arbiter) {
+    public synchronized void attach(ResourceArbiter arbiter, ClientThreadScheduler scheduler) {
         if (this.arbiter != null && this.arbiter != arbiter) {
             throw new IllegalStateException("Module scope already attached: " + owner);
         }
         this.arbiter = arbiter;
+        this.scheduler = scheduler;
     }
 
-    public synchronized void activate() {
+    public synchronized void activate(long activationGeneration) {
+        if (activationGeneration <= 0L) throw new IllegalArgumentException("activationGeneration");
         active = true;
+        ownerToken = OwnerToken.issue(owner, activationGeneration);
+    }
+
+    /** Starts a rollback-safe activation transaction. */
+    public synchronized Activation beginActivation(long activationGeneration) {
+        if (active) throw new IllegalStateException("Module scope already active: " + owner);
+        activate(activationGeneration);
+        return new Activation(this, ownerToken);
     }
 
     public synchronized boolean isActive() { return active; }
+    public synchronized OwnerToken getOwnerToken() { return ownerToken; }
     public String getOwner() { return owner; }
     public Random getRandom() { return random; }
 
@@ -73,11 +86,13 @@ public final class ModuleScope {
     public ResourceArbiter.Lease acquire(ResourceArbiter.Resource resource, int priority,
             int durationTicks, Runnable restoreAction) {
         ResourceArbiter value;
+        OwnerToken token;
         synchronized (this) {
             if (!active || arbiter == null) return null;
             value = arbiter;
+            token = ownerToken;
         }
-        ResourceArbiter.Lease lease = value.acquire(resource, owner, priority, durationTicks, restoreAction);
+        ResourceArbiter.Lease lease = value.acquire(resource, token, priority, durationTicks, restoreAction);
         synchronized (this) {
             if (active && arbiter == value) return lease;
         }
@@ -87,35 +102,55 @@ public final class ModuleScope {
 
     public void release(ResourceArbiter.Resource resource) {
         ResourceArbiter value;
-        synchronized (this) { value = arbiter; }
-        if (value != null) value.releaseOwner(owner, resource);
+        OwnerToken token;
+        synchronized (this) { value = arbiter; token = ownerToken; }
+        if (value != null) value.releaseOwner(token, resource);
     }
 
     public void cleanupInput(ModuleResetReason reason) {
         List<Runnable> actions;
         ResourceArbiter value;
+        OwnerToken token;
         synchronized (this) {
             actions = new ArrayList<Runnable>(inputCleanupActions);
             value = arbiter;
+            token = ownerToken;
         }
-        if (value != null) value.releaseOwner(owner);
+        if (value != null) value.releaseOwner(token);
         runActions(actions, "input cleanup", reason);
     }
 
     public void reset(ModuleResetReason reason) {
         List<Runnable> actions;
         ResourceArbiter value;
+        ClientThreadScheduler taskScheduler;
+        OwnerToken token;
         synchronized (this) {
             active = false;
+            token = ownerToken;
+            ownerToken = null;
             state.clear();
             deadlines.clear();
             targetEntityId = -1;
             status = "Idle";
             actions = new ArrayList<Runnable>(resetActions);
             value = arbiter;
+            taskScheduler = scheduler;
         }
-        if (value != null) value.releaseOwner(owner);
+        if (taskScheduler != null) taskScheduler.discardOwner(token);
+        if (value != null) value.releaseOwner(token);
         runActions(actions, "scope reset", reason);
+    }
+
+    private synchronized void commitActivation(OwnerToken token) {
+        if (!active || ownerToken != token) throw new IllegalStateException("Stale activation: " + owner);
+    }
+
+    private void rollbackActivation(OwnerToken token) {
+        synchronized (this) {
+            if (!active || ownerToken != token) return;
+        }
+        reset(ModuleResetReason.DISABLED);
     }
 
     private void runActions(List<Runnable> actions, String operation, ModuleResetReason reason) {
@@ -125,6 +160,33 @@ public final class ModuleScope {
             } catch (Throwable failure) {
                 AgentLog.error(owner + " " + operation + " failed (" + reason + ")", failure);
             }
+        }
+    }
+
+    public static final class Activation implements AutoCloseable {
+        private final ModuleScope scope;
+        private final OwnerToken token;
+        private boolean committed;
+        private boolean closed;
+
+        private Activation(ModuleScope scope, OwnerToken token) {
+            this.scope = scope;
+            this.token = token;
+        }
+
+        public OwnerToken getOwnerToken() { return token; }
+
+        public void commit() {
+            if (closed) throw new IllegalStateException("Activation already closed");
+            scope.commitActivation(token);
+            committed = true;
+        }
+
+        @Override
+        public void close() {
+            if (closed) return;
+            closed = true;
+            if (!committed) scope.rollbackActivation(token);
         }
     }
 }

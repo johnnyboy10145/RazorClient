@@ -5,10 +5,20 @@ import com.razorclient.combat.CombatTargetService;
 import com.razorclient.combat.CombatActionCoordinator;
 import com.razorclient.util.MouseButtonHelper;
 import com.razorclient.runtime.EntitySnapshotService;
+import com.razorclient.runtime.EntityFrame;
 import com.razorclient.runtime.FrameContext;
+import com.razorclient.runtime.ClientSession;
 import com.razorclient.runtime.ResourceArbiter;
 import com.razorclient.runtime.RuntimeCore;
 import com.razorclient.runtime.TickContext;
+import com.razorclient.runtime.OwnerToken;
+import com.razorclient.network.PacketDecision;
+import com.razorclient.network.PacketLane;
+import com.razorclient.network.PacketReleasePolicy;
+import com.razorclient.runtime.capability.InputListener;
+import com.razorclient.runtime.capability.RenderListener;
+import com.razorclient.runtime.capability.TickListener;
+import com.razorclient.runtime.capability.PacketPolicy;
 import com.razorclient.feature.module.impl.AimAssistModule;
 import com.razorclient.feature.module.impl.AutoClickerModule;
 import com.razorclient.feature.module.impl.AntiBotModule;
@@ -50,7 +60,11 @@ import java.util.Collections;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.lang.reflect.Method;
 import net.minecraft.network.Packet;
+import net.minecraft.network.play.server.S12PacketEntityVelocity;
+import net.minecraft.network.play.server.S14PacketEntity;
+import net.minecraft.network.play.server.S18PacketEntityTeleport;
 import net.minecraft.client.Minecraft;
 import net.minecraftforge.client.event.MouseEvent;
 import net.minecraftforge.client.event.RenderGameOverlayEvent;
@@ -64,10 +78,21 @@ public final class ModuleManager {
     private final ConfigManager configManager;
     private final ConfigModule configModule;
     private final RuntimeCore runtimeCore = new RuntimeCore();
-    private Object lastWorld;
-    private Object lastPlayer;
-    private boolean lastPlayerDead;
-    private boolean inputContextLost = true;
+    private static final Module[] EMPTY_SUBSCRIBERS = new Module[0];
+    private volatile Module[] clientTickSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] clientTickEventSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] playerTickSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] mouseSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] jumpSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] renderTickSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] renderWorldSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] renderOverlaySubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] sessionResetSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] inputLossSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] packetPolicySubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] inboundQueuedSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] inboundReleasedSubscribers = EMPTY_SUBSCRIBERS;
+    private volatile Module[] inboundProcessedSubscribers = EMPTY_SUBSCRIBERS;
 
     public ModuleManager() {
         for (Category category : Category.values()) {
@@ -116,9 +141,92 @@ public final class ModuleManager {
     }
 
     private void register(Module module) {
-        module.attachRuntime(runtimeCore.getResourceArbiter());
+        module.attachRuntime(runtimeCore);
         modules.add(module);
         modulesByCategory.get(module.getCategory()).add(module);
+        rebuildSubscriberIndexes();
+    }
+
+    /** Publishes immutable callback arrays; dispatch never scans modules that cannot receive an event. */
+    private void rebuildSubscriberIndexes() {
+        clientTickSubscribers = subscribers(TickListener.class, "onClientTick");
+        clientTickEventSubscribers = subscribers(null, "onClientTick", TickEvent.ClientTickEvent.class);
+        playerTickSubscribers = subscribers(null, "onPlayerTick", TickEvent.PlayerTickEvent.class);
+        mouseSubscribers = subscribers(null, "onMouseEvent", MouseEvent.class);
+        jumpSubscribers = subscribers(null, "onPlayerJump", LivingEvent.LivingJumpEvent.class);
+        renderTickSubscribers = subscribers(RenderListener.class, "onRenderTick", TickEvent.RenderTickEvent.class);
+        renderWorldSubscribers = subscribers(RenderListener.class, "onRenderWorld", RenderWorldLastEvent.class);
+        renderOverlaySubscribers = subscribers(RenderListener.class, "onRenderOverlay", RenderGameOverlayEvent.Text.class);
+        sessionResetSubscribers = subscribersAny(null,
+            new MethodSignature("onSessionReset"),
+            new MethodSignature("onSessionReset", ModuleResetReason.class));
+        inputLossSubscribers = subscribersAny(InputListener.class,
+            new MethodSignature("onInputContextLost"),
+            new MethodSignature("onInputContextLost", ModuleResetReason.class));
+        packetPolicySubscribers = subscribersAny(PacketPolicy.class,
+            new MethodSignature("onOutboundPacket", Packet.class),
+            new MethodSignature("onInboundPacket", Packet.class),
+            new MethodSignature("getOutboundPacketDelay", Packet.class),
+            new MethodSignature("getInboundPacketDelay", Packet.class),
+            new MethodSignature("getOutboundPacketDelayPriority", Packet.class),
+            new MethodSignature("getInboundPacketDelayPriority", Packet.class),
+            new MethodSignature("shouldHoldOutboundPacket", Packet.class),
+            new MethodSignature("shouldHoldInboundPacket", Packet.class),
+            new MethodSignature("shouldCancelInboundPacket", Packet.class),
+            new MethodSignature("shouldBypassOutboundOrdering", Packet.class),
+            new MethodSignature("shouldFlushThenPassOutboundPacket", Packet.class),
+            new MethodSignature("receivesInboundPacketsWhenDisabled"),
+            new MethodSignature("isPacketDelayActive"),
+            new MethodSignature("isOutboundPacketDelayActive"),
+            new MethodSignature("isInboundPacketDelayActive"),
+            new MethodSignature("onPacketDelayOverflow", boolean.class),
+            new MethodSignature("consumeFlushRequest"),
+            new MethodSignature("consumeOutboundFlushRequest"),
+            new MethodSignature("consumeInboundFlushRequest"));
+        inboundQueuedSubscribers = subscribers(null, "onInboundPacketQueued", Packet.class);
+        inboundReleasedSubscribers = subscribers(null, "onInboundPacketReleased", Packet.class);
+        inboundProcessedSubscribers = subscribers(null, "onInboundPacketProcessed", Packet.class);
+    }
+
+    private Module[] subscribers(Class<?> capability, String methodName, Class<?>... parameterTypes) {
+        List<Module> selected = new ArrayList<Module>();
+        for (Module module : modules) {
+            if ((capability != null && capability.isInstance(module))
+                    || overrides(module, methodName, parameterTypes)) selected.add(module);
+        }
+        return selected.toArray(new Module[selected.size()]);
+    }
+
+    private Module[] subscribersAny(Class<?> capability, MethodSignature... signatures) {
+        List<Module> selected = new ArrayList<Module>();
+        for (Module module : modules) {
+            boolean subscribed = capability != null && capability.isInstance(module);
+            for (int index = 0; !subscribed && index < signatures.length; index++) {
+                MethodSignature signature = signatures[index];
+                subscribed = overrides(module, signature.name, signature.parameterTypes);
+            }
+            if (subscribed) selected.add(module);
+        }
+        return selected.toArray(new Module[selected.size()]);
+    }
+
+    private static boolean overrides(Module module, String methodName, Class<?>... parameterTypes) {
+        try {
+            Method method = module.getClass().getMethod(methodName, parameterTypes);
+            return method.getDeclaringClass() != Module.class;
+        } catch (NoSuchMethodException ignored) {
+            return false;
+        }
+    }
+
+    private static final class MethodSignature {
+        private final String name;
+        private final Class<?>[] parameterTypes;
+
+        private MethodSignature(String name, Class<?>... parameterTypes) {
+            this.name = name;
+            this.parameterTypes = parameterTypes;
+        }
     }
 
     public List<Module> getModules() {
@@ -128,6 +236,9 @@ public final class ModuleManager {
     public List<Module> getModules(Category category) {
         return Collections.unmodifiableList(modulesByCategory.get(category));
     }
+
+    public int getPacketPolicyModuleCount() { return packetPolicySubscribers.length; }
+    public Module getPacketPolicyModule(int index) { return packetPolicySubscribers[index]; }
 
     public <T extends Module> T getModule(Class<T> moduleClass) {
         for (Module module : modules) {
@@ -140,9 +251,10 @@ public final class ModuleManager {
 
     public void onClientTick() {
         updateLifecycleState();
-        for (Module module : modules) {
+        for (Module module : clientTickSubscribers) {
             if (module.isEnabled()) {
-                invokeCallback(module, CallbackKind.CLIENT_TICK, null);
+                if (module instanceof TickListener) invokeTickListener(module);
+                else invokeCallback(module, CallbackKind.CLIENT_TICK, null);
             }
         }
         ConfigManager.flushPendingSave();
@@ -165,56 +277,47 @@ public final class ModuleManager {
     public TickContext getTickContext() { return runtimeCore.getTickContext(); }
     public FrameContext getFrameContext() { return runtimeCore.getFrameContext(); }
     public EntitySnapshotService getEntitySnapshots() { return runtimeCore.getEntitySnapshots(); }
+    public EntityFrame getEntityFrame() { return runtimeCore.getEntityFrame(); }
     public ResourceArbiter getResourceArbiter() { return runtimeCore.getResourceArbiter(); }
+    public ClientSession getClientSession() { return runtimeCore.getClientSession(); }
+    public boolean scheduleClientTask(Runnable action) {
+        return runtimeCore.getClientSession().getScheduler().submit(null, action);
+    }
 
     private void updateLifecycleState() {
         Minecraft minecraft = Minecraft.getMinecraft();
-        Object world = minecraft == null ? null : minecraft.theWorld;
-        Object player = minecraft == null ? null : minecraft.thePlayer;
-        boolean playerDead = minecraft != null && minecraft.thePlayer != null && minecraft.thePlayer.isDead;
-        if (world != lastWorld || player != lastPlayer) {
-            ModuleResetReason reason = world == null ? ModuleResetReason.DISCONNECT
-                : lastWorld == world ? ModuleResetReason.RESPAWN : ModuleResetReason.WORLD_CHANGE;
-            lastWorld = world;
-            lastPlayer = player;
-            lastPlayerDead = playerDead;
-            resetEnabledModules(reason);
-        } else if (playerDead != lastPlayerDead) {
-            lastPlayerDead = playerDead;
-            resetEnabledModules(ModuleResetReason.RESPAWN);
-        }
-
-        boolean lost = minecraft == null || world == null || player == null
-            || playerDead || !minecraft.inGameHasFocus || minecraft.currentScreen != null;
-        if (lost && !inputContextLost) {
-            ModuleResetReason reason = minecraft != null && minecraft.currentScreen != null
-                ? ModuleResetReason.GUI_OPENED : ModuleResetReason.FOCUS_LOSS;
+        ClientSession.Observation observation = runtimeCore.observeSession(minecraft);
+        if (observation.getResetReason() != null) resetEnabledModules(observation.getResetReason());
+        if (observation.isInputLost()) {
+            ModuleResetReason reason = observation.getInputReason();
             CombatActionCoordinator.clear();
             MouseButtonHelper.releaseAllSynthetic();
             for (Module module : modules) {
-                if (module.isEnabled()) {
-                    module.cleanupInputScope(reason);
-                    invokeCallback(module, CallbackKind.INPUT_CONTEXT_LOST, reason);
-                }
+                if (module.isEnabled()) module.cleanupInputScope(reason);
+            }
+            for (Module module : inputLossSubscribers) {
+                if (!module.isEnabled()) continue;
+                if (module instanceof InputListener) invokeInputListener(module, reason);
+                else invokeCallback(module, CallbackKind.INPUT_CONTEXT_LOST, reason);
             }
         }
-        inputContextLost = lost;
     }
 
     private void resetEnabledModules(ModuleResetReason reason) {
         CombatTargetService.clear();
+        runtimeCore.getTargetPublications().clearAll();
         CombatActionCoordinator.clear();
         MouseButtonHelper.releaseAllSynthetic();
-        for (Module module : modules) {
-            if (module.isEnabled()) {
-                module.resetScope(reason);
-                invokeCallback(module, CallbackKind.SESSION_RESET, reason);
-            }
+        for (Module module : packetPolicySubscribers) {
+            if (module.isEnabled()) module.resetScope(reason);
+        }
+        for (Module module : sessionResetSubscribers) {
+            if (module.isEnabled()) invokeCallback(module, CallbackKind.SESSION_RESET, reason);
         }
     }
 
     public void onClientTick(TickEvent.ClientTickEvent event) {
-        for (Module module : modules) {
+        for (Module module : clientTickEventSubscribers) {
             if (module.isEnabled()) {
                 invokeCallback(module, CallbackKind.CLIENT_TICK_EVENT, event);
             }
@@ -222,7 +325,7 @@ public final class ModuleManager {
     }
 
     public void onPlayerTick(TickEvent.PlayerTickEvent event) {
-        for (Module module : modules) {
+        for (Module module : playerTickSubscribers) {
             if (module.isEnabled()) {
                 invokeCallback(module, CallbackKind.PLAYER_TICK, event);
             }
@@ -230,7 +333,7 @@ public final class ModuleManager {
     }
 
     public void onMouseEvent(MouseEvent event) {
-        for (Module module : modules) {
+        for (Module module : mouseSubscribers) {
             if (module.isEnabled()) {
                 invokeCallback(module, CallbackKind.MOUSE, event);
             }
@@ -238,7 +341,7 @@ public final class ModuleManager {
     }
 
     public void onPlayerJump(LivingEvent.LivingJumpEvent event) {
-        for (Module module : modules) {
+        for (Module module : jumpSubscribers) {
             if (module.isEnabled()) {
                 invokeCallback(module, CallbackKind.PLAYER_JUMP, event);
             }
@@ -246,25 +349,28 @@ public final class ModuleManager {
     }
 
     public void onRenderTick(TickEvent.RenderTickEvent event) {
-        for (Module module : modules) {
+        for (Module module : renderTickSubscribers) {
             if (module.isEnabled()) {
-                invokeCallback(module, CallbackKind.RENDER_TICK, event);
+                if (module instanceof RenderListener) invokeRenderListener(module, RenderListener.Phase.FRAME);
+                else invokeCallback(module, CallbackKind.RENDER_TICK, event);
             }
         }
     }
 
     public void onRenderWorld(RenderWorldLastEvent event) {
-        for (Module module : modules) {
+        for (Module module : renderWorldSubscribers) {
             if (module.isEnabled()) {
-                invokeCallback(module, CallbackKind.RENDER_WORLD, event);
+                if (module instanceof RenderListener) invokeRenderListener(module, RenderListener.Phase.WORLD);
+                else invokeCallback(module, CallbackKind.RENDER_WORLD, event);
             }
         }
     }
 
     public void onRenderOverlay(RenderGameOverlayEvent.Text event) {
-        for (Module module : modules) {
+        for (Module module : renderOverlaySubscribers) {
             if (module.isEnabled()) {
-                invokeCallback(module, CallbackKind.RENDER_OVERLAY, event);
+                if (module instanceof RenderListener) invokeRenderListener(module, RenderListener.Phase.OVERLAY);
+                else invokeCallback(module, CallbackKind.RENDER_OVERLAY, event);
             }
         }
     }
@@ -281,12 +387,78 @@ public final class ModuleManager {
         return selectPacketDelay(packet, false);
     }
 
+    /** Captures all outbound policy state exactly once on the Netty interception edge. */
+    public PacketDecision captureOutboundPacketDecision(Packet<?> packet) {
+        onOutboundPacket(packet);
+        PacketDelaySelection selection = selectPacketDelay(packet, true);
+        PacketDecision decision = createPacketDecision(packet, true, selection, false);
+        Module owner = selection.getOwner();
+        if (owner != null) {
+            try {
+                if (owner.shouldFlushThenPassOutboundPacket(packet)) {
+                    return new PacketDecision(PacketDecision.Action.FLUSH_THEN_PASS, owner,
+                        owner.getScope().getOwnerToken(), selection.getPriority(), 0,
+                        PacketReleasePolicy.FLUSH_THEN_PASS, decision.getLane());
+                }
+            } catch (Throwable failure) {
+                runtimeCore.getFaultBarrier().report(owner, "flush-then-pass", failure);
+            }
+        }
+        return decision;
+    }
+
+    /** Captures mutation/cancellation/hold state once; release never re-queries module settings. */
+    public PacketDecision captureInboundPacketDecision(Packet<?> packet) {
+        onInboundPacket(packet);
+        PacketDelaySelection selection = selectInboundPacketDelay(packet);
+        boolean cancel = shouldCancelInboundPacket(packet);
+        return createPacketDecision(packet, false, selection, cancel);
+    }
+
+    private PacketDecision capturePacketDecision(Packet<?> packet, boolean outbound, boolean cancel) {
+        return createPacketDecision(packet, outbound, selectPacketDelay(packet, outbound), cancel);
+    }
+
+    private PacketDecision createPacketDecision(Packet<?> packet, boolean outbound,
+            PacketDelaySelection selection, boolean cancel) {
+        Module owner = selection.getOwner();
+        OwnerToken token = owner == null ? null : owner.getScope().getOwnerToken();
+        boolean hold = selection.isIndefinite() || selection.getDelay() > 0;
+        PacketDecision.Action action = hold ? PacketDecision.Action.HOLD
+            : cancel ? PacketDecision.Action.CANCEL : PacketDecision.Action.PASS;
+        PacketReleasePolicy release = selection.isIndefinite() ? PacketReleasePolicy.EXPLICIT_FLUSH
+            : hold ? PacketReleasePolicy.DEADLINE : PacketReleasePolicy.IMMEDIATE;
+        PacketLane.Direction direction = outbound ? PacketLane.Direction.OUTBOUND : PacketLane.Direction.INBOUND;
+        PacketLane lane = new PacketLane(token, direction, packetDependencyDomain(packet, outbound));
+        return new PacketDecision(action, owner, token, selection.getPriority(), selection.getDelay(),
+            release, lane, cancel);
+    }
+
+    private static String packetDependencyDomain(Packet<?> packet, boolean outbound) {
+        if (packet == null) return "transport";
+        String name = packet.getClass().getSimpleName();
+        if (outbound && name.startsWith("C03")) return "movement";
+        if (outbound && (name.startsWith("C02") || name.startsWith("C07") || name.startsWith("C08"))) return "action";
+        if (!outbound && packet instanceof S12PacketEntityVelocity) {
+            return "knockback:" + ((S12PacketEntityVelocity) packet).getEntityID();
+        }
+        if (!outbound && packet instanceof S14PacketEntity) {
+            return "entity-movement:" + ((S14PacketEntity) packet).entityId;
+        }
+        if (!outbound && packet instanceof S18PacketEntityTeleport) {
+            return "entity-movement:" + ((S18PacketEntityTeleport) packet).entityId;
+        }
+        if (!outbound && name.startsWith("S27")) return "knockback:local";
+        if (!outbound && name.startsWith("S19")) return "entity-status";
+        return "protocol";
+    }
+
     private PacketDelaySelection selectPacketDelay(Packet<?> packet, boolean outbound) {
         Module selected = null;
         int selectedDelay = 0;
         int selectedPriority = Integer.MIN_VALUE;
         boolean selectedHold = false;
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             if (!module.isEnabled()) {
                 continue;
             }
@@ -316,7 +488,7 @@ public final class ModuleManager {
     }
 
     public void onOutboundPacket(Packet<?> packet) {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             if (module.isEnabled()) {
                 invokePacketCallback(module, "outbound-packet", packet, 0);
             }
@@ -324,7 +496,7 @@ public final class ModuleManager {
     }
 
     public void onInboundPacket(Packet<?> packet) {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             if (module.isEnabled() || module.receivesInboundPacketsWhenDisabled()) {
                 invokePacketCallback(module, "inbound-packet", packet, 1);
             }
@@ -332,7 +504,7 @@ public final class ModuleManager {
     }
 
     public boolean shouldCancelInboundPacket(Packet<?> packet) {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             if (module.isEnabled()) {
                 try {
                     if (module.shouldCancelInboundPacket(packet)) return true;
@@ -345,19 +517,19 @@ public final class ModuleManager {
     }
 
     public void onInboundPacketQueued(Packet<?> packet) {
-        for (Module module : modules) {
+        for (Module module : inboundQueuedSubscribers) {
             invokePacketCallback(module, "inbound-queued", packet, 2);
         }
     }
 
     public void onInboundPacketReleased(Packet<?> packet) {
-        for (Module module : modules) {
+        for (Module module : inboundReleasedSubscribers) {
             invokePacketCallback(module, "inbound-released", packet, 3);
         }
     }
 
     public void onInboundPacketProcessed(Packet<?> packet) {
-        for (Module module : modules) {
+        for (Module module : inboundProcessedSubscribers) {
             invokePacketCallback(module, "inbound-processed", packet, 4);
         }
     }
@@ -409,7 +581,7 @@ public final class ModuleManager {
     }
 
     public boolean isPacketDelayActive() {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             if (module.isEnabled()) {
                 try {
                     if (module.isPacketDelayActive()) return true;
@@ -422,7 +594,7 @@ public final class ModuleManager {
     }
 
     public boolean isOutboundPacketDelayActive() {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             if (module.isEnabled()) {
                 try {
                     if (module.isOutboundPacketDelayActive()) return true;
@@ -448,7 +620,7 @@ public final class ModuleManager {
     }
 
     public boolean isInboundPacketDelayActive() {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             if (module.isEnabled()) {
                 try {
                     if (module.isInboundPacketDelayActive()) return true;
@@ -474,7 +646,7 @@ public final class ModuleManager {
     }
 
     public boolean consumeFlushRequest() {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             try {
                 if (module.consumeFlushRequest()) return true;
             } catch (Throwable failure) {
@@ -485,7 +657,7 @@ public final class ModuleManager {
     }
 
     public boolean consumeOutboundFlushRequest() {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             try {
                 if (module.consumeOutboundFlushRequest()) return true;
             } catch (Throwable failure) {
@@ -496,7 +668,7 @@ public final class ModuleManager {
     }
 
     public boolean consumeInboundFlushRequest() {
-        for (Module module : modules) {
+        for (Module module : packetPolicySubscribers) {
             try {
                 if (module.consumeInboundFlushRequest()) return true;
             } catch (Throwable failure) {
@@ -512,6 +684,30 @@ public final class ModuleManager {
 
     public void refreshConfigModule() {
         configModule.rebuildSettings();
+    }
+
+    private void invokeTickListener(Module module) {
+        try {
+            ((TickListener) module).onTick(module.getContext());
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, "typed-client-tick", failure);
+        }
+    }
+
+    private void invokeRenderListener(Module module, RenderListener.Phase phase) {
+        try {
+            ((RenderListener) module).onRender(module.getContext(), runtimeCore.getFrameContext(), phase);
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, "typed-render-" + phase.name().toLowerCase(), failure);
+        }
+    }
+
+    private void invokeInputListener(Module module, ModuleResetReason reason) {
+        try {
+            ((InputListener) module).onInputUnavailable(module.getContext(), reason);
+        } catch (Throwable failure) {
+            runtimeCore.getFaultBarrier().report(module, "typed-input-unavailable", failure);
+        }
     }
 
     private void invokeCallback(Module module, CallbackKind callback, Object argument) {

@@ -4,7 +4,7 @@ import com.razorclient.RazorClient;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
-import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
+import com.razorclient.runtime.EntityRecord;
 import java.util.Collection;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.network.NetworkPlayerInfo;
@@ -45,9 +45,9 @@ public final class AntiBotModule extends Module {
             return true;
         }
         RazorClient client = RazorClient.getInstance();
-        EntitySnapshot snapshot = client == null ? null
-            : client.getModuleManager().getEntitySnapshots().find(player.getEntityId());
-        if (snapshot != null && snapshot.getEntity() == player) {
+        EntityRecord snapshot = client == null ? null
+            : client.getModuleManager().getEntityFrame().find(player.getEntityId());
+        if (snapshot != null && minecraft.theWorld.getEntityByID(player.getEntityId()) == player) {
             if (ignoreSpectators.isEnabled() && snapshot.isSpectator()) return true;
             return requireTabList.isEnabled() && !snapshot.isInTabList();
         }

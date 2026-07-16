@@ -20,14 +20,9 @@ import com.razorclient.feature.setting.Setting;
 import com.razorclient.inject.AgentLog;
 import java.awt.Desktop;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -262,7 +257,7 @@ public final class ConfigManager {
                 for (Setting setting : module.getSettings()) {
                     if (setting instanceof ActionSetting || !settings.has(setting.getName())) continue;
                     String path = module.getName() + '.' + setting.getName();
-                    values.add(new SettingValue(setting, stageSettingValue(setting, settings.get(setting.getName()), path)));
+                    values.add(new SettingValue(setting, SettingCodec.decode(setting, settings.get(setting.getName()), path)));
                 }
             }
             modulePlans.add(new ModulePlan(module, enabled, keyCode, values));
@@ -289,58 +284,18 @@ public final class ConfigManager {
         return delays;
     }
 
-    private Object stageSettingValue(Setting setting, JsonElement element, String path) {
-        if (setting instanceof BooleanSetting) {
-            return Boolean.valueOf(requireBoolean(element, path));
-        }
-        if (setting instanceof DecimalSetting) {
-            double value = requireDouble(element, path);
-            return Double.valueOf(value);
-        }
-        if (setting instanceof IntRangeSetting) {
-            if (!element.isJsonArray() || element.getAsJsonArray().size() < 2) {
-                throw new IllegalArgumentException(path + " must be a two-value array");
-            }
-            JsonArray values = element.getAsJsonArray();
-            return new int[] {requireInt(values.get(0), path + "[0]"), requireInt(values.get(1), path + "[1]")};
-        }
-        if (setting instanceof NumberSetting) {
-            return Integer.valueOf(requireInt(element, path));
-        }
-        if (setting instanceof EnumSetting) {
-            String value = requireString(element, path);
-            if (!containsEnumValue((EnumSetting<?>) setting, value)) {
-                throw new IllegalArgumentException(path + " has unknown value " + value);
-            }
-            return value;
-        }
-        throw new IllegalArgumentException(path + " has unsupported setting type " + setting.getClass().getName());
-    }
-
     private RuntimeState captureRuntimeState() {
         List<ModuleState> modules = new ArrayList<ModuleState>(moduleManager.getModules().size());
         for (Module module : moduleManager.getModules()) {
             List<SettingValue> values = new ArrayList<SettingValue>(module.getSettings().size());
             for (Setting setting : module.getSettings()) {
                 if (!(setting instanceof ActionSetting)) {
-                    values.add(new SettingValue(setting, captureSettingValue(setting)));
+                    values.add(new SettingValue(setting, SettingCodec.capture(setting)));
                 }
             }
             modules.add(new ModuleState(module, module.isEnabled(), module.getKeyCode(), values));
         }
         return new RuntimeState(new ArrayList<Integer>(ClickPatternStore.getDelays()), modules);
-    }
-
-    private Object captureSettingValue(Setting setting) {
-        if (setting instanceof BooleanSetting) return Boolean.valueOf(((BooleanSetting) setting).isEnabled());
-        if (setting instanceof DecimalSetting) return Double.valueOf(((DecimalSetting) setting).getValue());
-        if (setting instanceof IntRangeSetting) {
-            IntRangeSetting range = (IntRangeSetting) setting;
-            return new int[] {range.getLow(), range.getHigh()};
-        }
-        if (setting instanceof NumberSetting) return Integer.valueOf(((NumberSetting) setting).getValue());
-        if (setting instanceof EnumSetting) return ((EnumSetting<?>) setting).getValue().name();
-        throw new IllegalArgumentException("Unsupported setting type " + setting.getClass().getName());
     }
 
     private void applyModuleValues(List<ModulePlan> plans) {
@@ -409,33 +364,12 @@ public final class ConfigManager {
     }
 
     private void applySettingValue(SettingValue value) {
-        Setting setting = value.setting;
-        if (setting instanceof BooleanSetting) {
-            ((BooleanSetting) setting).setEnabled(((Boolean) value.value).booleanValue());
-        } else if (setting instanceof DecimalSetting) {
-            ((DecimalSetting) setting).setManualValue(((Double) value.value).doubleValue(), false);
-        } else if (setting instanceof IntRangeSetting) {
-            int[] range = (int[]) value.value;
-            ((IntRangeSetting) setting).setRange(range[0], range[1], false);
-        } else if (setting instanceof NumberSetting) {
-            ((NumberSetting) setting).setManualValue(((Integer) value.value).intValue(), false);
-        } else if (setting instanceof EnumSetting) {
-            if (!((EnumSetting<?>) setting).setValueByName((String) value.value)) {
-                throw new IllegalStateException("Unable to apply enum setting " + setting.getName());
-            }
-        }
+        SettingCodec.apply(value.setting, value.value);
     }
 
     private void applyRecordedPattern(List<Integer> delays) {
         ClickPatternStore.clear();
         for (Integer delay : delays) ClickPatternStore.addDelay(delay.intValue());
-    }
-
-    private static boolean containsEnumValue(EnumSetting<?> setting, String name) {
-        for (Enum<?> value : setting.getValues()) {
-            if (value.name().equalsIgnoreCase(name)) return true;
-        }
-        return false;
     }
 
     private static boolean requireBoolean(JsonElement element, String path) {
@@ -454,22 +388,6 @@ public final class ConfigManager {
         } catch (ArithmeticException failure) {
             throw new IllegalArgumentException(path + " must be a 32-bit integer", failure);
         }
-    }
-
-    private static double requireDouble(JsonElement element, String path) {
-        if (element == null || !element.isJsonPrimitive() || !element.getAsJsonPrimitive().isNumber()) {
-            throw new IllegalArgumentException(path + " must be a number");
-        }
-        double value = element.getAsDouble();
-        if (!Double.isFinite(value)) throw new IllegalArgumentException(path + " must be finite");
-        return value;
-    }
-
-    private static String requireString(JsonElement element, String path) {
-        if (element == null || !element.isJsonPrimitive() || !element.getAsJsonPrimitive().isString()) {
-            throw new IllegalArgumentException(path + " must be a string");
-        }
-        return element.getAsString();
     }
 
     public void openFolder() {
@@ -497,24 +415,8 @@ public final class ConfigManager {
 
             JsonObject settingsJson = new JsonObject();
             for (Setting setting : module.getSettings()) {
-                if (setting instanceof ActionSetting) {
-                    continue;
-                }
-                if (setting instanceof BooleanSetting) {
-                    settingsJson.addProperty(setting.getName(), ((BooleanSetting) setting).isEnabled());
-                } else if (setting instanceof DecimalSetting) {
-                    settingsJson.addProperty(setting.getName(), ((DecimalSetting) setting).getValue());
-                } else if (setting instanceof IntRangeSetting) {
-                    IntRangeSetting range = (IntRangeSetting) setting;
-                    JsonArray array = new JsonArray();
-                    array.add(new JsonPrimitive(range.getLow()));
-                    array.add(new JsonPrimitive(range.getHigh()));
-                    settingsJson.add(setting.getName(), array);
-                } else if (setting instanceof NumberSetting) {
-                    settingsJson.addProperty(setting.getName(), ((NumberSetting) setting).getValue());
-                } else if (setting instanceof EnumSetting) {
-                    settingsJson.addProperty(setting.getName(), ((EnumSetting<?>) setting).getValue().name());
-                }
+                JsonElement encoded = SettingCodec.encode(setting);
+                if (encoded != null) settingsJson.add(setting.getName(), encoded);
             }
 
             moduleJson.add("settings", settingsJson);
@@ -663,7 +565,7 @@ public final class ConfigManager {
             setting("Sneak Delay", 85)
         );
         addModule(modules, "Clutch", true, org.lwjgl.input.Keyboard.KEY_NONE,
-            setting("Trigger", "ON_VOID"),
+            setting("Trigger", "PREDICTED_DANGER"),
             setting("Blocks", 6.0D),
             setting("Silent Aim", false),
             setting("Rotate Back", true),
@@ -688,7 +590,10 @@ public final class ConfigManager {
             setting("Disable Afterwards", false),
             setting("Only Mid-Air", true),
             setting("Recently Damaged", false),
-            setting("Moving Backwards", false)
+            setting("Moving Backwards", false),
+            setting("Recovery Mode", "EMERGENCY_BRIDGE"),
+            setting("Prediction Ticks", 4),
+            setting("Confirmation Ticks", 2)
         );
         addModule(modules, "AntiFireball", false, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("FOV", 180),
@@ -1201,57 +1106,11 @@ public final class ConfigManager {
     }
 
     private void persistCurrentConfigNameOrThrow() throws IOException {
-        writeBytesAtomically(currentConfigFile, currentConfigName.getBytes(StandardCharsets.UTF_8));
+        AtomicFileStore.write(currentConfigFile, currentConfigName.getBytes(StandardCharsets.UTF_8));
     }
 
     private void writeJsonAtomically(File file, JsonObject root) throws IOException {
-        File parent = file.getParentFile();
-        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
-            throw new IOException("Unable to create directory " + parent.getAbsolutePath());
-        }
-        File temporary = new File(parent, file.getName() + ".tmp");
-        try {
-            try (FileOutputStream output = new FileOutputStream(temporary);
-                    Writer writer = new OutputStreamWriter(output, StandardCharsets.UTF_8)) {
-                GSON.toJson(root, writer);
-                writer.flush();
-                output.getFD().sync();
-            }
-            moveAtomically(temporary, file);
-        } finally {
-            deleteTemporary(temporary);
-        }
-    }
-
-    private void writeBytesAtomically(File file, byte[] bytes) throws IOException {
-        File parent = file.getParentFile();
-        if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
-            throw new IOException("Unable to create directory " + parent.getAbsolutePath());
-        }
-        File temporary = new File(parent, file.getName() + ".tmp");
-        try {
-            try (FileOutputStream output = new FileOutputStream(temporary)) {
-                output.write(bytes);
-                output.flush();
-                output.getFD().sync();
-            }
-            moveAtomically(temporary, file);
-        } finally {
-            deleteTemporary(temporary);
-        }
-    }
-
-    private static void moveAtomically(File source, File destination) throws IOException {
-        try {
-            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING);
-        } catch (AtomicMoveNotSupportedException unsupported) {
-            Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING);
-        }
-    }
-
-    private static void deleteTemporary(File temporary) {
-        if (temporary.isFile() && !temporary.delete()) temporary.deleteOnExit();
+        AtomicFileStore.write(file, GSON.toJson(root).getBytes(StandardCharsets.UTF_8));
     }
 
     private static final class ConfigPlan {

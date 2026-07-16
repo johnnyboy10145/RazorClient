@@ -176,7 +176,8 @@ public final class AimAssistModule extends Module {
             status = "No target";
             return;
         }
-        CombatTargetService.publishTarget(minecraft, target.entity, 50);
+        getContext().getTargetPublications().publish(getScope().getOwnerToken(), target.entity.getEntityId(), 50,
+            getContext().getTick());
 
         float deltaSeconds = consumeDeltaSeconds();
         if (silent && !silentRotationInitialized) {
@@ -398,7 +399,7 @@ public final class AimAssistModule extends Module {
         resetTargetTiming();
         haveObservedRotation = false;
         status = "Ready";
-        CombatTargetService.clear();
+        getContext().getTargetPublications().clear(getScope().getOwnerToken());
     }
 
     @Override

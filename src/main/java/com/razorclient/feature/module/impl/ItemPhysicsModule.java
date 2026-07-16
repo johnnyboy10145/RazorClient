@@ -4,7 +4,8 @@ import com.razorclient.RazorClient;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
-import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
+import com.razorclient.runtime.EntityFrame;
+import com.razorclient.runtime.EntityRecord;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -32,10 +33,13 @@ public final class ItemPhysicsModule extends Module {
             return;
         }
 
-        SnapshotFrame frame = client.getModuleManager().getEntitySnapshots().current();
-        for (int index = 0; index < frame.getDroppedItemCount(); index++) {
-            EntityItem item = frame.getDroppedItem(index);
-            if (item == null) continue;
+        EntityFrame frame = client.getModuleManager().getEntityFrame();
+        for (int index = 0; index < frame.size(); index++) {
+            EntityRecord record = frame.get(index);
+            if (record == null || !record.isDroppedItem()) continue;
+            net.minecraft.entity.Entity entity = minecraft.theWorld.getEntityByID(record.getEntityId());
+            if (!(entity instanceof EntityItem)) continue;
+            EntityItem item = (EntityItem) entity;
             if (!originalPhases.containsKey(item)) originalPhases.put(item, Float.valueOf(item.hoverStart));
             // Minecraft uses /10 for bob and /20 for spin; cancel the selected phase locally.
             item.hoverStart = noBob.isEnabled() ? -(item.age / 10.0F) : -(item.age / 20.0F);

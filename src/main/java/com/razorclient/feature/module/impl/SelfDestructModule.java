@@ -3,6 +3,7 @@ package com.razorclient.feature.module.impl;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.ActionSetting;
+import com.razorclient.runtime.SecureStringTable;
 import org.lwjgl.input.Keyboard;
 
 public final class SelfDestructModule extends Module {
@@ -33,7 +34,7 @@ public final class SelfDestructModule extends Module {
 
     private void unload() {
         try {
-            Class<?> entrypoint = Class.forName("com.razorclient.inject.LiveEntrypoint");
+            Class<?> entrypoint = Class.forName(SecureStringTable.liveEntrypoint());
             entrypoint.getMethod("unload").invoke(null);
         } catch (Throwable ignored) {
         }

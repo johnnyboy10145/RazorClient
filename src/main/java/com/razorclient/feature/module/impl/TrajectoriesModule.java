@@ -6,8 +6,8 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.NumberSetting;
 import java.util.ArrayList;
 import java.util.List;
-import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
-import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
+import com.razorclient.runtime.EntityFrame;
+import com.razorclient.runtime.EntityRecord;
 import com.razorclient.runtime.FrameContext;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityPlayerSP;
@@ -35,9 +35,15 @@ import org.lwjgl.opengl.GL11;
 public final class TrajectoriesModule extends Module {
     private static final double SIMULATION_STEP = 0.1D;
     private static final int MAX_SIMULATION_STEPS = 512;
+    private static final ProjectileProperties FISHING_ROD = new ProjectileProperties(1.5D, 0.04D, 0.92D, 0.16D, 0.0F);
+    private static final ProjectileProperties POTION = new ProjectileProperties(0.5D, 0.05D, 0.95D, 0.16D, -20.0F);
+    private static final ProjectileProperties THROWN = new ProjectileProperties(1.5D, 0.03D, 0.99D, 0.16D, 0.0F);
     private final List<Vec3> pathBuffer = new ArrayList<Vec3>(MAX_SIMULATION_STEPS + 2);
     private final float[] aimingColorBuffer = new float[3];
     private final float[] trajectoryColorBuffer = new float[3];
+    private final SimulationResult simulationResult = new SimulationResult(pathBuffer);
+    private final EntityPathHit entityPathHit = new EntityPathHit();
+    private final AxisAlignedBB collisionBox = new AxisAlignedBB(0.0D, 0.0D, 0.0D, 0.0D, 0.0D, 0.0D);
 
     private final NumberSetting aimingRed = new NumberSetting("Aiming Red", 0, 255, 5, 85);
     private final NumberSetting aimingGreen = new NumberSetting("Aiming Green", 0, 255, 5, 255);
@@ -137,15 +143,15 @@ public final class TrajectoriesModule extends Module {
         }
 
         if (item instanceof ItemFishingRod) {
-            return new ProjectileProperties(1.5D, 0.04D, 0.92D, 0.16D, 0.0F);
+            return FISHING_ROD;
         }
 
         if (item instanceof ItemPotion) {
-            return new ProjectileProperties(0.5D, 0.05D, 0.95D, 0.16D, -20.0F);
+            return POTION;
         }
 
         if (item instanceof ItemSnowball || item instanceof ItemEgg || item instanceof ItemEnderPearl) {
-            return new ProjectileProperties(1.5D, 0.03D, 0.99D, 0.16D, 0.0F);
+            return THROWN;
         }
 
         return null;
@@ -160,6 +166,7 @@ public final class TrajectoriesModule extends Module {
         double pitchRadians = Math.toRadians(pitch + properties.pitchOffset);
         Vec3 position = getStartPosition(player, yawRadians, partialTicks, properties);
         Vec3 motion = getInitialMotion(yawRadians, pitchRadians, properties.velocity);
+        double stepDrag = getStepDrag(properties.drag);
 
         points.add(position);
         for (int i = 0; i < MAX_SIMULATION_STEPS; i++) {
@@ -178,9 +185,9 @@ public final class TrajectoriesModule extends Module {
             position = nextPosition;
             points.add(position);
             motion = new Vec3(
-                motion.xCoord * getStepDrag(properties.drag),
-                motion.yCoord * getStepDrag(properties.drag) - properties.gravity * SIMULATION_STEP,
-                motion.zCoord * getStepDrag(properties.drag)
+                motion.xCoord * stepDrag,
+                motion.yCoord * stepDrag - properties.gravity * SIMULATION_STEP,
+                motion.zCoord * stepDrag
             );
 
             if (position.yCoord < 0.0D || position.yCoord > minecraft.theWorld.getActualHeight()) {
@@ -194,9 +201,9 @@ public final class TrajectoriesModule extends Module {
                 points.remove(points.size() - 1);
             }
             points.add(entityHit.hitVec);
-            return new SimulationResult(points, entityHit.entity);
+            return simulationResult.set(entityHit.entity);
         }
-        return new SimulationResult(points, null);
+        return simulationResult.set(null);
     }
 
     private Vec3 getStartPosition(EntityPlayerSP player, double yawRadians, float partialTicks, ProjectileProperties properties) {
@@ -253,11 +260,12 @@ public final class TrajectoriesModule extends Module {
         double bestDistance = Double.POSITIVE_INFINITY;
         RazorClient client = RazorClient.getInstance();
         if (client == null) return null;
-        SnapshotFrame snapshots = client.getModuleManager().getEntitySnapshots().current();
+        EntityFrame snapshots = client.getModuleManager().getEntityFrame();
         for (int snapshotIndex = 0; snapshotIndex < snapshots.size(); snapshotIndex++) {
-            EntitySnapshot snapshot = snapshots.get(snapshotIndex);
-            Entity entity = snapshot.getEntity();
+            EntityRecord snapshot = snapshots.get(snapshotIndex);
+            Entity entity = minecraft.theWorld.getEntityByID(snapshot.getEntityId());
             if (snapshot.isDead()
+                || entity == null
                 || entity instanceof EntityFishHook
                 || entity instanceof EntityArmorStand
                 || !entity.canBeCollidedWith()) {
@@ -267,9 +275,14 @@ public final class TrajectoriesModule extends Module {
                     || snapshot.getMaxY() + 1.0D < minY || snapshot.getMinY() - 1.0D > maxY
                     || snapshot.getMaxZ() + 1.0D < minZ || snapshot.getMinZ() - 1.0D > maxZ) continue;
 
-            float border = Math.max(0.45F, entity.getCollisionBorderSize());
-            AxisAlignedBB box = new AxisAlignedBB(snapshot.getMinX(), snapshot.getMinY(), snapshot.getMinZ(),
-                snapshot.getMaxX(), snapshot.getMaxY(), snapshot.getMaxZ()).expand(border, border, border);
+            float border = Math.max(0.45F, snapshot.getCollisionBorder());
+            AxisAlignedBB box = collisionBox;
+            box.minX = snapshot.getMinX() - border;
+            box.minY = snapshot.getMinY() - border;
+            box.minZ = snapshot.getMinZ() - border;
+            box.maxX = snapshot.getMaxX() + border;
+            box.maxY = snapshot.getMaxY() + border;
+            box.maxZ = snapshot.getMaxZ() + border;
             for (int segment = 0; segment < points.size() - 1; segment++) {
                 if (segment > bestSegment) break;
                 Vec3 start = points.get(segment);
@@ -295,7 +308,7 @@ public final class TrajectoriesModule extends Module {
             }
         }
 
-        return bestEntity == null ? null : new EntityPathHit(bestEntity, bestHitVec, bestSegment);
+        return bestEntity == null ? null : entityPathHit.set(bestEntity, bestHitVec, bestSegment);
     }
 
     private void renderPath(Minecraft minecraft, List<Vec3> points, float[] color) {
@@ -348,23 +361,25 @@ public final class TrajectoriesModule extends Module {
 
     private static final class SimulationResult {
         private final List<Vec3> points;
-        private final Entity entityHit;
+        private Entity entityHit;
 
-        private SimulationResult(List<Vec3> points, Entity entityHit) {
+        private SimulationResult(List<Vec3> points) {
             this.points = points;
-            this.entityHit = entityHit;
         }
+
+        private SimulationResult set(Entity entityHit) { this.entityHit = entityHit; return this; }
     }
 
     private static final class EntityPathHit {
-        private final Entity entity;
-        private final Vec3 hitVec;
-        private final int segmentIndex;
+        private Entity entity;
+        private Vec3 hitVec;
+        private int segmentIndex;
 
-        private EntityPathHit(Entity entity, Vec3 hitVec, int segmentIndex) {
+        private EntityPathHit set(Entity entity, Vec3 hitVec, int segmentIndex) {
             this.entity = entity;
             this.hitVec = hitVec;
             this.segmentIndex = segmentIndex;
+            return this;
         }
     }
 }

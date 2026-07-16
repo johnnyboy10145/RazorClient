@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "modules": [
+    "AimAssist", "AntiBot", "AntiFireball", "LeftClicker", "BedPlates",
+    "ClickGUI", "ClickRecorder", "Clutch", "Config", "HUD", "KillAura",
+    "Knockback Delay", "LegitScaffold", "No Jump Delay", "Hit Select",
+    "Sprint Reset", "Auto Weapon", "Teams", "No Hit Delay", "Criticals",
+    "Fast Place", "Auto Tool", "Item Physics", "Fullbright", "PlayerESP",
+    "Reach", "RightClicker", "Sprint", "Trajectories", "Velocity",
+    "Fake Lag", "Blink", "Backtrack", "Lag Range", "Ping Fix", "Self Destruct"
+  ],
+  "builtInProfiles": [
+    "survival", "bedwars-survival", "bedwars-legit", "bedwars-aggressive",
+    "bedwars-aggressive-v2"
+  ],
+  "protectedSettings": {
+    "Clutch": ["Trigger", "Silent Aim", "Recovery Mode", "Prediction Ticks", "Confirmation Ticks"],
+    "Velocity": ["Mode", "Horizontal", "Vertical", "Chance", "Explosions"],
+    "Blink": ["Direction", "Maximum Duration", "Allow Keep Alives"],
+    "ClickGUI": ["Color Preset", "GUI Effects", "Glow Intensity", "Sweep Animation"],
+    "PlayerESP": ["Projection Mode", "Target Type", "Render Mode", "Max Distance"]
+  },
+  "release": {
+    "entrypoint": "com/razorclient/inject/LiveEntrypoint.class",
+    "oneFileName": "RazorClient.exe",
+    "configFormat": "json"
+  }
+}

@@ -4,7 +4,8 @@ import com.razorclient.config.ConfigManager;
 import com.razorclient.feature.setting.Setting;
 import com.razorclient.inject.AgentLog;
 import com.razorclient.runtime.ModuleScope;
-import com.razorclient.runtime.ResourceArbiter;
+import com.razorclient.runtime.ModuleContext;
+import com.razorclient.runtime.RuntimeCore;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -21,6 +22,7 @@ public abstract class Module {
     private final Category category;
     private final List<Setting> settings = new ArrayList<Setting>();
     private final ModuleScope scope;
+    private ModuleContext context;
     private volatile int keyCode;
     private volatile boolean enabled;
     private volatile long enableGeneration;
@@ -93,8 +95,12 @@ public abstract class Module {
         return scope;
     }
 
-    void attachRuntime(ResourceArbiter resourceArbiter) {
-        scope.attach(resourceArbiter);
+    public ModuleContext getContext() { return context; }
+
+    void attachRuntime(RuntimeCore runtime) {
+        if (context != null) throw new IllegalStateException("Module already attached: " + name);
+        scope.attach(runtime.getResourceArbiter(), runtime.getClientSession().getScheduler());
+        context = new ModuleContext(this, runtime, scope);
     }
 
     public int getHudInfoColor() {
@@ -112,14 +118,16 @@ public abstract class Module {
 
         if (enabled) {
             enableGeneration++;
+            ModuleScope.Activation activation = scope.beginActivation(enableGeneration);
             this.enabled = true;
-            scope.activate();
             try {
                 onEnable();
+                activation.commit();
             } catch (Throwable failure) {
                 this.enabled = false;
-                scope.reset(ModuleResetReason.DISABLED);
                 AgentLog.error("Unable to enable module " + name, failure);
+            } finally {
+                activation.close();
             }
         } else {
             this.enabled = false;
@@ -151,7 +159,7 @@ public abstract class Module {
 
     void resetScope(ModuleResetReason reason) {
         scope.reset(reason);
-        if (enabled) scope.activate();
+        if (enabled) scope.activate(++enableGeneration);
     }
 
     void cleanupInputScope(ModuleResetReason reason) {
@@ -215,6 +223,11 @@ public abstract class Module {
 
     /** Explicitly permits a protocol packet to pass an existing lane owned by this module. */
     public boolean shouldBypassOutboundOrdering(Packet<?> packet) {
+        return false;
+    }
+
+    /** Requests an ordered owner-lane flush before this triggering packet is written. */
+    public boolean shouldFlushThenPassOutboundPacket(Packet<?> packet) {
         return false;
     }
 

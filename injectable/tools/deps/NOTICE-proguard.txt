@@ -1,0 +1,8 @@
+ProGuard 7.8.1 build dependencies
+
+The ProGuard artifacts in this directory are build-time dependencies and are
+not embedded in RazorClient.exe or the runtime payload. They are distributed
+under their respective upstream licenses. See:
+
+https://www.guardsquare.com/proguard
+https://www.gnu.org/licenses/gpl-2.0.html

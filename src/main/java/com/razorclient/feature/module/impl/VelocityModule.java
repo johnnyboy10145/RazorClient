@@ -11,7 +11,6 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.Random;
 import net.minecraft.client.Minecraft;
-import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.network.Packet;
 import net.minecraft.network.play.server.S12PacketEntityVelocity;
 import net.minecraft.network.play.server.S27PacketExplosion;
@@ -48,6 +47,7 @@ public final class VelocityModule extends Module {
     private volatile long clientTick;
     private volatile long lastAttackTick = Long.MIN_VALUE;
     private volatile boolean doubleAttackThisTick;
+    private volatile GateSnapshot gateSnapshot = GateSnapshot.EMPTY;
 
     public VelocityModule() {
         super("Velocity", "Adjusts or cancels local knockback response.", Category.LAG_MODULES, Keyboard.KEY_NONE);
@@ -92,6 +92,7 @@ public final class VelocityModule extends Module {
             resetRuntimeState();
             return;
         }
+        gateSnapshot = captureGateSnapshot(minecraft);
         clientTick++;
         if (lastAttackTick != clientTick) {
             doubleAttackThisTick = false;
@@ -122,19 +123,19 @@ public final class VelocityModule extends Module {
 
     @Override
     public void onInboundPacket(Packet<?> packet) {
-        Minecraft minecraft = Minecraft.getMinecraft();
-        PacketKind kind = getVelocityPacketKind(packet, minecraft);
+        GateSnapshot gates = gateSnapshot;
+        PacketKind kind = getVelocityPacketKind(packet, gates);
         if (kind == PacketKind.NONE) {
             return;
         }
         synchronized (decisions) { if (decisions.containsKey(packet)) return; }
 
-        if (!conditionsPass(minecraft) || !roll(chance.getValue())) {
+        if (!conditionsPass(gates) || !roll(chance.getValue())) {
             setStatus("Skipped", 900L);
             return;
         }
 
-        VelocityDecision decision = createDecision(packet, kind, minecraft);
+        VelocityDecision decision = createDecision(packet, kind, gates);
         boolean needsPostProcess = decision.mode == Mode.JUMP || decision.mode == Mode.REDUCE;
         if (decision.delayMs > 0 || decision.cancel || needsPostProcess) {
             if (!cacheDecision(packet, decision)) {
@@ -200,7 +201,10 @@ public final class VelocityModule extends Module {
     @Override
     public boolean shouldCancelInboundPacket(Packet<?> packet) {
         VelocityDecision decision;
-        synchronized (decisions) { decision = decisions.remove(packet); }
+        synchronized (decisions) {
+            decision = decisions.get(packet);
+            if (decision != null && decision.cancel) decisions.remove(packet);
+        }
         if (decision == null || !decision.cancel) {
             return false;
         }
@@ -240,14 +244,14 @@ public final class VelocityModule extends Module {
         return super.getHudInfoColor();
     }
 
-    private VelocityDecision createDecision(Packet<?> packet, PacketKind kind, Minecraft minecraft) {
+    private VelocityDecision createDecision(Packet<?> packet, PacketKind kind, GateSnapshot gates) {
         Mode selectedMode = mode.getValue();
         boolean cancel = selectedMode != Mode.JUMP && horizontal.getValue() == 0 && vertical.getValue() == 0;
         int appliedHorizontal = horizontal.getValue();
         int appliedVertical = vertical.getValue();
         if (selectedMode == Mode.IGNORE) {
             appliedHorizontal = 0;
-            appliedVertical = ignoreVerticalPercent(minecraft);
+            appliedVertical = ignoreVerticalPercent(gates);
         }
         if (!cancel && selectedMode != Mode.JUMP && selectedMode != Mode.REDUCE && randomize.isEnabled()) {
             int delta = random.nextInt(5) - 2;
@@ -314,19 +318,17 @@ public final class VelocityModule extends Module {
                 }
             }
         };
-        if (minecraft.isCallingFromMinecraftThread()) {
+        if (getContext().isClientThread()) {
             action.run();
-        } else {
-            minecraft.addScheduledTask(action);
+        } else if (!getContext().scheduleClientTask(action)) {
+            setStatus("Failed", 1200L);
         }
     }
 
-    private PacketKind getVelocityPacketKind(Packet<?> packet, Minecraft minecraft) {
-        if (!LagModuleSupport.inGame(minecraft)) {
-            return PacketKind.NONE;
-        }
+    private PacketKind getVelocityPacketKind(Packet<?> packet, GateSnapshot gates) {
+        if (!gates.available) return PacketKind.NONE;
         if (packet instanceof S12PacketEntityVelocity
-            && ((S12PacketEntityVelocity) packet).getEntityID() == minecraft.thePlayer.getEntityId()) {
+            && ((S12PacketEntityVelocity) packet).getEntityID() == gates.playerEntityId) {
             return PacketKind.ENTITY;
         }
         if (packet instanceof S27PacketExplosion && explosions.isEnabled()) {
@@ -335,48 +337,28 @@ public final class VelocityModule extends Module {
         return PacketKind.NONE;
     }
 
-    private boolean conditionsPass(Minecraft minecraft) {
-        if (!LagModuleSupport.activeInGame(minecraft)) {
-            return false;
-        }
-        if (waterCheck.isEnabled() && minecraft.thePlayer.isInWater()) {
-            return false;
-        }
-        if (mousePressed.isEnabled() && !LagModuleSupport.mouseDown()) {
-            return false;
-        }
-        if (onlyMoving.isEnabled() && !LagModuleSupport.moving(minecraft)) {
-            return false;
-        }
-        if (onlyOnGround.isEnabled() && !minecraft.thePlayer.onGround) {
-            return false;
-        }
-        if (requireSprinting.isEnabled() && mode.getValue() == Mode.JUMP && !minecraft.thePlayer.isSprinting()) {
-            return false;
-        }
-        if (movingForward.isEnabled() && !LagModuleSupport.movingForward(minecraft)) {
-            return false;
-        }
-        if (holdingWeapon.isEnabled() && !LagModuleSupport.holdingWeapon(minecraft)) {
-            return false;
-        }
-        if (onlyWhenTargeting.isEnabled()) {
-            EntityPlayer target = LagModuleSupport.crosshairTarget(minecraft, 6.0D, fov.getValue());
-            return target != null;
-        }
-        return true;
+    private boolean conditionsPass(GateSnapshot gates) {
+        return gates.available
+            && (!waterCheck.isEnabled() || !gates.inWater)
+            && (!mousePressed.isEnabled() || gates.mouseDown)
+            && (!onlyMoving.isEnabled() || gates.moving)
+            && (!onlyOnGround.isEnabled() || gates.onGround)
+            && (!requireSprinting.isEnabled() || mode.getValue() != Mode.JUMP || gates.sprinting)
+            && (!movingForward.isEnabled() || gates.movingForward)
+            && (!holdingWeapon.isEnabled() || gates.holdingWeapon)
+            && (!onlyWhenTargeting.isEnabled() || gates.targetInFov);
     }
 
     private boolean roll(int percent) {
         return percent >= 100 || (percent > 0 && random.nextInt(100) < percent);
     }
 
-    private int ignoreVerticalPercent(Minecraft minecraft) {
+    private int ignoreVerticalPercent(GateSnapshot gates) {
         switch (verticalMode.getValue()) {
             case ALWAYS:
                 return 0;
             case ONLY_IN_AIR:
-                return minecraft.thePlayer.onGround ? 100 : 0;
+                return gates.onGround ? 100 : 0;
             case NEVER:
             default:
                 return 100;
@@ -431,6 +413,22 @@ public final class VelocityModule extends Module {
         statusUntil = 0L;
         lastAttackTick = Long.MIN_VALUE;
         doubleAttackThisTick = false;
+        gateSnapshot = GateSnapshot.EMPTY;
+    }
+
+    private GateSnapshot captureGateSnapshot(Minecraft minecraft) {
+        return new GateSnapshot(
+            LagModuleSupport.activeInGame(minecraft),
+            minecraft.thePlayer.getEntityId(),
+            minecraft.thePlayer.isInWater(),
+            LagModuleSupport.mouseDown(),
+            LagModuleSupport.moving(minecraft),
+            minecraft.thePlayer.onGround,
+            minecraft.thePlayer.isSprinting(),
+            LagModuleSupport.movingForward(minecraft),
+            LagModuleSupport.holdingWeapon(minecraft),
+            LagModuleSupport.crosshairTarget(minecraft, 6.0D, fov.getValue()) != null
+        );
     }
 
     private enum PacketKind {
@@ -505,6 +503,36 @@ public final class VelocityModule extends Module {
             this.doubleAttack = doubleAttack;
             this.delayMs = delayMs;
             this.createdAtMs = createdAtMs;
+        }
+    }
+
+    private static final class GateSnapshot {
+        private static final GateSnapshot EMPTY = new GateSnapshot(false, -1, false, false,
+            false, false, false, false, false, false);
+        private final boolean available;
+        private final int playerEntityId;
+        private final boolean inWater;
+        private final boolean mouseDown;
+        private final boolean moving;
+        private final boolean onGround;
+        private final boolean sprinting;
+        private final boolean movingForward;
+        private final boolean holdingWeapon;
+        private final boolean targetInFov;
+
+        private GateSnapshot(boolean available, int playerEntityId, boolean inWater,
+                boolean mouseDown, boolean moving, boolean onGround, boolean sprinting,
+                boolean movingForward, boolean holdingWeapon, boolean targetInFov) {
+            this.available = available;
+            this.playerEntityId = playerEntityId;
+            this.inWater = inWater;
+            this.mouseDown = mouseDown;
+            this.moving = moving;
+            this.onGround = onGround;
+            this.sprinting = sprinting;
+            this.movingForward = movingForward;
+            this.holdingWeapon = holdingWeapon;
+            this.targetInFov = targetInFov;
         }
     }
 }

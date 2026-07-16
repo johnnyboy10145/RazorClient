@@ -6,7 +6,6 @@ import com.razorclient.feature.module.impl.HudModule;
 import com.razorclient.gui.ClickGuiScreen;
 import com.razorclient.gui.HudEditorScreen;
 import com.razorclient.gui.GuiCursor;
-import com.razorclient.network.KnockbackDelayBuffer;
 import com.razorclient.network.PacketDelayManager;
 import net.minecraft.client.Minecraft;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
@@ -20,7 +19,6 @@ public final class RazorClient {
 
     private final ModuleManager moduleManager = new ModuleManager();
     private final PacketDelayManager packetDelayManager = new PacketDelayManager(moduleManager);
-    private final KnockbackDelayBuffer knockbackDelayBuffer = new KnockbackDelayBuffer();
     private final ClickGuiScreen clickGuiScreen = new ClickGuiScreen(moduleManager);
 
     public static synchronized RazorClient bootstrap() {
@@ -41,7 +39,6 @@ public final class RazorClient {
     public static RazorClient getInstance() { return instance; }
     public ModuleManager getModuleManager() { return moduleManager; }
     public PacketDelayManager getPacketDelayManager() { return packetDelayManager; }
-    public KnockbackDelayBuffer getKnockbackDelayBuffer() { return knockbackDelayBuffer; }
 
     public static synchronized void shutdownForUnload() {
         RazorClient client = instance;
@@ -70,7 +67,6 @@ public final class RazorClient {
         moduleManager.onClientTick(event);
         if (event.phase == TickEvent.Phase.END) {
             moduleManager.onClientTick();
-            knockbackDelayBuffer.onClientTick();
             packetDelayManager.onClientTick();
         }
     }

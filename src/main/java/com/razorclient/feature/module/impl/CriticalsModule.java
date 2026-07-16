@@ -53,6 +53,10 @@ public final class CriticalsModule extends Module {
         if (mode.getValue() != Mode.PACKET || !CombatModuleSupport.isAttackPacket(packet)) {
             return;
         }
+        if (!getContext().isClientThread()) {
+            status = "Client-thread deferred";
+            return;
+        }
         Minecraft minecraft = Minecraft.getMinecraft();
         if (!canActivate(minecraft) || !rollChance()) {
             status = "Skipped";

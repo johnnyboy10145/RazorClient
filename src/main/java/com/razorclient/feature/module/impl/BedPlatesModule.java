@@ -13,7 +13,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.Iterator;
@@ -30,6 +29,7 @@ import net.minecraft.client.renderer.WorldRenderer;
 import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
 import net.minecraft.init.Blocks;
 import net.minecraft.util.BlockPos;
+import net.minecraft.util.EnumFacing;
 import net.minecraft.util.MathHelper;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
@@ -45,6 +45,9 @@ public final class BedPlatesModule extends Module {
     private static final float LABEL_DISTANCE_REFERENCE = 32.0F;
     private static final float LABEL_DISTANCE_MULTIPLIER = 6.0F;
     private static final float LABEL_MAX_SCALE = 0.30F;
+    private static final EnumFacing[] HORIZONTAL_DIRECTIONS = {
+        EnumFacing.NORTH, EnumFacing.SOUTH, EnumFacing.EAST, EnumFacing.WEST
+    };
 
     private final NumberSetting range = new NumberSetting("Range", 5, 128, 1, 128);
     private final NumberSetting layers = new NumberSetting("Layers", 1, 4, 1, 2);
@@ -56,6 +59,7 @@ public final class BedPlatesModule extends Module {
     private final Deque<Long> rescanQueue = new ArrayDeque<Long>();
     private final Set<Long> queuedChunks = new HashSet<Long>();
     private final List<BedRenderInfo> renderPool = new ArrayList<BedRenderInfo>();
+    private final BlockPos.MutableBlockPos blockCursor = new BlockPos.MutableBlockPos();
     private ChunkScanTask activeScan;
 
     private WorldClient cachedWorld;
@@ -148,7 +152,7 @@ public final class BedPlatesModule extends Module {
                     renderInfo = new BedRenderInfo();
                     renderPool.add(renderInfo);
                 }
-                renderInfo.set(cachedBed.first, cachedBed.second, cachedBed.defenses, distanceSq);
+                renderInfo.set(cachedBed.first, cachedBed.second, cachedBed.defenseText, distanceSq);
                 renderCount++;
             }
         }
@@ -350,15 +354,11 @@ public final class BedPlatesModule extends Module {
 
     private BedPair resolveBedPair(WorldClient world, BlockPos pos) {
         BlockPos otherPart = pos;
-        BlockPos[] neighbors = new BlockPos[] {
-            pos.north(),
-            pos.south(),
-            pos.east(),
-            pos.west()
-        };
-        for (BlockPos neighbor : neighbors) {
-            if (isBedBlock(world, neighbor)) {
-                otherPart = neighbor;
+        for (EnumFacing direction : HORIZONTAL_DIRECTIONS) {
+            blockCursor.set(pos.getX() + direction.getFrontOffsetX(), pos.getY(),
+                pos.getZ() + direction.getFrontOffsetZ());
+            if (isBedBlock(world, blockCursor)) {
+                otherPart = new BlockPos(blockCursor.getX(), blockCursor.getY(), blockCursor.getZ());
                 break;
             }
         }
@@ -375,8 +375,8 @@ public final class BedPlatesModule extends Module {
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dy = 0; dy <= radius; dy++) {
                 for (int dz = -radius; dz <= radius; dz++) {
-                    addDefenseBlock(world, names, first.add(dx, dy, dz));
-                    addDefenseBlock(world, names, second.add(dx, dy, dz));
+                    addDefenseBlock(world, names, first.getX() + dx, first.getY() + dy, first.getZ() + dz);
+                    addDefenseBlock(world, names, second.getX() + dx, second.getY() + dy, second.getZ() + dz);
                 }
             }
         }
@@ -384,8 +384,9 @@ public final class BedPlatesModule extends Module {
         return names;
     }
 
-    private void addDefenseBlock(WorldClient world, Set<String> names, BlockPos pos) {
-        Block block = world.getBlockState(pos).getBlock();
+    private void addDefenseBlock(WorldClient world, Set<String> names, int x, int y, int z) {
+        blockCursor.set(x, y, z);
+        Block block = world.getBlockState(blockCursor).getBlock();
         if (block == null || block == Blocks.air || block instanceof BlockBed || block.getMaterial() == Material.air) {
             return;
         }
@@ -440,9 +441,9 @@ public final class BedPlatesModule extends Module {
         double y = Math.max(bed.first.getY(), bed.second.getY()) + 1.35D - viewerY;
         double z = (bed.first.getZ() + bed.second.getZ()) / 2.0D + 0.5D - viewerZ;
 
-        String defenseText = bed.defenses.isEmpty() ? "Uncovered" : joinNames(bed.defenses);
+        String defenseText = bed.defenseText;
         if (showDistance.isEnabled()) {
-            defenseText = defenseText + String.format(Locale.US, " [%.1fm]", Math.sqrt(bed.distanceSq));
+            defenseText = defenseText + " [" + formatDistance(Math.sqrt(bed.distanceSq)) + "]";
         }
 
         float scale = getLabelScale(bed.distanceSq);
@@ -497,21 +498,9 @@ public final class BedPlatesModule extends Module {
         GlStateManager.enableTexture2D();
     }
 
-    private String joinNames(Set<String> names) {
-        StringBuilder builder = new StringBuilder();
-        int index = 0;
-        for (String name : names) {
-            if (index > 0) {
-                builder.append(", ");
-            }
-            builder.append(name);
-            index++;
-            if (builder.length() > 48 && index < names.size()) {
-                builder.append("...");
-                break;
-            }
-        }
-        return builder.toString();
+    private static String formatDistance(double distance) {
+        long tenths = Math.max(0L, Math.round(distance * 10.0D));
+        return (tenths / 10L) + "." + (tenths % 10L) + "m";
     }
 
     private void resetCache() {
@@ -587,25 +576,39 @@ public final class BedPlatesModule extends Module {
     private static final class CachedBed {
         private final BlockPos first;
         private final BlockPos second;
-        private final Set<String> defenses;
+        private final String defenseText;
 
         private CachedBed(BlockPos first, BlockPos second, Set<String> defenses) {
             this.first = first;
             this.second = second;
-            this.defenses = defenses;
+            this.defenseText = defenses.isEmpty() ? "Uncovered" : joinDefenseNames(defenses);
+        }
+
+        private static String joinDefenseNames(Set<String> names) {
+            StringBuilder builder = new StringBuilder(64);
+            int index = 0;
+            for (String name : names) {
+                if (index++ > 0) builder.append(", ");
+                builder.append(name);
+                if (builder.length() > 48 && index < names.size()) {
+                    builder.append("...");
+                    break;
+                }
+            }
+            return builder.toString();
         }
     }
 
     private static final class BedRenderInfo {
         private BlockPos first;
         private BlockPos second;
-        private Set<String> defenses;
+        private String defenseText;
         private double distanceSq;
 
-        private void set(BlockPos first, BlockPos second, Set<String> defenses, double distanceSq) {
+        private void set(BlockPos first, BlockPos second, String defenseText, double distanceSq) {
             this.first = first;
             this.second = second;
-            this.defenses = defenses;
+            this.defenseText = defenseText;
             this.distanceSq = distanceSq;
         }
     }

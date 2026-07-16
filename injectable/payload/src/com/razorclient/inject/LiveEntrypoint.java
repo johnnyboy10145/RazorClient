@@ -31,6 +31,7 @@ public final class LiveEntrypoint {
     private static volatile boolean running;
     private static volatile String injectionId;
     private static volatile NetworkManager installedManager;
+    private static volatile LivePacketHandler installedPacketHandler;
     private static volatile NetworkManager pendingManager;
     private static final Set<Integer> downKeys = new HashSet<Integer>();
     private static final boolean[] downMouseButtons = new boolean[8];
@@ -360,10 +361,12 @@ public final class LiveEntrypoint {
                     String anchor = managerContext == null ? null : managerContext.name();
                     if (anchor == null && pipeline.get("packet_handler") != null) anchor = "packet_handler";
                     if (anchor == null) throw new IllegalStateException("NetworkManager pipeline anchor not found");
-                    pipeline.addBefore(anchor, PACKET_HANDLER_NAME, new LivePacketHandler(manager));
+                    LivePacketHandler handler = new LivePacketHandler(manager);
+                    pipeline.addBefore(anchor, PACKET_HANDLER_NAME, handler);
                     AgentLog.info("Installed live Netty packet handler");
                     InjectionStatus.write("NETTY_HANDLER_INSTALLED", "manager=" + manager);
                     installedManager = manager;
+                    installedPacketHandler = handler;
                 } catch (Throwable failure) {
                     AgentLog.error("Failed to install live Netty packet handler", failure);
                 } finally {
@@ -396,15 +399,17 @@ public final class LiveEntrypoint {
     private static void removePacketHandler() {
         pendingManager = null;
         final NetworkManager manager = installedManager;
+        final LivePacketHandler handler = installedPacketHandler;
         installedManager = null;
-        if (manager == null || manager.channel == null) return;
+        installedPacketHandler = null;
+        if (manager == null || manager.channel == null || handler == null) return;
         manager.channel.eventLoop().execute(new Runnable() {
             @Override
             public void run() {
                 try {
                     ChannelPipeline pipeline = manager.channel.pipeline();
-                    if (pipeline.get(PACKET_HANDLER_NAME) != null) {
-                        pipeline.remove(PACKET_HANDLER_NAME);
+                    if (pipeline.get(PACKET_HANDLER_NAME) == handler) {
+                        pipeline.remove(handler);
                         AgentLog.info("Removed live Netty packet handler");
                     }
                 } catch (Throwable failure) {

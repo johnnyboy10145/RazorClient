@@ -10,8 +10,8 @@ import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
 import com.razorclient.gui.GuiEffects;
 import com.razorclient.gui.GuiTheme;
-import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
-import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
+import com.razorclient.runtime.EntityFrame;
+import com.razorclient.runtime.EntityRecord;
 import com.razorclient.runtime.FrameContext;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -256,7 +256,7 @@ public final class HudModule extends Module {
             return;
         }
 
-        EntitySnapshot current = resolveCurrentTarget(minecraft);
+        EntityRecord current = resolveCurrentTarget(minecraft);
         if (current == null) {
             return;
         }
@@ -282,25 +282,25 @@ public final class HudModule extends Module {
         lastPlayerHealth = playerHealth;
     }
 
-    private EntitySnapshot resolveCurrentTarget(Minecraft minecraft) {
+    private EntityRecord resolveCurrentTarget(Minecraft minecraft) {
         RazorClient client = RazorClient.getInstance();
         if (client == null) return null;
         if (targetHovered.isEnabled()) {
-            EntitySnapshot hovered = getHoveredLiving(minecraft, client);
+            EntityRecord hovered = getHoveredLiving(minecraft, client);
             if (hovered != null) {
                 return hovered;
             }
         }
-        int publishedTargetId = CombatTargetService.getPublishedTargetId(minecraft);
+        int publishedTargetId = getContext().getTargetPublications().activeTarget(getContext().getTick());
         if (publishedTargetId >= 0) {
-            EntitySnapshot published = client.getModuleManager().getEntitySnapshots().find(publishedTargetId);
+            EntityRecord published = client.getModuleManager().getEntityFrame().find(publishedTargetId);
             if (isValidTargetSnapshot(published)) return published;
         }
-        EntitySnapshot previous = client.getModuleManager().getEntitySnapshots().find(lastTargetId);
+        EntityRecord previous = client.getModuleManager().getEntityFrame().find(lastTargetId);
         return isValidTargetSnapshot(previous) ? previous : null;
     }
 
-    private EntitySnapshot getHoveredLiving(Minecraft minecraft, RazorClient client) {
+    private EntityRecord getHoveredLiving(Minecraft minecraft, RazorClient client) {
         MovingObjectPosition mouseOver = minecraft.objectMouseOver;
         if (mouseOver == null || mouseOver.typeOfHit != MovingObjectPosition.MovingObjectType.ENTITY) {
             return null;
@@ -312,11 +312,11 @@ public final class HudModule extends Module {
         if (entity instanceof EntityPlayer && AntiBotModule.shouldIgnore((EntityPlayer) entity)) {
             return null;
         }
-        EntitySnapshot snapshot = client.getModuleManager().getEntitySnapshots().find(entity.getEntityId());
+        EntityRecord snapshot = client.getModuleManager().getEntityFrame().find(entity.getEntityId());
         return isValidTargetSnapshot(snapshot) ? snapshot : null;
     }
 
-    private boolean isValidTargetSnapshot(EntitySnapshot snapshot) {
+    private boolean isValidTargetSnapshot(EntityRecord snapshot) {
         return snapshot != null && !snapshot.isDead() && snapshot.getHealth() > 0.0F;
     }
 
@@ -477,9 +477,13 @@ public final class HudModule extends Module {
         private void renderScaled(ScaledResolution resolution, boolean editorOpen) {
             float scale = getScale();
             GL11.glPushMatrix();
-            GL11.glScalef(scale, scale, 1.0F);
-            render((int) (getX() / scale), (int) (getY() / scale), editorOpen);
-            GL11.glPopMatrix();
+            try {
+                GL11.glScalef(scale, scale, 1.0F);
+                render((int) (getX() / scale), (int) (getY() / scale), editorOpen);
+            } finally {
+                GL11.glColor4f(1.0F, 1.0F, 1.0F, 1.0F);
+                GL11.glPopMatrix();
+            }
         }
 
         private Bounds pinBounds(Bounds bounds) {
@@ -728,7 +732,7 @@ public final class HudModule extends Module {
         @Override
         protected void render(int x, int y, boolean editorOpen) {
             Minecraft minecraft = Minecraft.getMinecraft();
-            EntitySnapshot target = editorOpen ? null : resolveCurrentTarget(minecraft);
+            EntityRecord target = editorOpen ? null : resolveCurrentTarget(minecraft);
             String name = target == null ? "Target" : target.getName();
             float health = target == null ? 17.0F : Math.max(0.0F, target.getHealth());
             float maxHealth = target == null ? 20.0F : Math.max(1.0F, target.getMaxHealth());
@@ -834,7 +838,7 @@ public final class HudModule extends Module {
 
             RazorClient client = RazorClient.getInstance();
             if (client == null) return;
-            SnapshotFrame snapshots = client.getModuleManager().getEntitySnapshots().current();
+            EntityFrame snapshots = client.getModuleManager().getEntityFrame();
             FrameContext frame = client.getModuleManager().getFrameContext();
             float partialTicks = frame == null ? 1.0F : frame.getPartialTicks();
             double localX = minecraft.thePlayer.lastTickPosX
@@ -847,12 +851,12 @@ public final class HudModule extends Module {
             double radarScaleValue = (half - 6) / (double) Math.max(1, radarRange.getValue());
             int index = 0;
             for (int snapshotIndex = 0; snapshotIndex < snapshots.size(); snapshotIndex++) {
-                EntitySnapshot snapshot = snapshots.get(snapshotIndex);
+                EntityRecord snapshot = snapshots.get(snapshotIndex);
                 if (!snapshot.isPlayer() || snapshot.isDead() || snapshot.isInvisible()) {
                     continue;
                 }
-                EntityPlayer player = (EntityPlayer) snapshot.getEntity();
-                if (AntiBotModule.shouldIgnore(player)) continue;
+                Entity live = minecraft.theWorld.getEntityByID(snapshot.getEntityId());
+                if (!(live instanceof EntityPlayer) || AntiBotModule.shouldIgnore((EntityPlayer) live)) continue;
 
                 double dx = snapshot.interpolateX(partialTicks) - localX;
                 double dz = snapshot.interpolateZ(partialTicks) - localZ;

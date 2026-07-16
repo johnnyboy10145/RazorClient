@@ -25,7 +25,8 @@ public final class LagRangeModule extends Module {
     private final BooleanSetting realPositionIndicator = new BooleanSetting("Real Position Indicator", true);
     private final BooleanSetting holdingWeapon = new BooleanSetting("Holding Weapon", false);
 
-    private volatile EntityPlayer target;
+    private volatile int targetEntityId = -1;
+    private volatile boolean weaponHeld;
     private final AtomicBoolean outboundFlushRequested = new AtomicBoolean();
     private volatile Packet<?> flushTriggerPacket;
     private final Object positionLock = new Object();
@@ -45,7 +46,8 @@ public final class LagRangeModule extends Module {
 
     @Override
     protected void onEnable() {
-        target = null;
+        targetEntityId = -1;
+        weaponHeld = false;
         outboundFlushRequested.set(false);
         flushTriggerPacket = null;
         resetPositionTracking();
@@ -53,7 +55,8 @@ public final class LagRangeModule extends Module {
 
     @Override
     protected void onDisable() {
-        target = null;
+        targetEntityId = -1;
+        weaponHeld = false;
         outboundFlushRequested.set(true);
         flushTriggerPacket = null;
         clearPositionTracking();
@@ -61,7 +64,8 @@ public final class LagRangeModule extends Module {
 
     @Override
     public void onSessionReset() {
-        target = null;
+        targetEntityId = -1;
+        weaponHeld = false;
         outboundFlushRequested.set(true);
         flushTriggerPacket = null;
         clearPositionTracking();
@@ -70,12 +74,13 @@ public final class LagRangeModule extends Module {
     @Override
     public void onClientTick() {
         Minecraft minecraft = Minecraft.getMinecraft();
-        EntityPlayer previousTarget = target;
+        int previousTargetId = targetEntityId;
         EntityPlayer nextTarget = LagModuleSupport.activeInGame(minecraft)
             ? LagModuleSupport.closestCombatTarget(minecraft, activationRange.getValue())
             : null;
-        target = nextTarget;
-        if (nextTarget == null && previousTarget != null) {
+        targetEntityId = nextTarget == null ? -1 : nextTarget.getEntityId();
+        weaponHeld = LagModuleSupport.inGame(minecraft) && LagModuleSupport.holdingWeapon(minecraft);
+        if (targetEntityId == -1 && previousTargetId != -1) {
             outboundFlushRequested.set(true);
         }
         if (!LagModuleSupport.inGame(minecraft)) {
@@ -104,9 +109,9 @@ public final class LagRangeModule extends Module {
             return 1;
         }
         int delay = maximumDelay.getValue() <= 0
-            || target == null
+            || targetEntityId == -1
             || !LagModuleSupport.isMovementPacket(packet)
-            || (holdingWeapon.isEnabled() && !LagModuleSupport.holdingWeapon(Minecraft.getMinecraft()))
+            || (holdingWeapon.isEnabled() && !weaponHeld)
             ? 0
             : maximumDelay.getValue();
         trackMovement(packet, delay);
@@ -120,7 +125,7 @@ public final class LagRangeModule extends Module {
 
     @Override
     public boolean isOutboundPacketDelayActive() {
-        return target != null;
+        return targetEntityId != -1;
     }
 
     @Override
@@ -140,9 +145,12 @@ public final class LagRangeModule extends Module {
             || minecraft.gameSettings == null
             || minecraft.gameSettings.thirdPersonView == 0
             || !LagModuleSupport.inGame(minecraft)
-            || target == null) {
+            || targetEntityId == -1) {
             return;
         }
+        EntityPlayer target = minecraft.theWorld.getEntityByID(targetEntityId) instanceof EntityPlayer
+            ? (EntityPlayer) minecraft.theWorld.getEntityByID(targetEntityId) : null;
+        if (target == null) return;
         LagModuleSupport.ServerPosition position = serverPosition;
         if (position == null || position.entityId != minecraft.thePlayer.getEntityId()) {
             return;
@@ -161,12 +169,12 @@ public final class LagRangeModule extends Module {
 
     @Override
     public String getHudInfo() {
-        return target == null ? maximumDelay.getValue() + "ms" : "Holding";
+        return targetEntityId == -1 ? maximumDelay.getValue() + "ms" : "Holding";
     }
 
     @Override
     public int getHudInfoColor() {
-        return target == null ? super.getHudInfoColor() : 0xFF58C8FF;
+        return targetEntityId == -1 ? super.getHudInfoColor() : 0xFF58C8FF;
     }
 
     private void trackMovement(Packet<?> packet, int delay) {

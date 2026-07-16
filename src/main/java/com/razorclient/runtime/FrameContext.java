@@ -16,6 +16,7 @@ public final class FrameContext {
 
     private final long sequence;
     private final long nanoTime;
+    private final long sessionGeneration;
     private final float partialTicks;
     private final int displayWidth;
     private final int displayHeight;
@@ -31,10 +32,11 @@ public final class FrameContext {
     private final float[] projection;
     private final int[] viewport;
 
-    private FrameContext(long sequence, long nanoTime, float partialTicks, Minecraft minecraft,
+    private FrameContext(long sequence, long nanoTime, long sessionGeneration, float partialTicks, Minecraft minecraft,
             ProjectionBacking backing, boolean projectionValid) {
         this.sequence = sequence;
         this.nanoTime = nanoTime;
+        this.sessionGeneration = sessionGeneration;
         this.partialTicks = partialTicks;
         this.displayWidth = minecraft == null ? 0 : minecraft.displayWidth;
         this.displayHeight = minecraft == null ? 0 : minecraft.displayHeight;
@@ -53,9 +55,9 @@ public final class FrameContext {
         this.viewport = backing.viewport;
     }
 
-    static FrameContext capture(long sequence, float partialTicks, Minecraft minecraft) {
+    static FrameContext capture(long sequence, long sessionGeneration, float partialTicks, Minecraft minecraft) {
         CaptureState state = CAPTURE_STATE.get();
-        ProjectionBacking backing = state.nextBacking();
+        ProjectionBacking backing = new ProjectionBacking();
         boolean valid = false;
         try {
             FloatBuffer floats = state.matrixBuffer;
@@ -82,7 +84,7 @@ public final class FrameContext {
         } catch (Throwable ignored) {
             // Forge may deliver a render callback while the display context is being rebuilt.
         }
-        return new FrameContext(sequence, System.nanoTime(), partialTicks, minecraft, backing, valid);
+        return new FrameContext(sequence, System.nanoTime(), sessionGeneration, partialTicks, minecraft, backing, valid);
     }
 
     private static boolean isValidMatrix(float[] matrix) {
@@ -96,6 +98,7 @@ public final class FrameContext {
 
     public long getSequence() { return sequence; }
     public long getNanoTime() { return nanoTime; }
+    public long getSessionGeneration() { return sessionGeneration; }
     public float getPartialTicks() { return partialTicks; }
     public int getDisplayWidth() { return displayWidth; }
     public int getDisplayHeight() { return displayHeight; }
@@ -114,16 +117,6 @@ public final class FrameContext {
     private static final class CaptureState {
         private final FloatBuffer matrixBuffer = BufferUtils.createFloatBuffer(16);
         private final IntBuffer viewportBuffer = BufferUtils.createIntBuffer(4);
-        private final ProjectionBacking[] backings = {
-            new ProjectionBacking(), new ProjectionBacking(), new ProjectionBacking()
-        };
-        private int nextIndex;
-
-        private ProjectionBacking nextBacking() {
-            ProjectionBacking result = backings[nextIndex];
-            nextIndex = (nextIndex + 1) % backings.length;
-            return result;
-        }
     }
 
     private static final class ProjectionBacking {

@@ -6,7 +6,6 @@ import com.razorclient.feature.module.impl.HudModule;
 import com.razorclient.gui.ClickGuiScreen;
 import com.razorclient.gui.HudEditorScreen;
 import com.razorclient.input.KeybindHandler;
-import com.razorclient.network.KnockbackDelayBuffer;
 import com.razorclient.network.PacketDelayManager;
 import net.minecraft.client.Minecraft;
 import net.minecraftforge.client.event.MouseEvent;
@@ -29,7 +28,6 @@ public final class RazorClient {
     private static RazorClient instance;
     private final ModuleManager moduleManager = new ModuleManager();
     private final PacketDelayManager packetDelayManager = new PacketDelayManager(moduleManager);
-    private final KnockbackDelayBuffer knockbackDelayBuffer = new KnockbackDelayBuffer();
     private final ClickGuiScreen clickGuiScreen = new ClickGuiScreen(moduleManager);
     private boolean tickDispatchActive;
 
@@ -61,9 +59,6 @@ public final class RazorClient {
         return packetDelayManager;
     }
 
-    public KnockbackDelayBuffer getKnockbackDelayBuffer() {
-        return knockbackDelayBuffer;
-    }
 
     @EventHandler
     public void onPreInit(FMLPreInitializationEvent event) {
@@ -95,7 +90,6 @@ public final class RazorClient {
         tickDispatchActive = false;
         moduleManager.onClientTick(event);
         moduleManager.onClientTick();
-        knockbackDelayBuffer.onClientTick();
         packetDelayManager.onClientTick();
     }
 

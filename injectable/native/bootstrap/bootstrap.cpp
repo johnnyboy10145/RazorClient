@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
+#include <bcrypt.h>
 #include <jni.h>
 #include <jvmti.h>
 #include <filesystem>
@@ -11,17 +12,22 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include "payload_security.h"
 
 namespace {
 JavaVM* vm = nullptr;
 jvmtiEnv* jvmti = nullptr;
 HINSTANCE selfInstance = nullptr;
 std::filesystem::path statusFile;
+std::filesystem::path systemSearchJar;
+std::string systemSearchHash;
 using SwapBuffersFn = BOOL (WINAPI*)(HDC);
 struct ImportPatch { HMODULE module; void** slot; void* original; };
 std::vector<ImportPatch> renderPatches;
 std::mutex renderMutex;
+std::mutex statusMutex;
 std::atomic<bool> renderInstalled{false};
+std::atomic<bool> initializationRunning{false};
 std::atomic<int> activeRenderCallbacks{0};
 std::atomic<DWORD> renderThreadId{0};
 std::atomic<HGLRC> renderContext{nullptr};
@@ -255,6 +261,7 @@ void log(const std::string& message) {
 }
 
 void writeStatus(const std::string& phase, const std::string& detail = "") {
+    std::lock_guard<std::mutex> lock(statusMutex);
     if (statusFile.empty()) {
         return;
     }
@@ -265,6 +272,48 @@ void writeStatus(const std::string& phase, const std::string& detail = "") {
             << jsonEscape(phase) << "\",\"detail\":\"" << jsonEscape(detail) << "\"}\n";
     } catch (...) {
     }
+}
+
+std::string sha256File(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return {};
+    BCRYPT_ALG_HANDLE algorithm{};
+    BCRYPT_HASH_HANDLE hash{};
+    DWORD objectSize = 0, hashSize = 0, resultSize = 0;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0 ||
+            BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectSize),
+                sizeof(objectSize), &resultSize, 0) != 0 ||
+            BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashSize),
+                sizeof(hashSize), &resultSize, 0) != 0) {
+        if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+        return {};
+    }
+    std::vector<unsigned char> object(objectSize), digest(hashSize), buffer(1024 * 1024);
+    if (BCryptCreateHash(algorithm, &hash, object.data(), objectSize, nullptr, 0, 0) != 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return {};
+    }
+    bool success = true;
+    while (input) {
+        input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        if (count > 0 && BCryptHashData(hash, buffer.data(), static_cast<ULONG>(count), 0) != 0) {
+            success = false;
+            break;
+        }
+    }
+    if (input.bad() || !success || BCryptFinishHash(hash, digest.data(), hashSize, 0) != 0) success = false;
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!success) return {};
+    static constexpr char HEX[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(digest.size() * 2);
+    for (const auto value : digest) {
+        result.push_back(HEX[value >> 4]);
+        result.push_back(HEX[value & 0x0F]);
+    }
+    return result;
 }
 
 std::filesystem::path resolveStatusFile() {
@@ -477,8 +526,23 @@ jclass loadPayloadEntrypoint(JNIEnv* env, const std::string& jarUtf8) {
     return entry;
 }
 
-DWORD WINAPI initialize(void*) {
-    statusFile = resolveStatusFile();
+DWORD WINAPI initialize(void* parameter) {
+    bool expected = false;
+    if (!initializationRunning.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return ERROR_BUSY;
+    }
+    struct InitializationGuard {
+        ~InitializationGuard() {
+            initializationRunning.store(false, std::memory_order_release);
+        }
+    } initializationGuard;
+
+    {
+        std::lock_guard<std::mutex> lock(statusMutex);
+        statusFile = parameter
+            ? std::filesystem::path(static_cast<const wchar_t*>(parameter))
+            : resolveStatusFile();
+    }
     writeStatus("BOOTSTRAP_LOADED", "Bootstrap DLL loaded");
     HMODULE jvm = nullptr;
     for (int i = 0; i < 300 && !(jvm = GetModuleHandleW(L"jvm.dll")); ++i) {
@@ -552,13 +616,54 @@ DWORD WINAPI initialize(void*) {
         vm->DetachCurrentThread();
         return 7;
     }
+    const std::string actualAgentHash = sha256File(jar);
+    if (actualAgentHash.empty()) {
+        log("Agent jar hash calculation failed");
+        writeStatus("FAILED", "Agent jar hash calculation failed");
+        vm->DetachCurrentThread();
+        return 7;
+    }
+#ifdef RAZORCLIENT_RELEASE
+    if (actualAgentHash != RAZORCLIENT_EXPECTED_AGENT_SHA256) {
+        log("Agent jar hash verification failed");
+        writeStatus("FAILED", "Agent jar hash verification failed");
+        vm->DetachCurrentThread();
+        return 7;
+    }
+#endif
     writeStatus("AGENT_FOUND", jarUtf8);
-    if (jvmti->AddToSystemClassLoaderSearch(jarUtf8.c_str()) != JVMTI_ERROR_NONE) {
-        log("AddToSystemClassLoaderSearch failed");
-        writeStatus("FAILED", "AddToSystemClassLoaderSearch failed");
+    std::error_code canonicalError;
+    const std::filesystem::path canonicalJar = std::filesystem::weakly_canonical(jar, canonicalError);
+    const std::filesystem::path searchJar = canonicalError ? jar : canonicalJar;
+    if (systemSearchJar != searchJar || systemSearchHash != actualAgentHash) {
+        if (jvmti->AddToSystemClassLoaderSearch(jarUtf8.c_str()) != JVMTI_ERROR_NONE) {
+            log("AddToSystemClassLoaderSearch failed");
+            writeStatus("FAILED", "AddToSystemClassLoaderSearch failed");
+            vm->DetachCurrentThread();
+            return 8;
+        }
+        systemSearchJar = searchJar;
+        systemSearchHash = actualAgentHash;
+    } else {
+        writeStatus("AGENT_SEARCH_REUSED", "Agent already present in system classloader search");
+    }
+#ifdef RAZORCLIENT_RELEASE
+    jclass signatureVerifier = env->FindClass("com/razorclient/inject/JarSignatureVerifier");
+    jmethodID verifyJar = signatureVerifier ? env->GetStaticMethodID(signatureVerifier, "verify",
+        "(Ljava/lang/String;Ljava/lang/String;)Z") : nullptr;
+    jstring jarPathText = env->NewStringUTF(jarUtf8.c_str());
+    jstring signerText = env->NewStringUTF(RAZORCLIENT_EXPECTED_JAR_SIGNER_SHA256);
+    const jboolean signatureOk = signatureVerifier && verifyJar && jarPathText && signerText &&
+        env->CallStaticBooleanMethod(signatureVerifier, verifyJar, jarPathText, signerText);
+    if (jarPathText) env->DeleteLocalRef(jarPathText);
+    if (signerText) env->DeleteLocalRef(signerText);
+    if (clearException(env, "Verify signed payload JAR") || !signatureOk) {
+        log("Signed payload JAR verification failed");
+        writeStatus("FAILED", "Signed payload JAR verification failed");
         vm->DetachCurrentThread();
         return 8;
     }
+#endif
 
     jclass systemClass = env->FindClass("java/lang/System");
     jmethodID setProperty = env->GetStaticMethodID(systemClass, "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
@@ -606,6 +711,10 @@ DWORD WINAPI initialize(void*) {
     vm->DetachCurrentThread();
     return 0;
 }
+}
+
+extern "C" __declspec(dllexport) DWORD WINAPI RazorClientRestart(void* statusPath) {
+    return initialize(statusPath);
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {

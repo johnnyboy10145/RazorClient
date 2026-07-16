@@ -2,6 +2,9 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <bcrypt.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
 #include <psapi.h>
 #include <dwmapi.h>
 #include <winhttp.h>
@@ -13,7 +16,14 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <ctime>
+#include <atomic>
+#include <mutex>
+#include <limits>
+#include <utility>
 #include "resource.h"
+#include "compat_public_key.h"
+#include "payload_hashes.h"
 
 namespace {
 std::wstring status = L"Launch Lunar 1.8.9 first, then press Inject.";
@@ -33,11 +43,25 @@ std::string fingerprintDetail;
 DWORD lastInjectError = 0;
 bool passwordAccepted = false;
 std::string remoteCompatStatus = "not checked";
+std::atomic<bool> injectionInProgress{false};
+std::mutex statusMutex;
+
+constexpr DWORD WM_INJECTION_FINISHED = WM_APP + 1;
+constexpr size_t MAX_MANIFEST_ENVELOPE_BYTES = 1024 * 1024;
+constexpr size_t MAX_MANIFEST_PAYLOAD_BYTES = 512 * 1024;
+constexpr unsigned long long MAX_MANIFEST_LIFETIME_SECONDS = 30ULL * 24ULL * 60ULL * 60ULL;
+constexpr unsigned long long MANIFEST_CLOCK_SKEW_SECONDS = 5ULL * 60ULL;
 
 bool processHasJvm(HANDLE process);
 std::wstring jvmModulePath(HANDLE process);
 
 const wchar_t* COMPAT_MANIFEST_URL = L"https://joisthegayest.com/razorclient/compat.json";
+
+#ifdef RAZORCLIENT_RELEASE
+constexpr bool REQUIRE_SIGNED_COMPAT = true;
+#else
+constexpr bool REQUIRE_SIGNED_COMPAT = false;
+#endif
 
 COLORREF rgb(unsigned char r, unsigned char g, unsigned char b) {
     return RGB(r, g, b);
@@ -82,6 +106,8 @@ struct ProcessCandidate {
     DWORD pid{};
     std::wstring exePath;
     std::wstring jvmPath;
+    unsigned long long creationTime{};
+    bool x64{};
 };
 
 struct SupportedLunarBuild {
@@ -99,6 +125,10 @@ struct LunarBuildDetection {
     const SupportedLunarBuild* supported{};
     std::string remoteName;
     std::string remoteAdapterVersion;
+    DWORD targetPid{};
+    unsigned long long processCreationTime{};
+    std::string executableHash;
+    std::string jvmHash;
 
     bool isSupported() const {
         return supported != nullptr || !remoteAdapterVersion.empty();
@@ -173,30 +203,171 @@ void writeLauncherLogLine(const std::wstring& line) {
     std::wofstream out(directory/L"launcher.log",std::ios::app); out<<timestamp()<<L" "<<line<<L'\n';
 }
 
+std::wstring currentStatus() {
+    std::lock_guard<std::mutex> lock(statusMutex);
+    return status;
+}
+
+void setStatus(std::wstring value) {
+    {
+        std::lock_guard<std::mutex> lock(statusMutex);
+        status = std::move(value);
+    }
+    if (windowHandle) PostMessageW(windowHandle, WM_APP, 0, 0);
+}
+
 void writeLauncherLog() {
-    writeLauncherLogLine(status);
+    writeLauncherLogLine(currentStatus());
 }
 
 void redraw() {
     if (windowHandle) {
         InvalidateRect(windowHandle, nullptr, TRUE);
-        UpdateWindow(windowHandle);
     }
+}
+
+std::vector<unsigned char> sha256Bytes(const unsigned char* bytes, size_t length) {
+    BCRYPT_ALG_HANDLE algorithm{}; BCRYPT_HASH_HANDLE hash{};
+    DWORD objectSize=0,cb=0,hashSize=0;
+    if (BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)!=0) return {};
+    if (BCryptGetProperty(algorithm,BCRYPT_OBJECT_LENGTH,reinterpret_cast<PUCHAR>(&objectSize),sizeof(objectSize),&cb,0)!=0 ||
+        BCryptGetProperty(algorithm,BCRYPT_HASH_LENGTH,reinterpret_cast<PUCHAR>(&hashSize),sizeof(hashSize),&cb,0)!=0) {
+        BCryptCloseAlgorithmProvider(algorithm,0);
+        return {};
+    }
+    std::vector<unsigned char> object(objectSize),digest(hashSize);
+    if (BCryptCreateHash(algorithm,&hash,object.data(),objectSize,nullptr,0,0)!=0) { BCryptCloseAlgorithmProvider(algorithm,0); return {}; }
+    const bool hashed = length <= std::numeric_limits<ULONG>::max() &&
+        BCryptHashData(hash, const_cast<PUCHAR>(bytes), static_cast<ULONG>(length), 0) == 0 &&
+        BCryptFinishHash(hash,digest.data(),hashSize,0) == 0;
+    BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(algorithm,0);
+    if (!hashed) return {};
+    return digest;
 }
 
 std::string sha256(const std::filesystem::path& path) {
     BCRYPT_ALG_HANDLE algorithm{}; BCRYPT_HASH_HANDLE hash{};
     DWORD objectSize=0,cb=0,hashSize=0;
-    if (BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)!=0) return {};
-    BCryptGetProperty(algorithm,BCRYPT_OBJECT_LENGTH,reinterpret_cast<PUCHAR>(&objectSize),sizeof(objectSize),&cb,0);
-    BCryptGetProperty(algorithm,BCRYPT_HASH_LENGTH,reinterpret_cast<PUCHAR>(&hashSize),sizeof(hashSize),&cb,0);
+    std::ifstream input(path,std::ios::binary);
+    if (!input || BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)!=0) return {};
+    if (BCryptGetProperty(algorithm,BCRYPT_OBJECT_LENGTH,reinterpret_cast<PUCHAR>(&objectSize),sizeof(objectSize),&cb,0)!=0 ||
+        BCryptGetProperty(algorithm,BCRYPT_HASH_LENGTH,reinterpret_cast<PUCHAR>(&hashSize),sizeof(hashSize),&cb,0)!=0) {
+        BCryptCloseAlgorithmProvider(algorithm,0);
+        return {};
+    }
     std::vector<unsigned char> object(objectSize),digest(hashSize),buffer(1024*1024);
     if (BCryptCreateHash(algorithm,&hash,object.data(),objectSize,nullptr,0,0)!=0) { BCryptCloseAlgorithmProvider(algorithm,0); return {}; }
-    std::ifstream input(path,std::ios::binary);
-    while(input){input.read(reinterpret_cast<char*>(buffer.data()),buffer.size());auto count=input.gcount();if(count>0)BCryptHashData(hash,buffer.data(),static_cast<ULONG>(count),0);}
-    BCryptFinishHash(hash,digest.data(),hashSize,0); BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(algorithm,0);
+    bool hashed = true;
+    while(input){
+        input.read(reinterpret_cast<char*>(buffer.data()),buffer.size());
+        auto count=input.gcount();
+        if(count>0 && BCryptHashData(hash,buffer.data(),static_cast<ULONG>(count),0)!=0) { hashed=false; break; }
+    }
+    if (input.bad() || !hashed || BCryptFinishHash(hash,digest.data(),hashSize,0)!=0) hashed=false;
+    BCryptDestroyHash(hash); BCryptCloseAlgorithmProvider(algorithm,0);
+    if (!hashed) return {};
     static const char hex[]="0123456789ABCDEF"; std::string result; result.reserve(hashSize*2);
     for(unsigned char value:digest){result.push_back(hex[value>>4]);result.push_back(hex[value&15]);} return result;
+}
+
+bool verifyAuthenticode(const std::filesystem::path& path) {
+#ifndef RAZORCLIENT_RELEASE
+    (void)path;
+    return true;
+#else
+    WINTRUST_FILE_INFO fileInfo{};
+    fileInfo.cbStruct = sizeof(fileInfo);
+    fileInfo.pcwszFilePath = path.c_str();
+    GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA trust{};
+    trust.cbStruct = sizeof(trust);
+    trust.dwUIChoice = WTD_UI_NONE;
+    trust.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trust.dwUnionChoice = WTD_CHOICE_FILE;
+    trust.pFile = &fileInfo;
+    trust.dwStateAction = WTD_STATEACTION_VERIFY;
+    LONG result = WinVerifyTrust(nullptr, &policy, &trust);
+    trust.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &policy, &trust);
+    return result == ERROR_SUCCESS;
+#endif
+}
+
+bool verifyExpectedPayloadHash(WORD id, const std::filesystem::path& path) {
+    const std::string actual = sha256(path);
+    if (id == IDR_BOOTSTRAP) return !actual.empty() && actual == RAZORCLIENT_EXPECTED_BOOTSTRAP_SHA256;
+    if (id == IDR_AGENT) return !actual.empty() && actual == RAZORCLIENT_EXPECTED_AGENT_SHA256;
+    return false;
+}
+
+std::vector<unsigned char> base64Decode(const std::string& encoded) {
+    if (encoded.empty() || encoded.size() > 8 * 1024 * 1024) return {};
+    DWORD required = 0;
+    if (!CryptStringToBinaryA(encoded.c_str(), static_cast<DWORD>(encoded.size()),
+            CRYPT_STRING_BASE64, nullptr, &required, nullptr, nullptr)) {
+        return {};
+    }
+    std::vector<unsigned char> decoded(required);
+    if (!CryptStringToBinaryA(encoded.c_str(), static_cast<DWORD>(encoded.size()),
+            CRYPT_STRING_BASE64, decoded.data(), &required, nullptr, nullptr)) {
+        return {};
+    }
+    decoded.resize(required);
+    return decoded;
+}
+
+bool verifyRsaPssSha256WithKey(const std::string& payload, const std::string& signatureB64,
+        const std::string& publicKeyB64) {
+    std::vector<unsigned char> keyBlob = base64Decode(publicKeyB64);
+    std::vector<unsigned char> signature = base64Decode(signatureB64);
+    if (keyBlob.size() < sizeof(BCRYPT_RSAKEY_BLOB) || signature.empty()) return false;
+
+    BCRYPT_RSAKEY_BLOB* header = reinterpret_cast<BCRYPT_RSAKEY_BLOB*>(keyBlob.data());
+    const size_t headerSize = sizeof(BCRYPT_RSAKEY_BLOB);
+    const size_t required = headerSize + header->cbPublicExp + header->cbModulus;
+    if (header->Magic != BCRYPT_RSAPUBLIC_MAGIC || header->cbPrime1 != 0 || header->cbPrime2 != 0 ||
+        required != keyBlob.size() || header->cbModulus == 0 || header->cbPublicExp == 0) {
+        return false;
+    }
+
+    std::vector<unsigned char> digest = sha256Bytes(
+        reinterpret_cast<const unsigned char*>(payload.data()), payload.size());
+    if (digest.size() != 32) return false;
+
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_RSA_ALGORITHM, nullptr, 0) != 0) return false;
+    BCRYPT_KEY_HANDLE key = nullptr;
+    if (BCryptImportKeyPair(algorithm, nullptr, BCRYPT_RSAPUBLIC_BLOB,
+            &key, keyBlob.data(), static_cast<ULONG>(keyBlob.size()), 0) != 0) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+    BCRYPT_PSS_PADDING_INFO padding{};
+    padding.pszAlgId = BCRYPT_SHA256_ALGORITHM;
+    padding.cbSalt = 32;
+    NTSTATUS result = BCryptVerifySignature(key, &padding,
+        digest.data(), static_cast<ULONG>(digest.size()),
+        signature.data(), static_cast<ULONG>(signature.size()), BCRYPT_PAD_PSS);
+    BCryptDestroyKey(key);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    return result == 0;
+}
+
+bool verifyRsaPssSha256(const std::string& payload, const std::string& signatureB64) {
+    return verifyRsaPssSha256WithKey(payload, signatureB64, RAZORCLIENT_COMPAT_PUBLIC_KEY_B64);
+}
+
+bool cryptoSelfCheck() {
+    static const std::string payload =
+        "{\"manifestVersion\":1,\"issuedAt\":1700000000,\"expires\":1700003600}";
+    static const std::string publicKey =
+        "UlNBMQAIAAADAAAAAAEAAAAAAAAAAAAAAQABwR/Wm+oC2Droula4eQsIFheS+LGTv6jIqqZ87s3aVB0vZBrbwIdeWSJLaw73Owvr6Kzgg2dNsU5eOucWunyA0IOb0SLRwRmliU66QQHgOzM6MWr/XCjtj0rrvDRutgqOnmw0HK9q8gDB35rG2QTBjPkF8tqc8RxZJ8Ya/7/tDieihHWnfWf8R+kdP3l3B2cNn5/UOzMZoR+x4BU9+Vs25lHgCcx+7rL4yrI86bkphZpuRjtNB6/cWZ5GNCBGDCg9FmvrsUQ4CreS2TdPRuo72dAkg+kJRWvKBMKVoTxkSa7+EPv8/hDUOfex8BdWiPW/lv8Toj77omfMwNRaLR4gsQ==";
+    static const std::string signature =
+        "bG9iHwPxvpaBdYsKZWt7ERZcj88sNwP8FCBNjDtYaW72CvjCVJ5H4qI1U6x/JJ8l8REZ7/GyIAC7dsZTZLZghLEY51U7Hi6WURdJXuAFWTpmKwkIN+d7EfHT+Uhd/InwtSEtgLVoDBepfiYWDcaYaUuSYyx2oCX9Lhj30anQtVsdQPqXoXfKzKvzKd0KpRMezc3WbNLpeRAL1BUmiA+wY7O5guVxMyEwTf+oybZDvSqt688pMm4rcu0BEZkxZRQhITy/5EZrIEgxksz1kfbXo4yiRohp5EQX9zSRr82h/CFYblKHQufkEEfDgQChQCZKU3gvTrL+WUx5gH8a+p5yJw==";
+    if (!verifyRsaPssSha256WithKey(payload, signature, publicKey)) return false;
+    std::string tampered = payload;
+    tampered.back() = ']';
+    return !verifyRsaPssSha256WithKey(tampered, signature, publicKey);
 }
 
 bool embeddedResourceExists(WORD id) {
@@ -209,22 +380,52 @@ bool embeddedPayloadAvailable() {
     return embeddedResourceExists(IDR_BOOTSTRAP) && embeddedResourceExists(IDR_AGENT);
 }
 
-std::string readTextFile(const std::filesystem::path& path) {
+std::string readTextFileBounded(const std::filesystem::path& path, size_t maximumBytes) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || size == 0 || size > maximumBytes) return {};
     std::ifstream input(path, std::ios::binary);
-    return std::string((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (!input) return {};
+    std::string value(static_cast<size_t>(size), '\0');
+    input.read(value.data(), static_cast<std::streamsize>(value.size()));
+    return input && input.gcount() == static_cast<std::streamsize>(value.size()) ? value : std::string{};
 }
 
-bool writeTextFile(const std::filesystem::path& path, const std::string& text) {
+bool writeTextFileAtomic(const std::filesystem::path& path, const std::string& text) {
+    if (text.empty() || text.size() > MAX_MANIFEST_ENVELOPE_BYTES) return false;
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    output.write(text.data(), static_cast<std::streamsize>(text.size()));
-    return output.good();
+    if (ec) return false;
+    const std::filesystem::path temporary = path.wstring() + L".tmp-" +
+        std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output.write(text.data(), static_cast<std::streamsize>(text.size()));
+        output.flush();
+        if (!output.good()) {
+            output.close();
+            std::filesystem::remove(temporary, ec);
+            return false;
+        }
+    }
+    if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::filesystem::remove(temporary, ec);
+        return false;
+    }
+    return true;
 }
 
 std::filesystem::path compatCachePath() {
     return localRazorDirectory() / L"compat-cache.json";
 }
+
+std::filesystem::path compatVersionPath() {
+    return localRazorDirectory() / L"compat-version.txt";
+}
+
+std::string extractJsonStringField(const std::string& object, const std::string& field);
+bool verifyManifestEnvelope(const std::string& envelope, std::string& payload);
+bool manifestPayloadPolicyValid(const std::string& payload, unsigned long long& version);
 
 bool fetchRemoteCompatManifest(std::string& manifest) {
     remoteCompatStatus = "fetch failed";
@@ -240,6 +441,10 @@ bool fetchRemoteCompatManifest(std::string& manifest) {
         remoteCompatStatus = "invalid manifest URL";
         return false;
     }
+    if (parts.nScheme != INTERNET_SCHEME_HTTPS) {
+        remoteCompatStatus = "compatibility manifest must use HTTPS";
+        return false;
+    }
 
     HINTERNET session = WinHttpOpen(L"RazorClient/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) {
@@ -247,6 +452,8 @@ bool fetchRemoteCompatManifest(std::string& manifest) {
         return false;
     }
     WinHttpSetTimeouts(session, 3000, 3000, 5000, 5000);
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+    WinHttpSetOption(session, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     HINTERNET connect = WinHttpConnect(session, std::wstring(host, parts.dwHostNameLength).c_str(), parts.nPort, 0);
     if (!connect) {
@@ -255,7 +462,7 @@ bool fetchRemoteCompatManifest(std::string& manifest) {
         return false;
     }
 
-    DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
+    DWORD flags = WINHTTP_FLAG_SECURE;
     HINTERNET request = WinHttpOpenRequest(connect, L"GET", std::wstring(path, parts.dwUrlPathLength).c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!request) {
         WinHttpCloseHandle(connect);
@@ -274,12 +481,25 @@ bool fetchRemoteCompatManifest(std::string& manifest) {
         if (!ok) {
             remoteCompatStatus = "HTTP status " + std::to_string(statusCode);
         }
+        DWORD contentLength = 0;
+        DWORD contentLengthSize = sizeof(contentLength);
+        if (ok && WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                nullptr, &contentLength, &contentLengthSize, nullptr) &&
+                contentLength > MAX_MANIFEST_ENVELOPE_BYTES) {
+            ok = false;
+            remoteCompatStatus = "manifest response exceeds size limit";
+        }
     }
 
     if (ok) {
         std::string body;
         DWORD available = 0;
         while (WinHttpQueryDataAvailable(request, &available) && available > 0) {
+            if (available > MAX_MANIFEST_ENVELOPE_BYTES || body.size() > MAX_MANIFEST_ENVELOPE_BYTES - available) {
+                ok = false;
+                remoteCompatStatus = "manifest response exceeds size limit";
+                break;
+            }
             std::vector<char> buffer(available);
             DWORD read = 0;
             if (!WinHttpReadData(request, buffer.data(), available, &read)) {
@@ -289,9 +509,8 @@ bool fetchRemoteCompatManifest(std::string& manifest) {
             }
             body.append(buffer.data(), buffer.data() + read);
         }
-        if (ok && !body.empty()) {
+        if (ok && !body.empty() && body.size() <= MAX_MANIFEST_ENVELOPE_BYTES) {
             manifest = body;
-            writeTextFile(compatCachePath(), manifest);
             remoteCompatStatus = "remote manifest fetched";
         }
     } else if (remoteCompatStatus == "fetch failed") {
@@ -307,13 +526,38 @@ bool fetchRemoteCompatManifest(std::string& manifest) {
 std::string loadCompatManifest() {
     std::string manifest;
     if (fetchRemoteCompatManifest(manifest)) {
-        return manifest;
+        std::string verified;
+        if (verifyManifestEnvelope(manifest, verified)) {
+            unsigned long long version = 0;
+            if (manifestPayloadPolicyValid(verified, version) &&
+                    writeTextFileAtomic(compatVersionPath(), std::to_string(version)) &&
+                    writeTextFileAtomic(compatCachePath(), manifest)) {
+                remoteCompatStatus += "; signed manifest accepted";
+                return verified;
+            }
+            remoteCompatStatus += "; signed manifest policy/cache update rejected";
+        }
+        if (!REQUIRE_SIGNED_COMPAT && manifest.find("\"payload\"") == std::string::npos) {
+            remoteCompatStatus += "; unsigned manifest accepted in debug mode";
+            return manifest;
+        }
+        remoteCompatStatus += "; manifest signature rejected";
     }
-    manifest = readTextFile(compatCachePath());
+    manifest = readTextFileBounded(compatCachePath(), MAX_MANIFEST_ENVELOPE_BYTES);
     if (!manifest.empty()) {
-        remoteCompatStatus += "; using cached manifest";
+        std::string verified;
+        unsigned long long version = 0;
+        if (verifyManifestEnvelope(manifest, verified) && manifestPayloadPolicyValid(verified, version)) {
+            remoteCompatStatus += "; using cached signed manifest";
+            return verified;
+        }
+        if (!REQUIRE_SIGNED_COMPAT && manifest.find("\"payload\"") == std::string::npos) {
+            remoteCompatStatus += "; using cached unsigned manifest in debug mode";
+            return manifest;
+        }
+        remoteCompatStatus += "; cached manifest signature rejected";
     }
-    return manifest;
+    return {};
 }
 
 std::string extractJsonStringField(const std::string& object, const std::string& field) {
@@ -337,6 +581,35 @@ std::string extractJsonStringField(const std::string& object, const std::string&
     return object.substr(pos + 1, end - pos - 1);
 }
 
+bool verifyManifestEnvelope(const std::string& envelope, std::string& payload) {
+    payload.clear();
+    if (envelope.empty() || envelope.size() > MAX_MANIFEST_ENVELOPE_BYTES) return false;
+    const size_t firstEnvelope = envelope.find_first_not_of(" \t\r\n");
+    const size_t lastEnvelope = envelope.find_last_not_of(" \t\r\n");
+    if (firstEnvelope == std::string::npos || lastEnvelope <= firstEnvelope ||
+            envelope[firstEnvelope] != '{' || envelope[lastEnvelope] != '}') return false;
+    const auto uniqueField = [&](const char* field) {
+        const std::string needle = std::string("\"") + field + "\"";
+        const size_t first = envelope.find(needle);
+        return first != std::string::npos && envelope.find(needle, first + needle.size()) == std::string::npos;
+    };
+    if (!uniqueField("schemaVersion") || !uniqueField("payload") || !uniqueField("signature")) return false;
+    const std::string schema = extractJsonStringField(envelope, "schemaVersion");
+    const std::string payloadB64 = extractJsonStringField(envelope, "payload");
+    const std::string signatureB64 = extractJsonStringField(envelope, "signature");
+    if (schema != "1" || payloadB64.empty() || signatureB64.empty()) return false;
+    std::vector<unsigned char> decoded = base64Decode(payloadB64);
+    if (decoded.empty() || decoded.size() > MAX_MANIFEST_PAYLOAD_BYTES) return false;
+    payload.assign(reinterpret_cast<const char*>(decoded.data()), decoded.size());
+    if (!verifyRsaPssSha256(payload, signatureB64)) {
+        payload.clear();
+        return false;
+    }
+    const size_t first = payload.find_first_not_of(" \t\r\n");
+    const size_t last = payload.find_last_not_of(" \t\r\n");
+    return first != std::string::npos && last > first && payload[first] == '{' && payload[last] == '}';
+}
+
 bool jsonBooleanFieldTrue(const std::string& object, const std::string& field) {
     std::string needle = "\"" + field + "\"";
     size_t pos = object.find(needle);
@@ -349,6 +622,62 @@ bool jsonBooleanFieldTrue(const std::string& object, const std::string& field) {
     }
     size_t value = object.find_first_not_of(" \t\r\n", pos + 1);
     return value != std::string::npos && object.compare(value, 4, "true") == 0;
+}
+
+bool jsonUnsignedLongField(const std::string& object, const std::string& field, unsigned long long& value) {
+    const std::string needle = "\"" + field + "\"";
+    size_t pos = object.find(needle);
+    if (pos == std::string::npos) return false;
+    pos = object.find(':', pos + needle.size());
+    if (pos == std::string::npos) return false;
+    pos = object.find_first_not_of(" \t\r\n", pos + 1);
+    if (pos == std::string::npos || pos >= object.size() || object[pos] < '0' || object[pos] > '9') return false;
+    size_t end = pos;
+    while (end < object.size() && object[end] >= '0' && object[end] <= '9') ++end;
+    try {
+        value = std::stoull(object.substr(pos, end - pos));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool manifestPayloadPolicyValid(const std::string& payload, unsigned long long& version) {
+    unsigned long long issuedAt = 0;
+    unsigned long long expires = 0;
+    version = 0;
+    const auto hasUniqueField = [&](const char* field) {
+        const std::string needle = std::string("\"") + field + "\"";
+        const size_t first = payload.find(needle);
+        return first != std::string::npos && payload.find(needle, first + needle.size()) == std::string::npos;
+    };
+    if (!hasUniqueField("issuedAt") || !hasUniqueField("expires") || !hasUniqueField("manifestVersion") ||
+            !jsonUnsignedLongField(payload, "issuedAt", issuedAt) ||
+            !jsonUnsignedLongField(payload, "expires", expires) ||
+            !jsonUnsignedLongField(payload, "manifestVersion", version) || version == 0) {
+        return false;
+    }
+    const unsigned long long now = static_cast<unsigned long long>(std::time(nullptr));
+    if (issuedAt > now + MANIFEST_CLOCK_SKEW_SECONDS || expires < now || expires <= issuedAt ||
+            expires - issuedAt > MAX_MANIFEST_LIFETIME_SECONDS) {
+        return false;
+    }
+    const std::string acceptedText = readTextFileBounded(compatVersionPath(), 64);
+    if (!acceptedText.empty()) {
+        try {
+            const unsigned long long acceptedVersion = std::stoull(acceptedText);
+            if (version < acceptedVersion) return false;
+        } catch (...) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool manifestPayloadFresh(const std::string& payload) {
+    unsigned long long expires = 0;
+    if (!jsonUnsignedLongField(payload, "expires", expires)) return !REQUIRE_SIGNED_COMPAT;
+    return expires >= static_cast<unsigned long long>(std::time(nullptr));
 }
 
 bool isKnownAdapter(const std::string& adapterVersion) {
@@ -408,8 +737,9 @@ bool genericLunar189Compatible(const LunarBuildDetection& detection, std::string
     });
 }
 
-bool remoteManifestApproves(const std::string& bakeHash, const std::string& mappingsHash, std::string& name, std::string& adapterVersion) {
-    if (bakeHash.empty() || mappingsHash.empty()) {
+bool remoteManifestApproves(const LunarBuildDetection& detection, std::string& name, std::string& adapterVersion) {
+    if (detection.bakeHash.empty() || detection.mappingsHash.empty() || detection.targetPid == 0 ||
+            detection.executableHash.empty() || detection.jvmHash.empty()) {
         remoteCompatStatus = "missing local fingerprint";
         return false;
     }
@@ -420,7 +750,7 @@ bool remoteManifestApproves(const std::string& bakeHash, const std::string& mapp
 
     size_t search = 0;
     while (true) {
-        size_t bake = manifest.find(bakeHash, search);
+        size_t bake = manifest.find(detection.bakeHash, search);
         if (bake == std::string::npos) {
             break;
         }
@@ -428,9 +758,17 @@ bool remoteManifestApproves(const std::string& bakeHash, const std::string& mapp
         size_t end = manifest.find('}', bake);
         if (start != std::string::npos && end != std::string::npos && end > start) {
             std::string object = manifest.substr(start, end - start + 1);
+            std::string objectBake = extractJsonStringField(object, "bakeHash");
             std::string objectMappings = extractJsonStringField(object, "mappingsHash");
             std::string objectAdapter = extractJsonStringField(object, "adapterVersion");
-            if (objectMappings == mappingsHash && jsonBooleanFieldTrue(object, "approved") && isKnownAdapter(objectAdapter)) {
+            std::string objectExecutable = extractJsonStringField(object, "executableHash");
+            std::string objectJvm = extractJsonStringField(object, "jvmHash");
+            std::string objectArchitecture = extractJsonStringField(object, "architecture");
+            const bool runtimeBound = objectExecutable == detection.executableHash &&
+                objectJvm == detection.jvmHash && objectArchitecture == "x64";
+            if (objectBake == detection.bakeHash && objectMappings == detection.mappingsHash && runtimeBound &&
+                jsonBooleanFieldTrue(object, "approved") &&
+                isKnownAdapter(objectAdapter) && manifestPayloadFresh(manifest)) {
                 name = extractJsonStringField(object, "name");
                 adapterVersion = objectAdapter;
                 if (name.empty()) {
@@ -440,7 +778,7 @@ bool remoteManifestApproves(const std::string& bakeHash, const std::string& mapp
                 return true;
             }
         }
-        search = bake + bakeHash.size();
+        search = bake + detection.bakeHash.size();
     }
     remoteCompatStatus += "; no approved remote match";
     return false;
@@ -485,21 +823,60 @@ std::vector<std::filesystem::path> findBakeCandidates(const std::filesystem::pat
     return candidates;
 }
 
-LunarBuildDetection detectLunarBuild() {
+unsigned long long fileTimeValue(const FILETIME& value) {
+    ULARGE_INTEGER integer{};
+    integer.LowPart = value.dwLowDateTime;
+    integer.HighPart = value.dwHighDateTime;
+    return integer.QuadPart;
+}
+
+unsigned long long fileLastWriteTime(const std::filesystem::path& path) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    return GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)
+        ? fileTimeValue(attributes.ftLastWriteTime) : 0;
+}
+
+LunarBuildDetection detectLunarBuild(const ProcessCandidate* target = nullptr) {
     LunarBuildDetection detection;
+    if (target) {
+        detection.targetPid = target->pid;
+        detection.processCreationTime = target->creationTime;
+        detection.executableHash = sha256(target->exePath);
+        detection.jvmHash = sha256(target->jvmPath);
+        if (!target->x64 || target->creationTime == 0) {
+            fingerprintDetail = "selected Lunar JVM architecture or creation time unavailable";
+            return detection;
+        }
+    }
     auto multiver = lunarMultiverDirectory();
     detection.mappingsPath = multiver / L"lunar-platform-mappings-v1_8.jar";
     detection.mappingsHash = sha256(detection.mappingsPath);
 
     std::vector<std::filesystem::path> bakeCandidates = findBakeCandidates(multiver);
     std::stringstream detail;
-    detail << "mappings=" << detection.mappingsHash << " mappingsPath=" << narrow(detection.mappingsPath.wstring());
+    detail << "pid=" << detection.targetPid << " processCreated=" << detection.processCreationTime
+           << " exeHash=" << detection.executableHash << " jvmHash=" << detection.jvmHash
+           << " mappings=" << detection.mappingsHash << " mappingsPath=" << narrow(detection.mappingsPath.wstring());
 
     if (!bakeCandidates.empty()) {
-        const auto& bakePath = bakeCandidates.front();
+        auto selected = bakeCandidates.end();
+        constexpr unsigned long long launchWriteTolerance = 5ULL * 60ULL * 10000000ULL;
+        for (auto candidate = bakeCandidates.begin(); candidate != bakeCandidates.end(); ++candidate) {
+            const unsigned long long written = fileLastWriteTime(*candidate);
+            if (!target || target->creationTime == 0 || (written != 0 && written <= target->creationTime + launchWriteTolerance)) {
+                selected = candidate;
+                break;
+            }
+        }
+        if (selected == bakeCandidates.end()) {
+            detail << " bake=(no candidate bound to selected process start)";
+            fingerprintDetail = detail.str();
+            return detection;
+        }
+        const auto& bakePath = *selected;
         std::string bakeHash = sha256(bakePath);
         detail << " bakeCandidate=" << bakeHash << " path=" << narrow(bakePath.wstring());
-        detail << " ignoredOlderBakeCandidates=" << (bakeCandidates.size() - 1);
+        detail << " ignoredBakeCandidates=" << (bakeCandidates.size() - 1);
         detection.bakeHash = bakeHash;
         detection.bakePath = bakePath;
         for (const auto& build : SUPPORTED_LUNAR_BUILDS) {
@@ -517,13 +894,14 @@ LunarBuildDetection detectLunarBuild() {
     if (!detection.bakeHash.empty()) {
         std::string remoteName;
         std::string remoteAdapter;
-        if (remoteManifestApproves(detection.bakeHash, detection.mappingsHash, remoteName, remoteAdapter)) {
+        if (remoteManifestApproves(detection, remoteName, remoteAdapter)) {
             detection.remoteName = remoteName;
             detection.remoteAdapterVersion = remoteAdapter;
             fingerprintDetail = detail.str() + " remoteSupportedBuild=" + remoteName + " adapter=" + remoteAdapter;
             return detection;
         }
     }
+#ifndef RAZORCLIENT_RELEASE
     std::string genericAdapter;
     if (genericLunar189Compatible(detection, genericAdapter)) {
         detection.remoteName = "Lunar 1.8.9 generic-compatible";
@@ -532,12 +910,9 @@ LunarBuildDetection detectLunarBuild() {
         fingerprintDetail = detail.str() + " genericSupportedBuild=" + detection.remoteName + " adapter=" + genericAdapter;
         return detection;
     }
+#endif
     fingerprintDetail = detail.str();
     return detection;
-}
-
-bool validatePinnedBuild() {
-    return detectLunarBuild().isSupported();
 }
 
 std::vector<ProcessCandidate> lunarProcesses() {
@@ -553,7 +928,17 @@ std::vector<ProcessCandidate> lunarProcesses() {
             std::wstring value(path);
             std::wstring jvmPath = jvmModulePath(process);
             if (value.find(L"\\.lunarclient\\jre\\") != std::wstring::npos && !jvmPath.empty()) {
-                result.push_back(ProcessCandidate{entry.th32ProcessID, value, jvmPath});
+                FILETIME created{}, exited{}, kernel{}, user{};
+                BOOL wow64 = TRUE;
+                const bool hasCreationTime = GetProcessTimes(process, &created, &exited, &kernel, &user) != FALSE;
+                const bool architectureKnown = IsWow64Process(process, &wow64) != FALSE;
+                result.push_back(ProcessCandidate{
+                    entry.th32ProcessID,
+                    value,
+                    jvmPath,
+                    hasCreationTime ? fileTimeValue(created) : 0,
+                    architectureKnown && wow64 == FALSE
+                });
             } else if (!jvmPath.empty() && (value.find(L"\\.minecraft\\") != std::wstring::npos ||
                        value.find(L"Microsoft.4297127D64EC6") != std::wstring::npos ||
                        value.find(L"\\java-runtime-") != std::wstring::npos)) {
@@ -607,48 +992,268 @@ bool copyAdjacentPayload(const wchar_t* name, const std::filesystem::path& targe
 bool extract(WORD id, const wchar_t* adjacentName, const std::filesystem::path& target) {
     HMODULE module = appInstance ? appInstance : GetModuleHandleW(nullptr);
     HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(id), RT_RCDATA);
-    if (!resource) return copyAdjacentPayload(adjacentName, target);
+    if (!resource) return copyAdjacentPayload(adjacentName, target) && verifyExpectedPayloadHash(id, target) && (id != IDR_BOOTSTRAP || verifyAuthenticode(target));
     HGLOBAL loaded = LoadResource(module, resource);
     DWORD size = SizeofResource(module, resource);
     void* bytes = LockResource(loaded);
-    if (!loaded || !bytes || size == 0) return copyAdjacentPayload(adjacentName, target);
-    std::ofstream out(target, std::ios::binary | std::ios::trunc);
+    if (!loaded || !bytes || size == 0) return copyAdjacentPayload(adjacentName, target) && verifyExpectedPayloadHash(id, target) && (id != IDR_BOOTSTRAP || verifyAuthenticode(target));
+    const std::filesystem::path temporary = target.wstring() + L".tmp";
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
     out.write(static_cast<const char*>(bytes), size);
+    out.flush();
+    const bool written = out.good();
     out.close();
-    if (out.good() && std::filesystem::exists(target) && std::filesystem::file_size(target) > 0) return true;
-    return copyAdjacentPayload(adjacentName, target);
+    if (written && MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) &&
+            std::filesystem::exists(target) && std::filesystem::file_size(target) > 0) {
+        if (!verifyExpectedPayloadHash(id, target)) return false;
+        if (id == IDR_BOOTSTRAP && !verifyAuthenticode(target)) return false;
+        return true;
+    }
+    std::error_code cleanupError;
+    std::filesystem::remove(temporary, cleanupError);
+    return copyAdjacentPayload(adjacentName, target) && verifyExpectedPayloadHash(id, target) && (id != IDR_BOOTSTRAP || verifyAuthenticode(target));
 }
 
-bool inject(DWORD pid, const std::filesystem::path& dll) {
+class UniqueHandle {
+public:
+    explicit UniqueHandle(HANDLE value = nullptr) : value_(value) {}
+    ~UniqueHandle() { if (value_ && value_ != INVALID_HANDLE_VALUE) CloseHandle(value_); }
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+    HANDLE get() const { return value_; }
+    explicit operator bool() const { return value_ && value_ != INVALID_HANDLE_VALUE; }
+private:
+    HANDLE value_;
+};
+
+class UniqueModule {
+public:
+    explicit UniqueModule(HMODULE value = nullptr) : value_(value) {}
+    ~UniqueModule() { if (value_) FreeLibrary(value_); }
+    UniqueModule(const UniqueModule&) = delete;
+    UniqueModule& operator=(const UniqueModule&) = delete;
+    HMODULE get() const { return value_; }
+    explicit operator bool() const { return value_ != nullptr; }
+private:
+    HMODULE value_;
+};
+
+class RemoteAllocation {
+public:
+    RemoteAllocation(HANDLE process, size_t size) : process_(process) {
+        address_ = VirtualAllocEx(process_, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+    ~RemoteAllocation() { if (address_) VirtualFreeEx(process_, address_, 0, MEM_RELEASE); }
+    RemoteAllocation(const RemoteAllocation&) = delete;
+    RemoteAllocation& operator=(const RemoteAllocation&) = delete;
+    void* get() const { return address_; }
+    void abandon() { address_ = nullptr; }
+    explicit operator bool() const { return address_ != nullptr; }
+private:
+    HANDLE process_{};
+    void* address_{};
+};
+
+void* remoteFunctionAddress(HANDLE process, const char* functionName) {
+    HMODULE localKernel = GetModuleHandleW(L"kernel32.dll");
+    FARPROC localFunction = localKernel ? GetProcAddress(localKernel, functionName) : nullptr;
+    if (!localFunction) return nullptr;
+
+    HMODULE localOwner = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(localFunction), &localOwner) || !localOwner) return nullptr;
+    wchar_t ownerName[MAX_PATH]{};
+    if (!GetModuleBaseNameW(GetCurrentProcess(), localOwner, ownerName, MAX_PATH)) return nullptr;
+
+    const auto base = reinterpret_cast<const unsigned char*>(localOwner);
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const auto rva = reinterpret_cast<const unsigned char*>(localFunction) - base;
+    if (rva < 0 || static_cast<size_t>(rva) >= nt->OptionalHeader.SizeOfImage) return nullptr;
+
+    DWORD needed = 0;
+    if (!EnumProcessModulesEx(process, nullptr, 0, &needed, LIST_MODULES_64BIT) || needed == 0) return nullptr;
+    std::vector<HMODULE> modules((needed + sizeof(HMODULE) - 1) / sizeof(HMODULE));
+    if (!EnumProcessModulesEx(process, modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
+            &needed, LIST_MODULES_64BIT)) return nullptr;
+    const size_t count = std::min(modules.size(), static_cast<size_t>(needed / sizeof(HMODULE)));
+    for (size_t index = 0; index < count; ++index) {
+        wchar_t candidateName[MAX_PATH]{};
+        if (GetModuleBaseNameW(process, modules[index], candidateName, MAX_PATH) &&
+                _wcsicmp(candidateName, ownerName) == 0) {
+            return reinterpret_cast<unsigned char*>(modules[index]) + rva;
+        }
+    }
+    return nullptr;
+}
+
+struct ReusableBootstrap {
+    HMODULE remoteBase{};
+    std::filesystem::path dllPath;
+    std::filesystem::path jarPath;
+};
+
+std::filesystem::path bootstrapAgentPath(const std::filesystem::path& dllPath) {
+    constexpr wchar_t prefix[] = L"razorclient-bootstrap-live-";
+    const std::wstring name = dllPath.filename().wstring();
+    if (name.size() <= std::size(prefix) - 1 + 4 ||
+            _wcsnicmp(name.c_str(), prefix, std::size(prefix) - 1) != 0 ||
+            _wcsicmp(dllPath.extension().c_str(), L".dll") != 0) {
+        return {};
+    }
+    const std::wstring suffix = name.substr(std::size(prefix) - 1,
+        name.size() - (std::size(prefix) - 1) - 4);
+    return dllPath.parent_path() / (L"razorclient-agent-live-" + suffix + L".jar");
+}
+
+bool findReusableBootstrap(HANDLE process, const std::filesystem::path& currentDll,
+        const std::filesystem::path& currentJar, ReusableBootstrap& result) {
+    const std::string currentDllHash = sha256(currentDll);
+    const std::string currentJarHash = sha256(currentJar);
+    if (currentDllHash.empty() || currentJarHash.empty()) return false;
+
+    DWORD needed = 0;
+    if (!EnumProcessModulesEx(process, nullptr, 0, &needed, LIST_MODULES_64BIT) || needed == 0) return false;
+    std::vector<HMODULE> modules((needed + sizeof(HMODULE) - 1) / sizeof(HMODULE));
+    if (!EnumProcessModulesEx(process, modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
+            &needed, LIST_MODULES_64BIT)) return false;
+
+    const size_t count = std::min(modules.size(), static_cast<size_t>(needed / sizeof(HMODULE)));
+    for (size_t index = 0; index < count; ++index) {
+        wchar_t moduleName[MAX_PATH]{};
+        if (!GetModuleBaseNameW(process, modules[index], moduleName, MAX_PATH) ||
+                _wcsnicmp(moduleName, L"razorclient-bootstrap-live-", 27) != 0) {
+            continue;
+        }
+
+        std::vector<wchar_t> modulePath(32768);
+        if (!GetModuleFileNameExW(process, modules[index], modulePath.data(),
+                static_cast<DWORD>(modulePath.size()))) {
+            continue;
+        }
+        std::filesystem::path existingDll(modulePath.data());
+        std::filesystem::path existingJar = bootstrapAgentPath(existingDll);
+        if (existingJar.empty() || sha256(existingDll) != currentDllHash || sha256(existingJar) != currentJarHash) {
+            continue;
+        }
+        result = {modules[index], std::move(existingDll), std::move(existingJar)};
+        return true;
+    }
+    return false;
+}
+
+void* remoteBootstrapExport(const ReusableBootstrap& bootstrap, const char* exportName) {
+    UniqueModule local(LoadLibraryExW(bootstrap.dllPath.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES));
+    FARPROC exported = local ? GetProcAddress(local.get(), exportName) : nullptr;
+    if (!exported) return nullptr;
+
+    const auto base = reinterpret_cast<const unsigned char*>(local.get());
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const auto rva = reinterpret_cast<const unsigned char*>(exported) - base;
+    if (rva < 0 || static_cast<size_t>(rva) >= nt->OptionalHeader.SizeOfImage) return nullptr;
+    return reinterpret_cast<unsigned char*>(bootstrap.remoteBase) + rva;
+}
+
+enum class BootstrapReuseResult { NotFound, Restarted, Failed };
+
+BootstrapReuseResult restartReusableBootstrap(HANDLE process, const std::filesystem::path& dll,
+        const std::filesystem::path& jar, const std::filesystem::path& statusPath) {
+    ReusableBootstrap bootstrap;
+    if (!findReusableBootstrap(process, dll, jar, bootstrap)) return BootstrapReuseResult::NotFound;
+
+    void* restartAddress = remoteBootstrapExport(bootstrap, "RazorClientRestart");
+    if (!restartAddress) {
+        lastInjectError = ERROR_PROC_NOT_FOUND;
+        return BootstrapReuseResult::Failed;
+    }
+
+    const std::wstring path = statusPath.wstring();
+    const size_t bytes = (path.size() + 1) * sizeof(wchar_t);
+    RemoteAllocation remoteStatus(process, bytes);
+    SIZE_T written = 0;
+    if (!remoteStatus || !WriteProcessMemory(process, remoteStatus.get(), path.c_str(), bytes, &written) ||
+            written != bytes) {
+        lastInjectError = GetLastError();
+        return BootstrapReuseResult::Failed;
+    }
+
+    UniqueHandle thread(CreateRemoteThread(process, nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(restartAddress), remoteStatus.get(), 0, nullptr));
+    if (!thread) {
+        lastInjectError = GetLastError();
+        return BootstrapReuseResult::Failed;
+    }
+    const DWORD wait = WaitForSingleObject(thread.get(), 30000);
+    DWORD code = ERROR_GEN_FAILURE;
+    const bool restarted = wait == WAIT_OBJECT_0 && GetExitCodeThread(thread.get(), &code) && code == 0;
+    if (!restarted) {
+        if (wait == WAIT_TIMEOUT) {
+            lastInjectError = WAIT_TIMEOUT;
+            remoteStatus.abandon();
+        } else {
+            lastInjectError = code ? code : GetLastError();
+        }
+        return BootstrapReuseResult::Failed;
+    }
+    writeLauncherLogLine(L"Reused loaded bootstrap " + bootstrap.dllPath.wstring());
+    return BootstrapReuseResult::Restarted;
+}
+
+bool inject(DWORD pid, const std::filesystem::path& dll, const std::filesystem::path& jar,
+        const std::filesystem::path& statusPath, bool& reusedBootstrap) {
     lastInjectError = 0;
-    HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+    reusedBootstrap = false;
+    UniqueHandle process(OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+        PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid));
     if (!process) { lastInjectError = GetLastError(); return false; }
+
+    const BootstrapReuseResult reuse = restartReusableBootstrap(process.get(), dll, jar, statusPath);
+    if (reuse == BootstrapReuseResult::Restarted) {
+        reusedBootstrap = true;
+        return true;
+    }
+    if (reuse == BootstrapReuseResult::Failed) return false;
+
+    void* remoteLoadLibrary = remoteFunctionAddress(process.get(), "LoadLibraryW");
+    if (!remoteLoadLibrary) { lastInjectError = ERROR_PROC_NOT_FOUND; return false; }
     std::wstring path = dll.wstring();
     size_t bytes = (path.size() + 1) * sizeof(wchar_t);
-    void* remote = VirtualAllocEx(process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    bool ok = remote && WriteProcessMemory(process, remote, path.c_str(), bytes, nullptr);
+    RemoteAllocation remote(process.get(), bytes);
+    SIZE_T written = 0;
+    bool ok = remote && WriteProcessMemory(process.get(), remote.get(), path.c_str(), bytes, &written) && written == bytes;
     if (!ok) lastInjectError = GetLastError();
-    HANDLE thread = ok ? CreateRemoteThread(process, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW")), remote, 0, nullptr) : nullptr;
+    UniqueHandle thread(ok ? CreateRemoteThread(process.get(), nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(remoteLoadLibrary), remote.get(), 0, nullptr) : nullptr);
     DWORD wait = WAIT_FAILED;
     if (thread) {
-        wait = WaitForSingleObject(thread, 15000);
+        wait = WaitForSingleObject(thread.get(), 15000);
         DWORD code = 0;
-        GetExitCodeThread(thread, &code);
-        ok = wait == WAIT_OBJECT_0 && code != 0;
-        if (!ok) lastInjectError = wait == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
-        CloseHandle(thread);
+        ok = wait == WAIT_OBJECT_0 && GetExitCodeThread(thread.get(), &code) && code != 0;
+        if (!ok) {
+            if (wait == WAIT_TIMEOUT) lastInjectError = WAIT_TIMEOUT;
+            else if (wait == WAIT_OBJECT_0 && code == 0) lastInjectError = ERROR_DLL_INIT_FAILED;
+            else lastInjectError = GetLastError();
+        }
     } else {
         lastInjectError = GetLastError();
         ok = false;
     }
-    // A timed-out LoadLibraryW thread may still be reading this path.
-    if (remote && wait != WAIT_TIMEOUT) VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-    CloseHandle(process);
+    // A thread that did not signal completion may still be reading this path.
+    if (thread && wait != WAIT_OBJECT_0) remote.abandon();
     return ok;
 }
 
 int selfCheck() {
     writeLauncherLogLine(L"Running one-file self-check");
+    if (!verifyAuthenticode(currentExePath())) {
+        writeLauncherLogLine(L"Self-check failed: launcher signature verification failed");
+        return 1;
+    }
     HMODULE module = appInstance ? appInstance : GetModuleHandleW(nullptr);
     if (!FindResourceW(module, MAKEINTRESOURCEW(IDR_BOOTSTRAP), RT_RCDATA)) {
         writeLauncherLogLine(L"Self-check failed: embedded bootstrap resource missing");
@@ -684,10 +1289,14 @@ int selfCheck() {
         && std::filesystem::file_size(jar, ec) > 0
         && !sha256(dll).empty()
         && !sha256(jar).empty();
+    if (ok) {
+        UniqueModule bootstrap(LoadLibraryExW(dll.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES));
+        ok = bootstrap && GetProcAddress(bootstrap.get(), "RazorClientRestart") != nullptr;
+    }
     writeLauncherLogLine(payloadSummary(L"Self-check bootstrap", dll));
     writeLauncherLogLine(payloadSummary(L"Self-check agent", jar));
     std::filesystem::remove_all(directory, ec);
-    writeLauncherLogLine(ok ? L"Self-check passed" : L"Self-check failed: embedded payload extraction failed");
+    writeLauncherLogLine(ok ? L"Self-check passed" : L"Self-check failed: embedded payload or restart export invalid");
     return ok ? 0 : 6;
 }
 
@@ -777,7 +1386,7 @@ int writeDiagnostics(bool showMessage) {
     bool bootstrapOk = extract(IDR_BOOTSTRAP, L"__missing_adjacent_bootstrap__.dll", dll);
     bool agentOk = extract(IDR_AGENT, L"__missing_adjacent_agent__.jar", jar);
     auto processes = lunarProcesses();
-    LunarBuildDetection lunarBuild = detectLunarBuild();
+    LunarBuildDetection lunarBuild = processes.size() == 1 ? detectLunarBuild(&processes.front()) : detectLunarBuild();
     bool fingerprintOk = lunarBuild.isSupported();
     auto statusPath = latestStatusFile();
     std::string lastPhase = lastPhaseFromStatus(statusPath);
@@ -795,7 +1404,9 @@ int writeDiagnostics(bool showMessage) {
     report << L"Agent SHA-256: " << widen(sha256(jar)) << L"\n";
     report << L"Lunar JVM count: " << processes.size() << L"\n";
     for (const auto& process : processes) {
-        report << L"  PID " << process.pid << L" exe=" << process.exePath << L" jvm=" << process.jvmPath << L"\n";
+        report << L"  PID " << process.pid << L" created=" << process.creationTime
+               << L" x64=" << (process.x64 ? L"yes" : L"no")
+               << L" exe=" << process.exePath << L" jvm=" << process.jvmPath << L"\n";
     }
     report << L"Fingerprint: " << (fingerprintOk ? L"OK" : L"unsupported or missing") << L"\n";
     report << L"Fingerprint detail: " << widen(fingerprintDetail) << L"\n";
@@ -815,7 +1426,7 @@ int writeDiagnostics(bool showMessage) {
     }
     report << L"Last status file: " << (statusPath.empty() ? L"(none)" : statusPath.wstring()) << L"\n";
     report << L"Last phase: " << (lastPhase.empty() ? L"(none)" : widen(lastPhase)) << L"\n";
-    report << L"Launcher status: " << status << L"\n";
+    report << L"Launcher status: " << currentStatus() << L"\n";
 
     auto output = directory / L"diagnostics.txt";
     {
@@ -871,22 +1482,38 @@ AckStatus waitForAck(const std::filesystem::path& statusPath, std::wstring& deta
 }
 
 void performInjection() {
+    injectionExitCode = 1;
     if (!passwordAccepted) {
-        status = L"Enter password NERVE to enable injection.";
+        setStatus(L"Enter password NERVE to enable injection.");
         injectionExitCode = 10;
         writeLauncherLog();
         redraw();
         return;
     }
     auto processes = lunarProcesses();
-    if (processes.size() != 1) { status = processes.empty() ? L"Launch Lunar 1.8.9 first, then press Inject." : L"Multiple Lunar JVMs found; close extra instances."; writeLauncherLog(); redraw(); return; }
+    if (processes.size() != 1) { setStatus(processes.empty() ? L"Launch Lunar 1.8.9 first, then press Inject." : L"Multiple Lunar JVMs found; close extra instances."); writeLauncherLog(); redraw(); return; }
     ProcessCandidate target = processes.front();
     DWORD pid = target.pid;
+    const std::wstring injectionMutexName = L"Local\\RazorClient.Inject." + std::to_wstring(pid);
+    UniqueHandle injectionMutex(CreateMutexW(nullptr, FALSE, injectionMutexName.c_str()));
+    const DWORD mutexWait = injectionMutex ? WaitForSingleObject(injectionMutex.get(), 0) : WAIT_FAILED;
+    if (mutexWait != WAIT_OBJECT_0 && mutexWait != WAIT_ABANDONED) {
+        setStatus(L"Another RazorClient injection is already in progress for this Lunar instance.");
+        writeLauncherLogLine(L"Injection lock unavailable for pid=" + std::to_wstring(pid));
+        writeLauncherLog();
+        redraw();
+        return;
+    }
+    struct InjectionMutexGuard {
+        HANDLE value;
+        ~InjectionMutexGuard() { if (value) ReleaseMutex(value); }
+    } injectionMutexGuard{injectionMutex.get()};
+
     writeLauncherLogLine(L"Selected Lunar JVM pid=" + std::to_wstring(pid) + L" exe=" + target.exePath + L" jvm=" + target.jvmPath);
-    LunarBuildDetection lunarBuild = detectLunarBuild();
+    LunarBuildDetection lunarBuild = detectLunarBuild(&target);
     if (!lunarBuild.isSupported()) {
         writeLauncherLogLine(L"Unsupported Lunar build fingerprint " + widen(fingerprintDetail));
-        status=L"Unsupported Lunar build. This build needs a compatible RazorClient adapter.";
+        setStatus(L"Unsupported Lunar build. This build needs a compatible RazorClient adapter.");
         writeLauncherLog();
         redraw();
         return;
@@ -900,13 +1527,13 @@ void performInjection() {
     auto jar = directory / (L"razorclient-agent-live-" + suffix + L".jar");
     auto statusPath = directory / (L"razorclient-status-live-" + suffix + L".jsonl");
     auto metadataPath = directory / (L"razorclient-build-live-" + suffix + L".properties");
-    status = L"Injecting into Lunar JVM PID " + std::to_wstring(pid) + L"...";
+    setStatus(L"Injecting into Lunar JVM PID " + std::to_wstring(pid) + L"...");
     writeLauncherLog();
     redraw();
     if (!extract(IDR_BOOTSTRAP, L"razorclient-bootstrap.dll", dll)) {
-        status = L"Failed to extract embedded payload: bootstrap DLL.";
+        setStatus(L"Failed to extract embedded payload: bootstrap DLL.");
     } else if (!extract(IDR_AGENT, L"razorclient-agent.jar", jar)) {
-        status = L"Failed to extract embedded payload: agent JAR.";
+        setStatus(L"Failed to extract embedded payload: agent JAR.");
     } else {
         writeLauncherLogLine(payloadSummary(L"Extracted bootstrap", dll));
         writeLauncherLogLine(payloadSummary(L"Extracted agent", jar));
@@ -919,22 +1546,25 @@ void performInjection() {
             metadata << "mappingsHash=" << lunarBuild.mappingsHash << "\n";
         }
         writeLauncherLogLine(L"Build metadata " + metadataPath.wstring());
-        if (!inject(pid, dll)) {
-            status = L"Injection failed. Error " + std::to_wstring(lastInjectError) + L". See %LOCALAPPDATA%\\RazorClient\\bootstrap.log";
+        bool reusedBootstrap = false;
+        if (!inject(pid, dll, jar, statusPath, reusedBootstrap)) {
+            setStatus(L"Injection failed. Error " + std::to_wstring(lastInjectError) + L". See %LOCALAPPDATA%\\RazorClient\\bootstrap.log");
         } else {
-            status = L"Bootstrap loaded; waiting for Java payload confirmation...";
+            setStatus(reusedBootstrap
+                ? L"Bootstrap restarted; waiting for Java payload confirmation..."
+                : L"Bootstrap loaded; waiting for Java payload confirmation...");
             writeLauncherLog();
             redraw();
             std::wstring ackDetail;
             AckStatus ack = waitForAck(statusPath, ackDetail);
             if (ack == AckStatus::Success) {
-                status = L"Injected. Press Right Shift in game.";
+                setStatus(L"Injected. Press Right Shift in game.");
                 injectionExitCode = 0;
             } else if (ack == AckStatus::AlreadyInjected) {
-                status = L"Already injected.";
+                setStatus(L"Already injected.");
                 injectionExitCode = 0;
             } else {
-                status = ackDetail;
+                setStatus(ackDetail);
             }
         }
     }
@@ -980,7 +1610,8 @@ void paintLauncher(HWND hwnd, HDC dc) {
     frameRoundRect(dc, pill, 16, rgb(24, 64, 36));
     SetTextColor(dc, rgb(226, 235, 228));
     RECT statusText{60, 98, client.right - 60, 132};
-    DrawTextW(dc, status.c_str(), -1, &statusText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    const std::wstring displayedStatus = currentStatus();
+    DrawTextW(dc, displayedStatus.c_str(), -1, &statusText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     SetTextColor(dc, embeddedPayloadAvailable() ? rgb(69, 200, 131) : rgb(255, 112, 112));
     RECT payloadText{60, 136, client.right - 60, 158};
@@ -1013,10 +1644,14 @@ void drawButton(const DRAWITEMSTRUCT* item, const wchar_t* text, bool primary) {
 }
 
 void refreshInjectButton() {
+    const bool busy = injectionInProgress.load(std::memory_order_acquire);
     if (injectButton) {
-        EnableWindow(injectButton, passwordAccepted && embeddedPayloadAvailable());
+        EnableWindow(injectButton, !busy && passwordAccepted && embeddedPayloadAvailable());
         InvalidateRect(injectButton, nullptr, TRUE);
     }
+    if (diagnosticsButton) EnableWindow(diagnosticsButton, !busy);
+    if (unlockButton) EnableWindow(unlockButton, !busy);
+    if (passwordEdit) EnableWindow(passwordEdit, !busy);
 }
 
 void unlockPasswordFromUi() {
@@ -1024,14 +1659,35 @@ void unlockPasswordFromUi() {
     GetWindowTextW(passwordEdit, value, 128);
     if (wcscmp(value, L"NERVE") == 0) {
         passwordAccepted = true;
-        status = L"Password accepted. Launch Lunar 1.8.9 first, then press Inject.";
+        setStatus(L"Password accepted. Launch Lunar 1.8.9 first, then press Inject.");
     } else {
         passwordAccepted = false;
-        status = L"Invalid password.";
+        setStatus(L"Invalid password.");
     }
     refreshInjectButton();
     writeLauncherLog();
     redraw();
+}
+
+DWORD WINAPI injectionWorker(void*) {
+    performInjection();
+    if (windowHandle) PostMessageW(windowHandle, WM_INJECTION_FINISHED, 0, 0);
+    return 0;
+}
+
+void beginInjection() {
+    bool expected = false;
+    if (!injectionInProgress.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
+    setStatus(L"Discovering Lunar 1.8.9 runtime...");
+    refreshInjectButton();
+    HANDLE thread = CreateThread(nullptr, 0, injectionWorker, nullptr, 0, nullptr);
+    if (!thread) {
+        injectionInProgress.store(false, std::memory_order_release);
+        setStatus(L"Unable to start injection worker. Error " + std::to_wstring(GetLastError()) + L".");
+        refreshInjectButton();
+        return;
+    }
+    CloseHandle(thread);
 }
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1042,7 +1698,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         editBrush = solidBrush(rgb(8, 16, 10));
         payloadStatus = embeddedPayloadAvailable() ? L"Payload: embedded OK" : L"Invalid release build: embedded payload missing";
         if (!embeddedPayloadAvailable()) {
-            status = L"Invalid release build: embedded payload missing.";
+            setStatus(L"Invalid release build: embedded payload missing.");
         }
         passwordEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
             132, 166, 160, 28, hwnd, reinterpret_cast<HMENU>(4), nullptr, nullptr);
@@ -1062,7 +1718,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
         return 0;
     }
-    if (message == WM_COMMAND && LOWORD(wParam) == 1) { performInjection(); writeLauncherLog(); return 0; }
+    if (message == WM_COMMAND && LOWORD(wParam) == 1) { beginInjection(); return 0; }
     if (message == WM_COMMAND && LOWORD(wParam) == 2) { writeDiagnostics(true); return 0; }
     if (message == WM_COMMAND && LOWORD(wParam) == 3) { unlockPasswordFromUi(); return 0; }
     if (message == WM_DRAWITEM && wParam == 1) { drawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam), L"Inject", true); return TRUE; }
@@ -1075,6 +1731,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return reinterpret_cast<LRESULT>(editBrush ? editBrush : GetStockObject(BLACK_BRUSH));
     }
     if (message == WM_CTLCOLORBTN) { return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH)); }
+    if (message == WM_APP) { redraw(); return 0; }
+    if (message == WM_INJECTION_FINISHED) {
+        injectionInProgress.store(false, std::memory_order_release);
+        refreshInjectButton();
+        writeLauncherLog();
+        redraw();
+        return 0;
+    }
     if (message == WM_ERASEBKGND) { return TRUE; }
     if (message == WM_PAINT) {
         PAINTSTRUCT paint{};
@@ -1084,6 +1748,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return 0;
     }
     if (message == WM_DESTROY) {
+        windowHandle = nullptr;
         if (titleFont) DeleteObject(titleFont);
         if (bodyFont) DeleteObject(bodyFont);
         if (buttonFont) DeleteObject(buttonFont);
@@ -1099,6 +1764,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     appInstance = instance;
     passwordAccepted = commandLineHasPassword();
     if (wcsstr(GetCommandLineW(), L"--inject")) { performInjection(); writeLauncherLog(); return injectionExitCode; }
+    if (wcsstr(GetCommandLineW(), L"--crypto-self-check")) { return cryptoSelfCheck() ? 0 : 20; }
     if (wcsstr(GetCommandLineW(), L"--self-check")) { return selfCheck(); }
     if (wcsstr(GetCommandLineW(), L"--diagnose")) { return writeDiagnostics(false); }
     WNDCLASSW type{}; type.lpfnWndProc=windowProc; type.hInstance=instance; type.lpszClassName=L"RazorClientLauncher"; type.hCursor=LoadCursor(nullptr,IDC_ARROW); type.hbrBackground=solidBrush(rgb(5,8,5)); RegisterClassW(&type);

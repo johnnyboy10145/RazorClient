@@ -5,6 +5,8 @@ import com.razorclient.event.ClientRotationEvent;
 import com.razorclient.event.JumpEvent;
 import com.razorclient.event.StrafeEvent;
 import com.razorclient.runtime.ResourceArbiter;
+import com.razorclient.runtime.OwnerToken;
+import com.razorclient.feature.module.Module;
 import net.minecraft.client.Minecraft;
 import net.minecraft.entity.Entity;
 import net.minecraft.network.play.client.C03PacketPlayer;
@@ -30,6 +32,7 @@ public final class ClientRotationHelper {
     public boolean swappedForMouseOver;
     private boolean swappedForWalkingUpdate;
     private volatile String requestedOwner = "None";
+    private volatile OwnerToken requestedOwnerToken;
     private volatile int requestedPriority = Integer.MIN_VALUE;
     private ResourceArbiter.Lease rotationLease;
     private boolean registered;
@@ -72,18 +75,20 @@ public final class ClientRotationHelper {
         swappedForMouseOver = false;
         swappedForWalkingUpdate = false;
         requestedOwner = "None";
+        requestedOwnerToken = null;
         requestedPriority = Integer.MIN_VALUE;
         rotationLease = null;
     }
 
     public void clearRequestedRotations() {
-        ResourceArbiter arbiter = getArbiter();
-        if (arbiter != null) arbiter.clear(ResourceArbiter.Resource.SERVER_ROTATION);
+        ResourceArbiter.Lease lease = rotationLease;
+        if (lease != null) lease.close();
         serverYaw = null;
         serverPitch = null;
         publishedRotation = null;
         setRotations = false;
         requestedOwner = "None";
+        requestedOwnerToken = null;
         requestedPriority = Integer.MIN_VALUE;
         rotationLease = null;
     }
@@ -91,18 +96,23 @@ public final class ClientRotationHelper {
     public void clearRequestedRotations(String owner) {
         if (owner == null || !owner.equals(requestedOwner)) return;
         ResourceArbiter arbiter = getArbiter();
-        if (arbiter != null) arbiter.releaseOwner(owner, ResourceArbiter.Resource.SERVER_ROTATION);
+        if (arbiter != null) arbiter.releaseOwner(requestedOwnerToken, ResourceArbiter.Resource.SERVER_ROTATION);
         serverYaw = null;
         serverPitch = null;
         publishedRotation = null;
         setRotations = false;
         requestedOwner = "None";
+        requestedOwnerToken = null;
         requestedPriority = Integer.MIN_VALUE;
         rotationLease = null;
     }
 
     public boolean requestRotations(String owner, int priority, float yaw, float pitch) {
-        if (owner == null || owner.isEmpty() || priority < requestedPriority
+        return requestRotations(findOwnerToken(owner), priority, yaw, pitch);
+    }
+
+    public boolean requestRotations(OwnerToken owner, int priority, float yaw, float pitch) {
+        if (owner == null || priority < requestedPriority
                 || !Float.isFinite(yaw) || !Float.isFinite(pitch)) {
             return false;
         }
@@ -113,7 +123,8 @@ public final class ClientRotationHelper {
             if (lease == null) return false;
             rotationLease = lease;
         }
-        requestedOwner = owner;
+        requestedOwnerToken = owner;
+        requestedOwner = owner.getModuleName();
         requestedPriority = priority;
         serverYaw = Float.valueOf(yaw);
         serverPitch = Float.valueOf(pitch);
@@ -186,7 +197,7 @@ public final class ClientRotationHelper {
             float publishedYaw = serverYaw == null ? minecraft.thePlayer.rotationYaw : serverYaw.floatValue();
             float publishedPitch = serverPitch == null ? minecraft.thePlayer.rotationPitch : serverPitch.floatValue();
             if (Float.isFinite(publishedYaw) && Float.isFinite(publishedPitch)) {
-                publishedRotation = new RotationSnapshot(requestedOwner, publishedYaw, publishedPitch);
+                publishedRotation = new RotationSnapshot(requestedOwnerToken, publishedYaw, publishedPitch);
             } else {
                 publishedRotation = null;
                 setRotations = false;
@@ -329,11 +340,11 @@ public final class ClientRotationHelper {
     }
 
     private static final class RotationSnapshot {
-        private final String owner;
+        private final OwnerToken owner;
         private final float yaw;
         private final float pitch;
 
-        private RotationSnapshot(String owner, float yaw, float pitch) {
+        private RotationSnapshot(OwnerToken owner, float yaw, float pitch) {
             this.owner = owner;
             this.yaw = yaw;
             this.pitch = pitch;
@@ -343,6 +354,15 @@ public final class ClientRotationHelper {
     private static ResourceArbiter getArbiter() {
         RazorClient client = RazorClient.getInstance();
         return client == null ? null : client.getModuleManager().getResourceArbiter();
+    }
+
+    private static OwnerToken findOwnerToken(String owner) {
+        RazorClient client = RazorClient.getInstance();
+        if (client == null || owner == null) return null;
+        for (Module module : client.getModuleManager().getModules()) {
+            if (owner.equals(module.getName())) return module.getScope().getOwnerToken();
+        }
+        return null;
     }
 
     private static double getDirection(float rotationYaw, double moveForward, double moveStrafing) {

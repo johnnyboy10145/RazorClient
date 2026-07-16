@@ -2,8 +2,10 @@ package com.razorclient.network;
 
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.module.ModuleManager;
-import com.razorclient.feature.module.ModuleManager.PacketDelaySelection;
+import com.razorclient.network.PacketDecision;
+import com.razorclient.network.PacketReleasePolicy;
 import com.razorclient.inject.AgentLog;
+import com.razorclient.runtime.OwnerToken;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
@@ -14,6 +16,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -55,6 +58,10 @@ public final class PacketDelayManager {
     private final ModuleManager moduleManager;
     private final Queue<QueuedOutboundPacket> outboundQueue = new ArrayDeque<QueuedOutboundPacket>();
     private final Queue<QueuedInboundPacket> inboundQueue = new ArrayDeque<QueuedInboundPacket>();
+    private final List<QueuedOutboundPacket> outboundReleaseBatch =
+        new ArrayList<QueuedOutboundPacket>(MAX_OUTBOUND_RELEASES_PER_TICK);
+    private final Set<String> blockedOutboundDomains = new HashSet<String>();
+    private final Set<String> blockedInboundDomains = new HashSet<String>();
     private final Map<Packet<?>, Long> outboundFastTrack = Collections.synchronizedMap(
         new IdentityHashMap<Packet<?>, Long>()
     );
@@ -181,15 +188,16 @@ public final class PacketDelayManager {
         }
         bindConnection(connection);
 
-        moduleManager.onOutboundPacket(packet);
-        PacketDelaySelection selection = moduleManager.selectOutboundPacketDelay(packet);
-        boolean requestedDelay = selection.isIndefinite() || selection.getDelay() > 0;
-        Module owner = selection.getOwner();
-        long ownerGeneration = owner == null ? 0L : owner.getEnableGeneration();
-        if (requestedDelay && owner == null) return false;
+        PacketDecision decision = moduleManager.captureOutboundPacketDecision(packet);
+        boolean requestedDelay = decision.isHeld();
+        boolean flushThenPass = decision.getAction() == PacketDecision.Action.FLUSH_THEN_PASS;
+        Module owner = decision.getOwner();
+        OwnerToken ownerToken = decision.getOwnerToken();
+        if (requestedDelay && (owner == null || ownerToken == null)) return false;
 
         boolean overflow = false;
         boolean rejected = false;
+        boolean overflowPassThrough = false;
         Throwable rejectionFailure = null;
         OutboundCompletion completion = new OutboundCompletion(listeners, originalPromise);
         synchronized (outboundQueue) {
@@ -197,39 +205,36 @@ public final class PacketDelayManager {
                 rejected = true;
                 rejectionFailure = new ClosedChannelException();
             }
+            if (!rejected && flushThenPass && ownerToken != null) {
+                markOwnerReady(outboundQueue, ownerToken);
+                lastFlushReason = "Flush then pass: " + owner.getName();
+            }
             // A ready transport barrier keeps later pass-through packets behind a
             // partially drained lane without assigning them to another module.
             if (!rejected && !requestedDelay && outboundQueue.isEmpty()) return false;
-            if (!rejected && !requestedDelay && canBypassOutboundOrdering(outboundQueue, packet)) return false;
-            if (!rejected && owner != null && (countOwner(outboundQueue, owner, ownerGeneration)
+            if (!rejected && !requestedDelay && !flushThenPass
+                    && canBypassOutboundOrdering(outboundQueue, packet)) return false;
+            if (!rejected && owner != null && (countOwner(outboundQueue, ownerToken)
                     >= OUTBOUND_OWNER_HIGH_WATER || outboundQueue.size() >= OUTBOUND_OVERFLOW_HIGH_WATER)) {
-                compactMovementRuns(owner, ownerGeneration);
+                compactMovementRuns(owner, ownerToken);
             }
             if (!rejected && outboundQueue.size() >= OUTBOUND_OVERFLOW_HIGH_WATER) {
-                Map<Module, Set<Long>> lanes = new IdentityHashMap<Module, Set<Long>>();
+                Set<OwnerToken> lanes = new LinkedHashSet<OwnerToken>();
                 for (QueuedOutboundPacket queued : outboundQueue) {
-                    Set<Long> generations = lanes.get(queued.owner);
-                    if (generations == null) {
-                        generations = new LinkedHashSet<Long>();
-                        lanes.put(queued.owner, generations);
-                    }
-                    generations.add(Long.valueOf(queued.ownerGeneration));
+                    if (queued.ownerToken != null) lanes.add(queued.ownerToken);
                 }
-                for (Map.Entry<Module, Set<Long>> lane : lanes.entrySet()) {
-                    for (Long generation : lane.getValue()) {
-                        compactMovementRuns(lane.getKey(), generation.longValue());
-                    }
+                for (OwnerToken token : lanes) {
+                    compactMovementRuns(findOwner(outboundQueue, token), token);
                 }
             }
-            int ownerQueueSize = owner == null ? 0 : countOwner(outboundQueue, owner, ownerGeneration);
+            int ownerQueueSize = owner == null ? 0 : countOwner(outboundQueue, ownerToken);
             if (!rejected && owner != null && ownerQueueSize >= OUTBOUND_OWNER_HIGH_WATER) {
-                markOwnerReady(outboundQueue, owner, ownerGeneration);
+                markOwnerReady(outboundQueue, ownerToken);
                 lastFlushReason = "Outbound owner overflow: " + owner.getName();
                 overflow = true;
             }
             if (!rejected && owner != null && ownerQueueSize >= MAX_OUTBOUND_OWNER_QUEUE_SIZE) {
-                rejected = true;
-                rejectionFailure = new IllegalStateException("Outbound owner queue overflow");
+                overflowPassThrough = true;
             }
             if (!rejected && outboundQueue.size() >= OUTBOUND_OVERFLOW_HIGH_WATER) {
                 markAllReadyLocked(outboundQueue);
@@ -237,19 +242,19 @@ public final class PacketDelayManager {
                 overflow = true;
             }
             if (!rejected && outboundQueue.size() >= MAX_OUTBOUND_QUEUE_SIZE) {
-                rejected = true;
-                rejectionFailure = new IllegalStateException("Outbound packet queue overflow");
+                overflowPassThrough = true;
             }
-            if (!rejected) {
+            if (!rejected && !overflowPassThrough) {
                 long now = monotonicMillis();
                 outboundQueue.add(new QueuedOutboundPacket(
                     packet,
                     owner,
-                    ownerGeneration,
+                    ownerToken,
                     connection,
-                    requestedDelay ? deadline(now, selection) : 0L,
-                    requestedDelay && selection.isIndefinite(),
-                    completion
+                    requestedDelay ? deadline(now, decision) : 0L,
+                    decision.getReleasePolicy() == PacketReleasePolicy.EXPLICIT_FLUSH,
+                    completion,
+                    decision.getLane()
                 ));
             }
         }
@@ -258,6 +263,7 @@ public final class PacketDelayManager {
             logOverflow("outbound", ownerName);
             moduleManager.onPacketDelayOverflow(owner, true);
         }
+        if (overflowPassThrough) return false;
         if (rejected) completion.fail(rejectionFailure == null
             ? new IllegalStateException("Outbound packet rejected") : rejectionFailure, connection);
         return true;
@@ -288,22 +294,21 @@ public final class PacketDelayManager {
         if (connection == null || connection != currentNetworkManager()) return true;
         bindConnection(connection);
 
-        moduleManager.onInboundPacket(packet);
-        PacketDelaySelection selection = moduleManager.selectInboundPacketDelay(packet);
-        boolean requestedDelay = selection.isIndefinite() || selection.getDelay() > 0;
-        if (!requestedDelay && moduleManager.shouldCancelInboundPacket(packet)) return true;
-        Module owner = selection.getOwner();
-        long ownerGeneration = owner == null ? 0L : owner.getEnableGeneration();
-        if (requestedDelay && owner == null) return false;
+        PacketDecision decision = moduleManager.captureInboundPacketDecision(packet);
+        boolean requestedDelay = decision.isHeld();
+        if (!requestedDelay && decision.isCancelled()) return true;
+        Module owner = decision.getOwner();
+        OwnerToken ownerToken = decision.getOwnerToken();
+        if (requestedDelay && (owner == null || ownerToken == null)) return false;
 
         boolean overflow = false;
         boolean rejected = false;
         synchronized (inboundQueue) {
             if (closed) return true;
             if (!requestedDelay && inboundQueue.isEmpty()) return false;
-            int ownerQueueSize = owner == null ? 0 : countOwner(inboundQueue, owner, ownerGeneration);
+            int ownerQueueSize = owner == null ? 0 : countOwner(inboundQueue, ownerToken);
             if (owner != null && ownerQueueSize >= INBOUND_OWNER_HIGH_WATER) {
-                markOwnerReady(inboundQueue, owner, ownerGeneration);
+                markOwnerReady(inboundQueue, ownerToken);
                 lastFlushReason = "Inbound owner overflow: " + owner.getName();
                 overflow = true;
             }
@@ -322,11 +327,13 @@ public final class PacketDelayManager {
                 inboundQueue.add(new QueuedInboundPacket(
                     packet,
                     owner,
-                    ownerGeneration,
+                    ownerToken,
                     connection,
-                    requestedDelay ? deadline(now, selection) : 0L,
-                    requestedDelay && selection.isIndefinite(),
-                    createInboundAction(packet, listener)
+                    requestedDelay ? deadline(now, decision) : 0L,
+                    decision.getReleasePolicy() == PacketReleasePolicy.EXPLICIT_FLUSH,
+                    createInboundAction(packet, listener),
+                    decision.shouldCancelOnRelease(),
+                    decision.getLane()
                 ));
                 if (inboundQueue.size() >= INBOUND_RESUME_QUEUE_SIZE) pauseInbound(context);
             }
@@ -337,7 +344,7 @@ public final class PacketDelayManager {
             logOverflow("inbound", ownerName);
             moduleManager.onPacketDelayOverflow(owner, false);
         }
-        return true;
+        return !rejected;
     }
 
     private void pauseInbound(ChannelHandlerContext context) {
@@ -356,14 +363,15 @@ public final class PacketDelayManager {
     }
 
     private void consumeOwnerFlushRequests() {
-        for (Module module : moduleManager.getModules()) {
+        for (int index = 0; index < moduleManager.getPacketPolicyModuleCount(); index++) {
+            Module module = moduleManager.getPacketPolicyModule(index);
             int requests = moduleManager.consumePacketFlushRequests(module);
             boolean both = (requests & 1) != 0;
             boolean outbound = (requests & 2) != 0;
             boolean inbound = (requests & 4) != 0;
-            long generation = module.getEnableGeneration();
-            if (both || outbound) markOwnerReady(outboundQueue, module, generation);
-            if (both || inbound) markOwnerReady(inboundQueue, module, generation);
+            OwnerToken token = module.getScope().getOwnerToken();
+            if (both || outbound) markOwnerReady(outboundQueue, token);
+            if (both || inbound) markOwnerReady(inboundQueue, token);
             if (both || outbound || inbound) {
                 lastFlushReason = "Owner request: " + module.getName();
             }
@@ -374,7 +382,7 @@ public final class PacketDelayManager {
         synchronized (outboundQueue) {
             for (QueuedOutboundPacket packet : outboundQueue) {
                 if (packet.owner != null && (!packet.owner.isEnabled()
-                        || packet.ownerGeneration != packet.owner.getEnableGeneration()
+                        || !packet.ownerToken.equals(packet.owner.getScope().getOwnerToken())
                         || (packet.indefinite && !moduleManager.isPacketDelayOwnerActive(packet.owner, true)))) {
                     packet.makeReady();
                 }
@@ -383,7 +391,7 @@ public final class PacketDelayManager {
         synchronized (inboundQueue) {
             for (QueuedInboundPacket packet : inboundQueue) {
                 if (packet.owner != null && (!packet.owner.isEnabled()
-                        || packet.ownerGeneration != packet.owner.getEnableGeneration()
+                        || !packet.ownerToken.equals(packet.owner.getScope().getOwnerToken())
                         || (packet.indefinite && !moduleManager.isPacketDelayOwnerActive(packet.owner, false)))) {
                     packet.makeReady();
                 }
@@ -392,21 +400,31 @@ public final class PacketDelayManager {
     }
 
     private void drainReadyOutbound(int limit) {
-        List<QueuedOutboundPacket> ready;
+        outboundReleaseBatch.clear();
         synchronized (outboundQueue) {
-            ready = pollReadyOutboundLocked(monotonicMillis(), limit);
+            pollReadyOutboundLocked(monotonicMillis(), limit, outboundReleaseBatch);
         }
-        for (QueuedOutboundPacket packet : ready) releaseOutbound(packet);
+        for (int index = 0; index < outboundReleaseBatch.size(); index++) {
+            releaseOutbound(outboundReleaseBatch.get(index));
+        }
+        outboundReleaseBatch.clear();
     }
 
-    private List<QueuedOutboundPacket> pollReadyOutboundLocked(long now, int limit) {
-        List<QueuedOutboundPacket> ready = new ArrayList<QueuedOutboundPacket>(Math.min(limit, outboundQueue.size()));
-        while (ready.size() < limit && !outboundQueue.isEmpty()) {
-            QueuedOutboundPacket next = outboundQueue.peek();
-            if (!next.isReady(now)) break;
-            ready.add(outboundQueue.poll());
+    private void pollReadyOutboundLocked(long now, int limit, List<QueuedOutboundPacket> ready) {
+        blockedOutboundDomains.clear();
+        java.util.Iterator<QueuedOutboundPacket> iterator = outboundQueue.iterator();
+        while (iterator.hasNext() && ready.size() < limit) {
+            QueuedOutboundPacket next = iterator.next();
+            String domain = next.lane.getDependencyDomain();
+            if (blockedOutboundDomains.contains(domain)) continue;
+            if (!next.isReady(now)) {
+                blockedOutboundDomains.add(domain);
+                continue;
+            }
+            iterator.remove();
+            ready.add(next);
         }
-        return ready;
+        blockedOutboundDomains.clear();
     }
 
     private void drainReadyInbound(int limit, long budgetNanos) {
@@ -415,13 +433,31 @@ public final class PacketDelayManager {
         while (released < limit && System.nanoTime() - started < budgetNanos) {
             QueuedInboundPacket next;
             synchronized (inboundQueue) {
-                next = inboundQueue.peek();
-                if (next == null || !next.isReady(monotonicMillis())) break;
-                inboundQueue.poll();
+                next = pollReadyInboundLocked(monotonicMillis());
             }
+            if (next == null) break;
             releaseInbound(next);
             released++;
         }
+    }
+
+    private QueuedInboundPacket pollReadyInboundLocked(long now) {
+        blockedInboundDomains.clear();
+        java.util.Iterator<QueuedInboundPacket> iterator = inboundQueue.iterator();
+        while (iterator.hasNext()) {
+            QueuedInboundPacket next = iterator.next();
+            String domain = next.lane.getDependencyDomain();
+            if (blockedInboundDomains.contains(domain)) continue;
+            if (!next.isReady(now)) {
+                blockedInboundDomains.add(domain);
+                continue;
+            }
+            iterator.remove();
+            blockedInboundDomains.clear();
+            return next;
+        }
+        blockedInboundDomains.clear();
+        return null;
     }
 
     private void releaseOutbound(QueuedOutboundPacket queuedPacket) {
@@ -448,9 +484,7 @@ public final class PacketDelayManager {
     private void releaseInbound(QueuedInboundPacket queuedPacket) {
         if (currentNetworkManager() != queuedPacket.connection) return;
         moduleManager.onInboundPacketReleased(queuedPacket.packet);
-        if (moduleManager.shouldCancelInboundPacket(queuedPacket.packet)) {
-            return;
-        }
+        if (queuedPacket.cancelOnRelease) return;
         try {
             queuedPacket.action.run();
         } catch (Exception failure) {
@@ -541,14 +575,14 @@ public final class PacketDelayManager {
     }
 
     /** Overflow-only compaction; normal and requested releases remain byte-for-byte ordered. */
-    private void compactMovementRuns(Module owner, long ownerGeneration) {
+    private void compactMovementRuns(Module owner, OwnerToken ownerToken) {
         if (outboundQueue.size() < 2) return;
 
         ArrayDeque<QueuedOutboundPacket> rebuilt = new ArrayDeque<QueuedOutboundPacket>(outboundQueue.size());
         List<QueuedOutboundPacket> run = new ArrayList<QueuedOutboundPacket>();
         while (!outboundQueue.isEmpty()) {
             QueuedOutboundPacket packet = outboundQueue.poll();
-            if (packet.owner == owner && packet.ownerGeneration == ownerGeneration
+            if (packet.owner == owner && ownerToken.equals(packet.ownerToken)
                     && packet.packet instanceof C03PacketPlayer) {
                 run.add(packet);
                 continue;
@@ -613,21 +647,22 @@ public final class PacketDelayManager {
         } else {
             merged = new C03PacketPlayer(onGround);
         }
-        destination.add(new QueuedOutboundPacket(merged, last.owner, last.ownerGeneration,
-            last.connection, releaseAt, indefinite, completions));
+        destination.add(new QueuedOutboundPacket(merged, last.owner, last.ownerToken,
+            last.connection, releaseAt, indefinite, completions, last.lane));
         run.clear();
     }
 
-    private static long deadline(long now, PacketDelaySelection selection) {
-        if (selection.isIndefinite()) return Long.MAX_VALUE;
-        return now + Math.max(0, selection.getDelay());
+    private static long deadline(long now, PacketDecision decision) {
+        if (decision.getReleasePolicy() == PacketReleasePolicy.EXPLICIT_FLUSH) return Long.MAX_VALUE;
+        return now + Math.max(0, decision.getDelayMillis());
     }
 
     private static <T extends OwnedQueuedPacket> void markOwnerReady(
-            Queue<T> queue, Module owner, long ownerGeneration) {
+            Queue<T> queue, OwnerToken ownerToken) {
+        if (ownerToken == null) return;
         synchronized (queue) {
             for (T packet : queue) {
-                if (packet.owner == owner && packet.ownerGeneration == ownerGeneration) packet.makeReady();
+                if (ownerToken.equals(packet.ownerToken)) packet.makeReady();
             }
         }
     }
@@ -637,12 +672,21 @@ public final class PacketDelayManager {
     }
 
     private static <T extends OwnedQueuedPacket> int countOwner(
-            Queue<T> queue, Module owner, long ownerGeneration) {
+            Queue<T> queue, OwnerToken ownerToken) {
+        if (ownerToken == null) return 0;
         int count = 0;
         for (T packet : queue) {
-            if (packet.owner == owner && packet.ownerGeneration == ownerGeneration) count++;
+            if (ownerToken.equals(packet.ownerToken)) count++;
         }
         return count;
+    }
+
+    private static <T extends OwnedQueuedPacket> Module findOwner(Queue<T> queue, OwnerToken ownerToken) {
+        if (ownerToken == null) return null;
+        for (T packet : queue) {
+            if (ownerToken.equals(packet.ownerToken)) return packet.owner;
+        }
+        return null;
     }
 
     private static <T extends OwnedQueuedPacket> String ownerSummary(Queue<T> queue) {
@@ -721,18 +765,21 @@ public final class PacketDelayManager {
 
     private abstract static class OwnedQueuedPacket {
         protected final Module owner;
-        protected final long ownerGeneration;
+        protected final OwnerToken ownerToken;
         protected final NetworkManager connection;
+        protected final PacketLane lane;
         protected long releaseAt;
         protected boolean indefinite;
 
-        private OwnedQueuedPacket(Module owner, long ownerGeneration, NetworkManager connection,
-                long releaseAt, boolean indefinite) {
+        private OwnedQueuedPacket(Module owner, OwnerToken ownerToken, NetworkManager connection,
+                long releaseAt, boolean indefinite, PacketLane lane) {
             this.owner = owner;
-            this.ownerGeneration = ownerGeneration;
+            this.ownerToken = ownerToken;
             this.connection = connection;
             this.releaseAt = releaseAt;
             this.indefinite = indefinite;
+            this.lane = lane == null
+                ? new PacketLane(null, PacketLane.Direction.OUTBOUND, "transport") : lane;
         }
 
         protected final boolean isReady(long now) {
@@ -752,25 +799,28 @@ public final class PacketDelayManager {
         private QueuedOutboundPacket(
             Packet<?> packet,
             Module owner,
-            long ownerGeneration,
+            OwnerToken ownerToken,
             NetworkManager connection,
             long releaseAt,
             boolean indefinite,
-            OutboundCompletion completion
+            OutboundCompletion completion,
+            PacketLane lane
         ) {
-            this(packet, owner, ownerGeneration, connection, releaseAt, indefinite, Collections.singletonList(completion));
+            this(packet, owner, ownerToken, connection, releaseAt, indefinite,
+                Collections.singletonList(completion), lane);
         }
 
         private QueuedOutboundPacket(
             Packet<?> packet,
             Module owner,
-            long ownerGeneration,
+            OwnerToken ownerToken,
             NetworkManager connection,
             long releaseAt,
             boolean indefinite,
-            List<OutboundCompletion> completions
+            List<OutboundCompletion> completions,
+            PacketLane lane
         ) {
-            super(owner, ownerGeneration, connection, releaseAt, indefinite);
+            super(owner, ownerToken, connection, releaseAt, indefinite, lane);
             this.packet = packet;
             this.completions = completions;
         }
@@ -862,19 +912,23 @@ public final class PacketDelayManager {
     private static final class QueuedInboundPacket extends OwnedQueuedPacket {
         private final Packet<?> packet;
         private final Runnable action;
+        private final boolean cancelOnRelease;
 
         private QueuedInboundPacket(
             Packet<?> packet,
             Module owner,
-            long ownerGeneration,
+            OwnerToken ownerToken,
             NetworkManager connection,
             long releaseAt,
             boolean indefinite,
-            Runnable action
+            Runnable action,
+            boolean cancelOnRelease,
+            PacketLane lane
         ) {
-            super(owner, ownerGeneration, connection, releaseAt, indefinite);
+            super(owner, ownerToken, connection, releaseAt, indefinite, lane);
             this.packet = packet;
             this.action = action;
+            this.cancelOnRelease = cancelOnRelease;
         }
     }
 }

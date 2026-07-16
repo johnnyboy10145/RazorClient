@@ -12,8 +12,8 @@ import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.DecimalSetting;
 import com.razorclient.feature.setting.NumberSetting;
-import com.razorclient.runtime.EntitySnapshotService.ProjectileSnapshot;
-import com.razorclient.runtime.EntitySnapshotService.SnapshotFrame;
+import com.razorclient.runtime.EntityFrame;
+import com.razorclient.runtime.EntityRecord;
 import java.util.Random;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.EntityRenderer;
@@ -235,14 +235,14 @@ public final class AntiFireballModule extends Module {
         float fovValue = (float) fov.getValue();
         EntityFireball best = null;
         double bestDistance = Double.MAX_VALUE;
-        SnapshotFrame frame = client.getModuleManager().getEntitySnapshots().current();
-        for (int index = 0; index < frame.getProjectileCount(); index++) {
-            ProjectileSnapshot snapshot = frame.getProjectile(index);
+        EntityFrame frame = client.getModuleManager().getEntityFrame();
+        for (int index = 0; index < frame.size(); index++) {
+            EntityRecord snapshot = frame.get(index);
             if (!snapshot.isFireball() || snapshot.isDead()) {
                 continue;
             }
 
-            Entity entity = snapshot.getEntity();
+            Entity entity = minecraft.theWorld.getEntityByID(snapshot.getEntityId());
             if (!(entity instanceof EntityFireball)) {
                 continue;
             }
@@ -251,7 +251,7 @@ public final class AntiFireballModule extends Module {
                 continue;
             }
 
-            double distanceSq = snapshot.getDistanceSquared();
+            double distanceSq = snapshot.getDistanceToHitbox() * snapshot.getDistanceToHitbox();
             if (distanceSq > rangeSq) {
                 continue;
             }

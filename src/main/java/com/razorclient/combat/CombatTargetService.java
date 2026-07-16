@@ -3,7 +3,8 @@ package com.razorclient.combat;
 import com.razorclient.RazorClient;
 import com.razorclient.feature.module.impl.AntiBotModule;
 import com.razorclient.feature.module.impl.TeamsModule;
-import com.razorclient.runtime.EntitySnapshotService.EntitySnapshot;
+import com.razorclient.runtime.EntityFrame;
+import com.razorclient.runtime.EntityRecord;
 import java.util.HashMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -21,10 +22,6 @@ public final class CombatTargetService {
     private static Object cachedWorld;
     private static int cachedTick = Integer.MIN_VALUE;
     private static boolean candidateCacheBuilt;
-    private static Object publishedWorld;
-    private static int publishedTick = Integer.MIN_VALUE;
-    private static int publishedTargetId = -1;
-    private static int publishedPriority = Integer.MIN_VALUE;
 
     private CombatTargetService() {
     }
@@ -35,7 +32,7 @@ public final class CombatTargetService {
                 || entity == minecraft.thePlayer || entity.isDead || entity.deathTime != 0 || entity.getHealth() <= 0.0F) {
             return false;
         }
-        EntitySnapshot snapshot = snapshot(entity);
+        EntityRecord snapshot = snapshot(minecraft, entity);
         if (snapshot != null && snapshot.isDead()) return false;
         if (entity instanceof EntityPlayer) {
             if (!players || AntiBotModule.shouldIgnore((EntityPlayer) entity)) {
@@ -61,7 +58,7 @@ public final class CombatTargetService {
         if (minecraft == null || minecraft.thePlayer == null || minecraft.theWorld == null || entity == null) {
             return Double.MAX_VALUE;
         }
-        EntitySnapshot snapshot = snapshot(entity);
+        EntityRecord snapshot = snapshot(minecraft, entity);
         if (snapshot != null) return snapshot.getDistanceToHitbox();
         resetCacheIfNeeded(minecraft);
         Integer id = Integer.valueOf(entity.getEntityId());
@@ -85,8 +82,13 @@ public final class CombatTargetService {
             candidateCacheBuilt = true;
             RazorClient client = RazorClient.getInstance();
             if (client != null) {
-                for (EntitySnapshot snapshot : client.getModuleManager().getEntitySnapshots().current()) {
-                    if (snapshot.getEntity() != null) CANDIDATE_CACHE.add(snapshot.getEntity());
+                EntityFrame frame = client.getModuleManager().getEntityFrame();
+                for (int index = 0; index < frame.size(); index++) {
+                    EntityRecord snapshot = frame.get(index);
+                    if (snapshot == null || (!snapshot.isPlayer()
+                            && snapshot.getKind() != EntityRecord.Kind.LIVING)) continue;
+                    net.minecraft.entity.Entity entity = minecraft.theWorld.getEntityByID(snapshot.getEntityId());
+                    if (entity instanceof EntityLivingBase) CANDIDATE_CACHE.add((EntityLivingBase) entity);
                 }
             }
         }
@@ -99,32 +101,6 @@ public final class CombatTargetService {
         cachedWorld = null;
         cachedTick = Integer.MIN_VALUE;
         candidateCacheBuilt = false;
-        publishedWorld = null;
-        publishedTick = Integer.MIN_VALUE;
-        publishedTargetId = -1;
-        publishedPriority = Integer.MIN_VALUE;
-    }
-
-    /** Publishes a read-only, one-tick combat target for visual consumers. */
-    public static void publishTarget(Minecraft minecraft, EntityLivingBase target, int priority) {
-        if (minecraft == null || minecraft.theWorld == null || minecraft.thePlayer == null || target == null) return;
-        int tick = minecraft.thePlayer.ticksExisted;
-        if (publishedWorld != minecraft.theWorld || publishedTick != tick) {
-            publishedWorld = minecraft.theWorld;
-            publishedTick = tick;
-            publishedTargetId = -1;
-            publishedPriority = Integer.MIN_VALUE;
-        }
-        if (priority >= publishedPriority) {
-            publishedPriority = priority;
-            publishedTargetId = target.getEntityId();
-        }
-    }
-
-    public static int getPublishedTargetId(Minecraft minecraft) {
-        if (minecraft == null || minecraft.thePlayer == null || publishedWorld != minecraft.theWorld
-                || publishedTick < minecraft.thePlayer.ticksExisted - 1) return -1;
-        return publishedTargetId;
     }
 
     private static void resetCacheIfNeeded(Minecraft minecraft) {
@@ -142,10 +118,10 @@ public final class CombatTargetService {
         return Math.max(minimum, Math.min(maximum, value));
     }
 
-    private static EntitySnapshot snapshot(EntityLivingBase entity) {
+    private static EntityRecord snapshot(Minecraft minecraft, EntityLivingBase entity) {
         RazorClient client = RazorClient.getInstance();
-        if (client == null || entity == null) return null;
-        EntitySnapshot snapshot = client.getModuleManager().getEntitySnapshots().find(entity.getEntityId());
-        return snapshot != null && snapshot.getEntity() == entity ? snapshot : null;
+        if (client == null || minecraft == null || minecraft.theWorld == null || entity == null
+                || minecraft.theWorld.getEntityByID(entity.getEntityId()) != entity) return null;
+        return client.getModuleManager().getEntityFrame().find(entity.getEntityId());
     }
 }

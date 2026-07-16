@@ -122,7 +122,6 @@ public final class BlinkModule extends Module {
     @Override
     public boolean shouldHoldOutboundPacket(Packet<?> packet) {
         if (packet == triggerBypassPacket) {
-            triggerBypassPacket = null;
             heldOutboundPackets = true;
             return true;
         }
@@ -130,6 +129,13 @@ public final class BlinkModule extends Module {
         if (!activeDirection.outbound || bypassesProtocolPacket(packet)) return false;
         heldOutboundPackets = true;
         if (statusUntil == 0L) status = Status.HOLDING;
+        return true;
+    }
+
+    @Override
+    public boolean shouldFlushThenPassOutboundPacket(Packet<?> packet) {
+        if (packet != triggerBypassPacket) return false;
+        triggerBypassPacket = null;
         return true;
     }
 

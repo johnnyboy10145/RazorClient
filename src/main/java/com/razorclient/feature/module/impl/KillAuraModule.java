@@ -458,7 +458,8 @@ public final class KillAuraModule extends Module {
         }
 
         target = (EntityLivingBase) entity;
-        CombatTargetService.publishTarget(Minecraft.getMinecraft(), target, 100);
+        getContext().getTargetPublications().publish(getScope().getOwnerToken(), target.getEntityId(), 100,
+            getContext().getTick());
     }
 
     private void clearTargetState() {
