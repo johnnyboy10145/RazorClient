@@ -14,6 +14,8 @@ public final class ResourceArbiter {
         MODEL_ROTATION,
         ATTACK_ACTION,
         USE_ACTION,
+        FORWARD_INPUT,
+        JUMP_INPUT,
         SNEAK_INPUT,
         SPRINT_INPUT,
         HOTBAR_SLOT,
@@ -21,6 +23,7 @@ public final class ResourceArbiter {
     }
 
     private final Map<Resource, Lease> leases = new EnumMap<Resource, Lease>(Resource.class);
+    private final Map<Resource, Long> consumedActionTicks = new EnumMap<Resource, Long>(Resource.class);
     private long tickSequence;
     private long generation;
 
@@ -32,11 +35,17 @@ public final class ResourceArbiter {
         Lease acquired;
         synchronized (this) {
             int lifetime = Math.max(1, durationTicks);
+            if (isOneShotAction(resource)) {
+                Long consumedAt = consumedActionTicks.get(resource);
+                if (consumedAt != null && consumedAt.longValue() == tickSequence) return null;
+            }
             Lease current = leases.get(resource);
             if (current != null && current.valid) {
                 if (current.owner.equals(owner)) {
                     current.priority = priority;
-                    current.expiresAt = tickSequence + lifetime;
+                    // A second same-owner request may add information, but it
+                    // must never shorten a lease already held by the module.
+                    current.expiresAt = Math.max(current.expiresAt, tickSequence + lifetime);
                     if (restoreAction != null) current.restoreAction = restoreAction;
                     return current;
                 }
@@ -47,6 +56,9 @@ public final class ResourceArbiter {
             acquired = new Lease(this, resource, owner, priority, tickSequence + lifetime, ++generation,
                 restoreAction);
             leases.put(resource, acquired);
+            if (isOneShotAction(resource)) {
+                consumedActionTicks.put(resource, Long.valueOf(tickSequence));
+            }
         }
         restore(displaced);
         return acquired.isValid() ? acquired : null;
@@ -105,6 +117,7 @@ public final class ResourceArbiter {
         synchronized (this) {
             active = new ArrayList<Lease>(leases.values());
             leases.clear();
+            consumedActionTicks.clear();
             for (Lease lease : active) markInvalid(lease);
         }
         restoreAll(active);
@@ -115,6 +128,7 @@ public final class ResourceArbiter {
         synchronized (this) {
             released = leases.remove(resource);
             if (released != null) markInvalid(released);
+            if (isOneShotAction(resource)) consumedActionTicks.remove(resource);
         }
         restore(released);
     }
@@ -158,6 +172,10 @@ public final class ResourceArbiter {
         lease.valid = false;
     }
 
+    private static boolean isOneShotAction(Resource resource) {
+        return resource == Resource.ATTACK_ACTION || resource == Resource.USE_ACTION;
+    }
+
     private static int canonicalPriority(Resource resource, String owner, int fallback) {
         if (resource == Resource.SERVER_ROTATION || resource == Resource.MODEL_ROTATION) {
             if ("KillAura".equals(owner)) return 400;
@@ -177,6 +195,8 @@ public final class ResourceArbiter {
             if ("Clutch".equals(owner)) return 300;
             if ("Auto Weapon".equals(owner)) return 200;
             if ("Auto Tool".equals(owner)) return 100;
+        } else if (resource == Resource.FORWARD_INPUT || resource == Resource.JUMP_INPUT) {
+            if ("Clutch".equals(owner)) return 300;
         } else if (resource == Resource.SPRINT_INPUT || resource == Resource.SNEAK_INPUT) {
             if ("Sprint Reset".equals(owner)) return 300;
             if ("LegitScaffold".equals(owner)) return 200;

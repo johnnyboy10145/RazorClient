@@ -4,6 +4,7 @@ import com.razorclient.combat.CombatActionCoordinator;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
+import com.razorclient.feature.setting.DecimalSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
 import com.razorclient.runtime.ResourceArbiter;
@@ -30,6 +31,9 @@ public final class LegitScaffoldModule extends Module {
 
     private final BooleanSetting pitchCheck = new BooleanSetting("Pitch Check", false);
     private final NumberSetting sneakDelay = new NumberSetting("Sneak Delay", 0, 250, 5, 60);
+    private final DecimalSetting placementRange = new DecimalSetting("Range", 3.0D, 5.0D, 0.1D, 4.2D);
+    private final BooleanSetting sneakAssist = new BooleanSetting("Sneak Assist", true);
+    private final BooleanSetting edgeOnly = new BooleanSetting("Edge Only", true);
     private final EnumSetting<DirectionMode> directionMode =
         new EnumSetting<DirectionMode>("Direction Mode", DirectionMode.values(), DirectionMode.ANY_DIRECTION);
     private final BooleanSetting diagonalAssist = new BooleanSetting("Diagonal Assist", true);
@@ -56,6 +60,9 @@ public final class LegitScaffoldModule extends Module {
         requireRightClick.setVisibility(() -> placementAssist.isEnabled());
         addSetting(pitchCheck);
         addSetting(sneakDelay);
+        addSetting(placementRange);
+        addSetting(sneakAssist);
+        addSetting(edgeOnly);
         addSetting(directionMode);
         addSetting(diagonalAssist);
         addSetting(diagonalReleaseDelay);
@@ -82,7 +89,8 @@ public final class LegitScaffoldModule extends Module {
         int sneakKey = minecraft.gameSettings.keyBindSneak.getKeyCode();
         boolean physicalSneak = isPhysicalKeyDown(sneakKey);
         boolean active = passesActivation(player);
-        boolean unsafe = active && shouldSneakAtEdge(player, minecraft.theWorld);
+        boolean edgeDetected = active && shouldSneakAtEdge(player, minecraft.theWorld);
+        boolean unsafe = sneakAssist.isEnabled() && active && (!edgeOnly.isEnabled() || edgeDetected);
         long now = System.nanoTime();
 
         if (unsafe) {
@@ -96,9 +104,11 @@ public final class LegitScaffoldModule extends Module {
             status = diagonalMovement ? Status.DIAGONAL : Status.EDGE;
             KeyBinding.setKeyBindState(sneakKey, true);
             sneakReleaseTime = Long.MAX_VALUE;
-            tryPlacementAssist(minecraft, now);
+            if (!edgeOnly.isEnabled() || edgeDetected) tryPlacementAssist(minecraft, now);
             return;
         }
+
+        if (edgeDetected) tryPlacementAssist(minecraft, now);
 
         if (moduleSneaking && sneakReleaseTime == Long.MAX_VALUE) {
             int delay = diagonalMovement && diagonalAssist.isEnabled()
@@ -222,7 +232,12 @@ public final class LegitScaffoldModule extends Module {
 
         MovingObjectPosition hit = minecraft.objectMouseOver;
         if (hit == null || hit.typeOfHit != MovingObjectPosition.MovingObjectType.BLOCK
-            || hit.getBlockPos() == null || hit.sideHit == null) {
+            || hit.getBlockPos() == null || hit.sideHit == null || hit.hitVec == null) {
+            return;
+        }
+        double maximumRange = placementRange.getValue();
+        if (minecraft.thePlayer.getPositionEyes(1.0F).squareDistanceTo(hit.hitVec)
+                > maximumRange * maximumRange) {
             return;
         }
         if (!CombatActionCoordinator.tryAcquire("LegitScaffold")) {

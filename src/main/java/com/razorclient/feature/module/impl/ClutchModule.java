@@ -13,6 +13,7 @@ import com.razorclient.feature.module.impl.clutch.ClutchPlacementExecutor;
 import com.razorclient.feature.module.impl.clutch.ClutchPredictor;
 import com.razorclient.feature.module.impl.clutch.ClutchSession;
 import com.razorclient.feature.module.impl.clutch.ClutchSilentRotationController;
+import com.razorclient.feature.module.impl.clutch.DangerPrediction;
 import com.razorclient.feature.setting.BooleanSetting;
 import com.razorclient.feature.setting.DecimalSetting;
 import com.razorclient.feature.setting.EnumSetting;
@@ -24,13 +25,15 @@ import net.minecraft.block.BlockLiquid;
 import net.minecraft.block.material.Material;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.EntityPlayerSP;
+import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.item.ItemStack;
+import net.minecraft.util.ChatComponentText;
 import net.minecraft.util.BlockPos;
 import net.minecraft.util.EnumFacing;
 import net.minecraft.util.MathHelper;
 import net.minecraft.util.MovingObjectPosition;
+import net.minecraft.util.Vec3;
 import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.fml.common.eventhandler.Event;
 import net.minecraftforge.fml.common.eventhandler.EventPriority;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 import net.minecraftforge.fml.common.gameevent.TickEvent;
@@ -69,6 +72,10 @@ public final class ClutchModule extends Module {
     private final EnumSetting<RecoveryMode> recoveryMode = new EnumSetting<RecoveryMode>("Recovery Mode", RecoveryMode.values(), RecoveryMode.EMERGENCY_BRIDGE);
     private final NumberSetting predictionTicks = new NumberSetting("Prediction Ticks", 1, 8, 1, 4);
     private final NumberSetting confirmationTicks = new NumberSetting("Confirmation Ticks", 1, 5, 1, 2);
+    private final BooleanSetting tellyAssist = new BooleanSetting("Telly Assist", false);
+    private final DecimalSetting tellyCps = new DecimalSetting("Telly CPS", 15.0D, 25.0D, 0.5D, 20.0D);
+    private final NumberSetting tellyFlickSpeed = new NumberSetting("Telly Flick Speed", 2, 5, 1, 3);
+    private final DecimalSetting tellyOvershoot = new DecimalSetting("Telly Overshoot", 0.0D, 5.0D, 0.25D, 2.0D);
 
     private final Random random = getScope().getRandom();
     private final ClutchSession session = new ClutchSession();
@@ -82,8 +89,10 @@ public final class ClutchModule extends Module {
 
     private ResourceArbiter.Lease slotLease;
     private ResourceArbiter.Lease useActionLease;
-    private ResourceArbiter.Lease serverRotationLease;
+    private ResourceArbiter.Lease forwardInputLease;
+    private ResourceArbiter.Lease jumpInputLease;
     private ClutchCandidate activeCandidate;
+    private DangerPrediction activePrediction = DangerPrediction.safe();
     private boolean forgeRegistered;
     private boolean clutching;
     private boolean returningToCamera;
@@ -104,6 +113,32 @@ public final class ClutchModule extends Module {
     private long nextAttemptDelayNanos;
     private BlockPos lastAttemptNeighbor;
     private EnumFacing lastAttemptFace;
+    private TellyPhase tellyPhase = TellyPhase.RUNNING;
+    private boolean tellyActive;
+    private boolean tellyForwardWasDown;
+    private boolean tellyJumpWasDown;
+    private boolean tellyWarnedNoBlocks;
+    private Object tellyWorld;
+    private int tellyPlayerId = -1;
+    private int tellyOriginalSlot = -1;
+    private int tellyAirTicks;
+    private int tellyPhaseTicks;
+    private int tellyPlacements;
+    private int tellyPreferredSlot;
+    private long tellyNextPlaceNanos;
+    private long tellyNextSwapNanos;
+    private float tellyOriginalYaw;
+    private float tellyOriginalPitch;
+    private float tellyPhaseStartYaw;
+    private float tellyPhaseStartPitch;
+    private float tellyBackwardYaw;
+    private float tellyBackwardPitch;
+    private float tellyOvershootAmount;
+    private ClutchCandidate tellyPendingCandidate;
+    private Object tellyPendingWorld;
+    private int tellyPendingSlot = -1;
+    private int tellyPendingStackCount;
+    private int tellyConfirmationAge;
 
     public ClutchModule() {
         super("Clutch", "Places emergency blocks and builds a short recovery path", Category.PLAYER,
@@ -112,6 +147,9 @@ public final class ClutchModule extends Module {
         rotateBack.setVisibility(() -> !silentAim.isEnabled());
         clutchMoveDelay.setVisibility(() -> false);
         filterMode.setVisibility(() -> false);
+        tellyCps.setVisibility(tellyAssist::isEnabled);
+        tellyFlickSpeed.setVisibility(tellyAssist::isEnabled);
+        tellyOvershoot.setVisibility(tellyAssist::isEnabled);
         addSetting(trigger);
         addSetting(blocks);
         addSetting(silentAim);
@@ -141,6 +179,10 @@ public final class ClutchModule extends Module {
         addSetting(recoveryMode);
         addSetting(predictionTicks);
         addSetting(confirmationTicks);
+        addSetting(tellyAssist);
+        addSetting(tellyCps);
+        addSetting(tellyFlickSpeed);
+        addSetting(tellyOvershoot);
     }
 
     @Override
@@ -168,7 +210,6 @@ public final class ClutchModule extends Module {
     @Override
     public void onClientTick(TickEvent.ClientTickEvent event) {
         if (event.phase != TickEvent.Phase.START) return;
-        silentRotation.restoreRenderSwap();
         long now = System.nanoTime();
         EntityPlayerSP player = mc.thePlayer;
         if (!isPlayerReady()) {
@@ -184,15 +225,23 @@ public final class ClutchModule extends Module {
             abortClutch();
             return;
         }
-        if (serverRotationLease != null && !serverRotationLease.renew(2)) {
-            serverRotationLease = null;
-            if (session.isActive() && session.markBlocked(ClutchSession.BlockedReason.SUPPRESSED,
-                    "Suppressed", now)) abortClutch();
-            return;
-        }
         if (returningToCamera) {
             handleSnapBack(player);
             return;
+        }
+        if (tellyActive && !matchesTellySession(player)) {
+            abortTelly();
+        }
+        if (tellyActive && !player.onGround && player.motionY < 0.0D
+                && triggerMet(player) && conditionsMet(player)) {
+            abortTelly();
+        }
+        if (!clutching && tellyAssist.isEnabled()) {
+            if (tellyActive || tryBeginTelly(player, now)) {
+                if (processTelly(player, now)) return;
+            }
+        } else if (tellyActive) {
+            abortTelly();
         }
         if (player.onGround) {
             handleGroundState(player, now);
@@ -225,7 +274,8 @@ public final class ClutchModule extends Module {
         if (activeCandidate == null || !isCandidateValid(player, activeCandidate)) {
             activeCandidate = selectCandidate(player);
             if (activeCandidate != null) {
-                activeCandidate = scanner.randomizeAim(activeCandidate, random, randomization.getValue());
+                activeCandidate = scanner.randomizeAim(mc.theWorld, player, activeCandidate,
+                    random, randomization.getValue());
                 session.clearBlocked(ClutchSession.BlockedReason.NO_FACE);
             }
         }
@@ -233,16 +283,18 @@ public final class ClutchModule extends Module {
             if (session.markBlocked(ClutchSession.BlockedReason.NO_FACE, "No Face", now)) abortClutch();
             return;
         }
-        if (!acquireServerRotationLease()) {
-            if (session.markBlocked(ClutchSession.BlockedReason.SUPPRESSED, "Suppressed", now)) abortClutch();
+        setRotationTarget(activeCandidate.yawFrom(player), activeCandidate.pitchFrom(player));
+        stepRotation(resolveAimSpeed());
+        boolean rotationGranted = silentAim.isEnabled()
+            ? silentRotation.update(getScope(), player, currentYaw, currentPitch)
+            : ClientRotationHelper.get().requestRotations("Clutch", 95, currentYaw, currentPitch);
+        if (!rotationGranted) {
+            if (session.markBlocked(ClutchSession.BlockedReason.SUPPRESSED,
+                    "Suppressed", now)) abortClutch();
             return;
         }
         session.clearBlocked(ClutchSession.BlockedReason.SUPPRESSED);
-
-        setRotationTarget(activeCandidate.yawFrom(player), activeCandidate.pitchFrom(player));
-        stepRotation(resolveAimSpeed());
-        if (silentAim.isEnabled()) silentRotation.update(getScope(), player, currentYaw, currentPitch);
-        else {
+        if (!silentAim.isEnabled()) {
             silentRotation.clear();
             applyVisibleRotation(player);
         }
@@ -252,12 +304,16 @@ public final class ClutchModule extends Module {
             rotationHeldTicks = 0;
             return;
         }
-        rotationHeldTicks = Math.min(2, rotationHeldTicks + 1);
-        if (rotationHeldTicks < 2 || !canPlaceNow(now) || !canRetryCandidate(activeCandidate, now)) return;
+        int requiredAlignmentTicks = requiresImmediatePlacement(player) ? 1 : 2;
+        rotationHeldTicks = Math.min(requiredAlignmentTicks, rotationHeldTicks + 1);
+        if (rotationHeldTicks < requiredAlignmentTicks || !canPlaceNow(now)
+                || !canRetryCandidate(activeCandidate, now)) return;
 
         MovingObjectPosition hit = rayTraceAtRotation(player, getReach(player), currentYaw, currentPitch);
         if (!matchesCandidate(hit, activeCandidate)) {
-            if (session.markBlocked(ClutchSession.BlockedReason.NO_FACE, "No Face", now)) abortClutch();
+            activeCandidate = null;
+            rotationHeldTicks = 0;
+            if (session.markBlocked(ClutchSession.BlockedReason.NO_FACE, "Replanning", now)) abortClutch();
             return;
         }
         session.clearBlocked(ClutchSession.BlockedReason.NO_FACE);
@@ -340,8 +396,14 @@ public final class ClutchModule extends Module {
 
     private ClutchCandidate selectCandidate(EntityPlayerSP player) {
         if (!session.isEmergencyConfirmed()) {
-            return scanner.findEmergency(mc.theWorld, player, range.getValue(), session.getBlocksPlaced(),
-                getReach(player), onlyPlaceSideways.isEnabled(), fov.getValue(), multipoint.isEnabled());
+            if (trigger.getValue() == Trigger.PREDICTED_DANGER) {
+                DangerPrediction refreshed = predictor.predict(mc.theWorld, player,
+                    predictionTicks.getValue(), minimumHeight.getValue());
+                if (refreshed.isDangerous()) activePrediction = refreshed;
+            }
+            return scanner.findEmergency(mc.theWorld, player, activePrediction, range.getValue(),
+                session.getBlocksPlaced(), getReach(player), onlyPlaceSideways.isEnabled(),
+                fov.getValue(), multipoint.isEnabled());
         }
         if (recoveryMode.getValue() == RecoveryMode.EMERGENCY_ONLY) return null;
         if (bridge.isEmpty() || bridge.isComplete()) refreshBridge(player);
@@ -374,16 +436,21 @@ public final class ClutchModule extends Module {
         int feetY = MathHelper.floor_double(player.posY);
         switch (trigger.getValue()) {
             case PREDICTED_DANGER:
-                return predictor.isDangerPredicted(mc.theWorld, player, predictionTicks.getValue(),
+                activePrediction = predictor.predict(mc.theWorld, player, predictionTicks.getValue(),
                     minimumHeight.getValue());
+                return activePrediction.isDangerous();
             case ALWAYS:
+                activePrediction = DangerPrediction.safe();
                 return true;
             case ON_VOID:
+                activePrediction = DangerPrediction.safe();
                 return depthUntilSupport(x, feetY, z, 65) >= 65;
             case ON_LETHAL_FALL:
+                activePrediction = DangerPrediction.safe();
                 return player.fallDistance + depthUntilSupport(x, feetY, z, 40) - 3.0F
                     >= player.getHealth() / 2.0F;
             case FALL_DISTANCE:
+                activePrediction = DangerPrediction.safe();
                 return player.fallDistance + depthUntilSupport(x, feetY, z,
                     Math.max(1, (int) blocks.getValue()) + 1) >= blocks.getValue();
             default:
@@ -407,8 +474,14 @@ public final class ClutchModule extends Module {
         if (recentlyDamaged.isEnabled() && player.hurtTime <= 0) return false;
         if (movingBackwards.isEnabled()
                 && (player.movementInput == null || player.movementInput.moveForward >= 0.0F)) return false;
-        return predictor.countAirBelow(mc.theWorld, player, minimumHeight.getValue())
-            >= minimumHeight.getValue();
+        return trigger.getValue() == Trigger.PREDICTED_DANGER
+            || predictor.countAirBelow(mc.theWorld, player, minimumHeight.getValue())
+                >= minimumHeight.getValue();
+    }
+
+    private boolean requiresImmediatePlacement(EntityPlayerSP player) {
+        return (activePrediction != null && activePrediction.isDangerous())
+            || player.fallDistance >= 0.75F || player.motionY <= -0.22D;
     }
 
     private boolean ensureHoldingBlock(EntityPlayerSP player) {
@@ -473,10 +546,357 @@ public final class ClutchModule extends Module {
         return useActionLease != null;
     }
 
-    private boolean acquireServerRotationLease() {
-        if (serverRotationLease != null && serverRotationLease.renew(2)) return true;
-        serverRotationLease = getScope().acquire(ResourceArbiter.Resource.SERVER_ROTATION, 95, 2, null);
-        return serverRotationLease != null;
+    private boolean tryBeginTelly(EntityPlayerSP player, long now) {
+        if (!player.onGround || mc.currentScreen != null || !mc.inGameHasFocus
+                || !isPhysicalKeyDown(mc.gameSettings.keyBindForward.getKeyCode())
+                || !isPhysicalKeyDown(mc.gameSettings.keyBindJump.getKeyCode())) return false;
+        int blockSlot = findTellyBlockSlot(player, 2);
+        if (blockSlot < 0) blockSlot = findTellyBlockSlot(player, 3);
+        if (blockSlot < 0) blockSlot = findBlockSlot(player);
+        if (blockSlot < 0) {
+            warnNoTellyBlocks(player);
+            return false;
+        }
+        tellyForwardWasDown = true;
+        tellyJumpWasDown = true;
+        if (!acquireTellyInputLeases(player)) return false;
+        if (!acquireSlotLease(player)) {
+            releaseTellyInputLeases();
+            return false;
+        }
+        tellyActive = true;
+        tellyWorld = mc.theWorld;
+        tellyPlayerId = player.getEntityId();
+        tellyOriginalSlot = player.inventory.currentItem;
+        tellyOriginalYaw = player.rotationYaw;
+        tellyOriginalPitch = player.rotationPitch;
+        tellyPhaseStartYaw = player.rotationYaw;
+        tellyPhaseStartPitch = player.rotationPitch;
+        tellyBackwardYaw = player.rotationYaw + 180.0F + randomBetween(-2.0F, 2.0F);
+        tellyBackwardPitch = randomBetween(25.0F, 45.0F);
+        tellyOvershootAmount = (random.nextBoolean() ? 1.0F : -1.0F) * (float) tellyOvershoot.getValue();
+        tellyAirTicks = 0;
+        tellyPhaseTicks = 0;
+        tellyPlacements = 0;
+        tellyPreferredSlot = blockSlot == 3 ? 3 : 2;
+        tellyNextPlaceNanos = now;
+        tellyNextSwapNanos = now;
+        tellyWarnedNoBlocks = false;
+        tellyPhase = TellyPhase.RUNNING;
+        return true;
+    }
+
+    /** Returns true while Telly owns this tick; false hands control to recovery. */
+    private boolean processTelly(EntityPlayerSP player, long now) {
+        if (!tellyActive) return false;
+        if (mc.currentScreen != null || !mc.inGameHasFocus || player.isDead) {
+            abortTelly();
+            return true;
+        }
+        if (!renewTellyInputLeases()) {
+            abortTelly();
+            return true;
+        }
+        setTellyInputState(true, true);
+        if (!player.onGround) tellyAirTicks++;
+
+        switch (tellyPhase) {
+            case RUNNING:
+                tellyPhase = TellyPhase.FLICKING_BACK;
+                tellyPhaseTicks = 0;
+                return true;
+            case FLICKING_BACK:
+                if (!applyTellyFlick(player, tellyBackwardYaw, tellyBackwardPitch, true)) {
+                    abortTelly();
+                    return true;
+                }
+                if (++tellyPhaseTicks >= tellyFlickSpeed.getValue()) {
+                    tellyPhase = TellyPhase.PLACING;
+                    tellyPhaseTicks = 0;
+                }
+                return true;
+            case PLACING:
+                TellyConfirmationResult confirmationResult = pollTellyConfirmation(player);
+                if (confirmationResult == TellyConfirmationResult.PENDING) return true;
+                if (confirmationResult == TellyConfirmationResult.CONFIRMED) {
+                    tellyPlacements++;
+                    tellyPreferredSlot = tellyPendingSlot == 2 ? 3 : 2;
+                    clearTellyConfirmation();
+                } else if (confirmationResult == TellyConfirmationResult.FAILED) {
+                    clearTellyConfirmation();
+                    if (!predictor.hasCollisionSupport(mc.theWorld, player, player.getEntityBoundingBox())) {
+                        abortTelly();
+                        return false;
+                    }
+                }
+                if (player.onGround && tellyAirTicks > 0 || tellyAirTicks > 4) {
+                    beginTellyReturn(player);
+                    return true;
+                }
+                if (tellyAirTicks < 1) return true;
+                if (now < tellyNextPlaceNanos) return true;
+                ClutchCandidate candidate = createTellyCandidate(player);
+                if (candidate == null) {
+                    if (!predictor.hasCollisionSupport(mc.theWorld, player, player.getEntityBoundingBox())) {
+                        abortTelly();
+                        return false;
+                    }
+                    beginTellyReturn(player);
+                    return true;
+                }
+                int slot = chooseTellySlot(player, now);
+                if (slot < 0) {
+                    warnNoTellyBlocks(player);
+                    abortTelly();
+                    return true;
+                }
+                setSelectedSlot(slot);
+                if (!acquireUseActionLease()) return true;
+                MovingObjectPosition hit = tellyHit(candidate);
+                ItemStack stackBeforeAttempt = player.inventory.getStackInSlot(slot);
+                int countBeforeAttempt = stackBeforeAttempt == null ? 0 : stackBeforeAttempt.stackSize;
+                boolean invoked;
+                try {
+                    invoked = placementExecutor.attempt(mc, player, hit, candidate);
+                } finally {
+                    releaseUseActionLease();
+                }
+                tellyNextPlaceNanos = now + (long) (1_000_000_000.0D / tellyCps.getValue());
+                if (invoked) {
+                    beginTellyConfirmation(candidate, slot, countBeforeAttempt);
+                } else if (!predictor.hasCollisionSupport(mc.theWorld, player, player.getEntityBoundingBox())) {
+                    abortTelly();
+                    return false;
+                }
+                return true;
+            case FLICKING_FORWARD:
+                if (!applyTellyFlick(player, tellyOriginalYaw, tellyOriginalPitch, false)) {
+                    abortTelly();
+                    return true;
+                }
+                if (++tellyPhaseTicks >= tellyFlickSpeed.getValue()) abortTelly();
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    private void beginTellyReturn(EntityPlayerSP player) {
+        tellyPhase = TellyPhase.FLICKING_FORWARD;
+        tellyPhaseTicks = 0;
+        tellyPhaseStartYaw = player.rotationYaw;
+        tellyPhaseStartPitch = player.rotationPitch;
+    }
+
+    private boolean applyTellyFlick(EntityPlayerSP player, float endYaw, float endPitch, boolean overshoot) {
+        int duration = Math.max(1, tellyFlickSpeed.getValue());
+        float progress = Math.min(1.0F, (tellyPhaseTicks + 1.0F) / duration);
+        float eased;
+        float extraYaw = 0.0F;
+        if (overshoot && tellyPhaseTicks + 1 < duration) {
+            float approach = Math.min(1.0F, (tellyPhaseTicks + 1.0F) / Math.max(1.0F, duration - 1.0F));
+            eased = easeInOutCubic(approach);
+            extraYaw = tellyOvershootAmount * eased;
+        } else {
+            eased = easeInOutCubic(progress);
+        }
+        float yawDelta = MathHelper.wrapAngleTo180_float(endYaw - tellyPhaseStartYaw);
+        float yaw = tellyPhaseStartYaw + yawDelta * eased + extraYaw;
+        float pitch = tellyPhaseStartPitch + (endPitch - tellyPhaseStartPitch) * eased;
+        float sensitivity = mc.gameSettings.mouseSensitivity * 0.6F + 0.2F;
+        float gcd = sensitivity * sensitivity * sensitivity * 1.2F;
+        yaw = player.rotationYaw + Math.round(MathHelper.wrapAngleTo180_float(yaw - player.rotationYaw) / gcd) * gcd;
+        pitch = MathHelper.clamp_float(player.rotationPitch
+            + Math.round((pitch - player.rotationPitch) / gcd) * gcd, -90.0F, 90.0F);
+        currentYaw = yaw;
+        currentPitch = pitch;
+        rotationActive = true;
+        if (!ClientRotationHelper.get().requestRotations("Clutch", 95, yaw, pitch)) return false;
+        player.rotationYaw = yaw;
+        player.rotationPitch = pitch;
+        player.prevRotationYawHead = player.rotationYawHead;
+        player.prevRenderYawOffset = player.renderYawOffset;
+        player.rotationYawHead = yaw;
+        player.renderYawOffset = yaw;
+        return true;
+    }
+
+    private static float easeInOutCubic(float progress) {
+        return progress < 0.5F ? 4.0F * progress * progress * progress
+            : 1.0F - (float) Math.pow(-2.0F * progress + 2.0F, 3.0D) / 2.0F;
+    }
+
+    private void beginTellyConfirmation(ClutchCandidate candidate, int slot, int stackCount) {
+        tellyPendingCandidate = candidate;
+        tellyPendingWorld = mc.theWorld;
+        tellyPendingSlot = slot;
+        tellyPendingStackCount = stackCount;
+        tellyConfirmationAge = 0;
+    }
+
+    private TellyConfirmationResult pollTellyConfirmation(EntityPlayerSP player) {
+        if (tellyPendingCandidate == null) return TellyConfirmationResult.NONE;
+        if (tellyPendingWorld != mc.theWorld || player == null) return TellyConfirmationResult.FAILED;
+        BlockPos target = tellyPendingCandidate.getTargetPos();
+        Block targetBlock = mc.theWorld.getBlockState(target).getBlock();
+        if (!targetBlock.isReplaceable(mc.theWorld, target)) return TellyConfirmationResult.CONFIRMED;
+        ItemStack stack = tellyPendingSlot < 0 ? null : player.inventory.getStackInSlot(tellyPendingSlot);
+        int currentCount = stack == null ? 0 : stack.stackSize;
+        if (currentCount < tellyPendingStackCount) return TellyConfirmationResult.CONFIRMED;
+        tellyConfirmationAge++;
+        return tellyConfirmationAge <= confirmationTicks.getValue()
+            ? TellyConfirmationResult.PENDING : TellyConfirmationResult.FAILED;
+    }
+
+    private void clearTellyConfirmation() {
+        tellyPendingCandidate = null;
+        tellyPendingWorld = null;
+        tellyPendingSlot = -1;
+        tellyPendingStackCount = 0;
+        tellyConfirmationAge = 0;
+    }
+
+    private ClutchCandidate createTellyCandidate(EntityPlayerSP player) {
+        Float publishedYaw = ClientRotationHelper.get().getServerYaw();
+        float yaw = publishedYaw == null ? player.rotationYaw : publishedYaw.floatValue();
+        double radians = Math.toRadians(yaw);
+        int dx = (int) Math.round(-Math.sin(radians));
+        int dz = (int) Math.round(Math.cos(radians));
+        if (dx == 0 && dz == 0) dz = 1;
+        BlockPos feet = new BlockPos(player.posX, player.posY - 1.0D, player.posZ);
+        BlockPos target = feet.add(dx, 0, dz);
+        Block targetBlock = mc.theWorld.getBlockState(target).getBlock();
+        if (!targetBlock.isReplaceable(mc.theWorld, target)) return null;
+        BlockPos support = target.down();
+        Block supportBlock = mc.theWorld.getBlockState(support).getBlock();
+        Material material = supportBlock.getMaterial();
+        if (!material.isSolid() || supportBlock instanceof BlockLiquid
+                || supportBlock.isReplaceable(mc.theWorld, support)) return null;
+        double hitX = support.getX() + 0.5D;
+        double hitY = support.getY() + 1.0D;
+        double hitZ = support.getZ() + 0.5D;
+        double eyeX = player.posX;
+        double eyeY = player.posY + player.getEyeHeight();
+        double eyeZ = player.posZ;
+        double reach = getReach(player);
+        double distanceSq = square(hitX - eyeX) + square(hitY - eyeY) + square(hitZ - eyeZ);
+        if (distanceSq > reach * reach) return null;
+        return new ClutchCandidate(target, support, EnumFacing.UP, hitX, hitY, hitZ, 0.0D);
+    }
+
+    private static MovingObjectPosition tellyHit(ClutchCandidate candidate) {
+        return new MovingObjectPosition(new Vec3(candidate.getHitX(), candidate.getHitY(), candidate.getHitZ()),
+            candidate.getFace(), candidate.getNeighbor());
+    }
+
+    private int chooseTellySlot(EntityPlayerSP player, long now) {
+        if (now < tellyNextSwapNanos
+                && ClutchPlacementExecutor.isValidBlockStack(player.getHeldItem())) {
+            return player.inventory.currentItem;
+        }
+        int preferred = tellyPreferredSlot;
+        int alternate = preferred == 2 ? 3 : 2;
+        int selected = findTellyBlockSlot(player, preferred);
+        if (selected < 0) selected = findTellyBlockSlot(player, alternate);
+        if (selected < 0) selected = findBlockSlot(player);
+        if (selected < 0) return -1;
+        if (now >= tellyNextSwapNanos && selected != player.inventory.currentItem) {
+            tellyNextSwapNanos = now + 20_000_000L + (long) (random.nextDouble() * 30_000_000L);
+        }
+        return selected;
+    }
+
+    private static int findTellyBlockSlot(EntityPlayerSP player, int slot) {
+        return slot >= 0 && slot < 9
+            && ClutchPlacementExecutor.isValidBlockStack(player.inventory.getStackInSlot(slot)) ? slot : -1;
+    }
+
+    private boolean acquireTellyInputLeases(final EntityPlayerSP player) {
+        forwardInputLease = getScope().acquire(ResourceArbiter.Resource.FORWARD_INPUT, 400, 2,
+            () -> restoreKey(mc.gameSettings.keyBindForward, tellyForwardWasDown));
+        if (forwardInputLease == null) return false;
+        jumpInputLease = getScope().acquire(ResourceArbiter.Resource.JUMP_INPUT, 400, 2,
+            () -> restoreKey(mc.gameSettings.keyBindJump, tellyJumpWasDown));
+        if (jumpInputLease != null) return true;
+        forwardInputLease.close();
+        forwardInputLease = null;
+        return false;
+    }
+
+    private boolean renewTellyInputLeases() {
+        return forwardInputLease != null && jumpInputLease != null
+            && forwardInputLease.renew(2) && jumpInputLease.renew(2);
+    }
+
+    private void releaseTellyInputLeases() {
+        ResourceArbiter.Lease forward = forwardInputLease;
+        ResourceArbiter.Lease jump = jumpInputLease;
+        forwardInputLease = null;
+        jumpInputLease = null;
+        if (forward != null && forward.isValid()) forward.close();
+        if (jump != null && jump.isValid()) jump.close();
+    }
+
+    private void setTellyInputState(boolean forward, boolean jump) {
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.getKeyCode(), forward);
+        KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.getKeyCode(), jump);
+    }
+
+    private static void restoreKey(KeyBinding binding, boolean down) {
+        if (binding != null) KeyBinding.setKeyBindState(binding.getKeyCode(), down);
+    }
+
+    private static boolean isPhysicalKeyDown(int keyCode) {
+        return keyCode > 0 && Keyboard.isKeyDown(keyCode);
+    }
+
+    private boolean matchesTellySession(EntityPlayerSP player) {
+        return tellyWorld == mc.theWorld && tellyPlayerId == player.getEntityId();
+    }
+
+    private void abortTelly() {
+        if (!tellyActive && forwardInputLease == null && jumpInputLease == null) return;
+        EntityPlayerSP player = mc.thePlayer;
+        releaseUseActionLease();
+        releaseTellyInputLeases();
+        if (player != null && tellyOriginalSlot >= 0 && tellyOriginalSlot < 9) {
+            setSelectedSlot(tellyOriginalSlot);
+        }
+        releaseSlotLease();
+        if (player != null && matchesTellySession(player)) {
+            player.rotationYaw = tellyOriginalYaw;
+            player.rotationPitch = tellyOriginalPitch;
+            player.prevRotationYawHead = player.rotationYawHead;
+            player.prevRenderYawOffset = player.renderYawOffset;
+            player.rotationYawHead = tellyOriginalYaw;
+            player.renderYawOffset = tellyOriginalYaw;
+        }
+        tellyActive = false;
+        tellyPhase = TellyPhase.RUNNING;
+        tellyWorld = null;
+        tellyPlayerId = -1;
+        tellyOriginalSlot = -1;
+        tellyAirTicks = 0;
+        tellyPhaseTicks = 0;
+        tellyPlacements = 0;
+        tellyNextPlaceNanos = 0L;
+        tellyNextSwapNanos = 0L;
+        clearTellyConfirmation();
+        clearRotationState();
+    }
+
+    private void warnNoTellyBlocks(EntityPlayerSP player) {
+        if (tellyWarnedNoBlocks || player == null) return;
+        tellyWarnedNoBlocks = true;
+        player.addChatMessage(new ChatComponentText("\u00a7c[Clutch] Telly Assist needs full-cube blocks."));
+    }
+
+    private float randomBetween(float minimum, float maximum) {
+        return minimum + random.nextFloat() * (maximum - minimum);
+    }
+
+    private static double square(double value) {
+        return value * value;
     }
 
     private void releaseUseActionLease() {
@@ -645,6 +1065,7 @@ public final class ClutchModule extends Module {
     }
 
     private void abortClutch() {
+        abortTelly();
         releaseUseActionLease();
         releaseSlotLease();
         resetState();
@@ -658,9 +1079,6 @@ public final class ClutchModule extends Module {
     }
 
     private void clearRotationState() {
-        ResourceArbiter.Lease lease = serverRotationLease;
-        serverRotationLease = null;
-        if (lease != null && lease.isValid()) lease.close();
         silentRotation.clear();
         rotationActive = false;
         rotationHeldTicks = 0;
@@ -669,11 +1087,13 @@ public final class ClutchModule extends Module {
     }
 
     private void resetState() {
+        releaseTellyInputLeases();
         releaseUseActionLease();
         confirmation.clear();
         bridge.clear();
         session.reset();
         activeCandidate = null;
+        activePrediction = DangerPrediction.safe();
         clutching = false;
         returningToCamera = false;
         slotSwitchPending = false;
@@ -686,36 +1106,31 @@ public final class ClutchModule extends Module {
         nextAttemptDelayNanos = 0L;
         lastAttemptNeighbor = null;
         lastAttemptFace = null;
+        tellyWarnedNoBlocks = false;
     }
 
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onClientRotation(ClientRotationEvent event) {
         if (!isEnabled() || !silentAim.isEnabled() || !rotationActive || !isPlayerReady()
-                || serverRotationLease == null || !serverRotationLease.isValid()) return;
+                || event == null) return;
         ClientRotationHelper helper = ClientRotationHelper.get();
-        if (helper.requestRotations("Clutch", 95, currentYaw, currentPitch)
-                || "Clutch".equals(helper.getRequestedOwner())) {
+        if ("Clutch".equals(helper.getRequestedOwner())) {
             event.yaw = Float.valueOf(currentYaw);
             event.pitch = Float.valueOf(currentPitch);
         }
     }
 
-    @SubscribeEvent(priority = EventPriority.LOWEST)
-    public void onForgeRenderPre(Event event) {
-        if (event != null && "net.minecraftforge.client.event.RenderPlayerEvent$Pre".equals(event.getClass().getName())) {
-            silentRotation.renderPre(event, mc.thePlayer, isEnabled() && silentAim.isEnabled());
-        }
-    }
-
-    @SubscribeEvent(priority = EventPriority.HIGHEST)
-    public void onForgeRenderPost(Event event) {
-        if (event != null && "net.minecraftforge.client.event.RenderPlayerEvent$Post".equals(event.getClass().getName())) {
-            silentRotation.renderPost(event, mc.thePlayer);
-        }
-    }
-
     @Override
     public String getHudInfo() {
+        if (tellyActive) {
+            switch (tellyPhase) {
+                case FLICKING_BACK: return "Telly Flick";
+                case PLACING: return "Telly Place " + tellyPlacements + "/4";
+                case FLICKING_FORWARD: return "Telly Return";
+                case RUNNING:
+                default: return "Telly Run";
+            }
+        }
         return session.getPhase() == ClutchPhase.BRIDGING ? bridge.status()
             : session.getDetail() + (session.getBlocksPlaced() > 0
                 ? " " + session.getBlocksPlaced() + "/" + maxBlocks.getValue() : "");
@@ -773,5 +1188,19 @@ public final class ClutchModule extends Module {
         private final String displayName;
         SelectBlocksMode(String displayName) { this.displayName = displayName; }
         @Override public String toString() { return displayName; }
+    }
+
+    private enum TellyPhase {
+        RUNNING,
+        FLICKING_BACK,
+        PLACING,
+        FLICKING_FORWARD
+    }
+
+    private enum TellyConfirmationResult {
+        NONE,
+        PENDING,
+        CONFIRMED,
+        FAILED
     }
 }

@@ -48,6 +48,7 @@ final class ClickGuiCategoryPanel {
     private int width;
     private int scrollOffset;
     private int bodyContentHeight;
+    private int maxPanelHeight = Integer.MAX_VALUE;
     private boolean contentHeightDirty = true;
     private boolean dragging;
     private boolean movedByUser;
@@ -437,7 +438,10 @@ final class ClickGuiCategoryPanel {
     }
 
     private int getVisibleBodyHeight(int screenHeight) {
-        int maxVisibleBody = Math.max(ROW_HEIGHT, screenHeight - y - HEADER_HEIGHT - 2);
+        int screenBody = Math.max(0, screenHeight - y - HEADER_HEIGHT - 2);
+        int layoutBody = maxPanelHeight == Integer.MAX_VALUE
+            ? Integer.MAX_VALUE : Math.max(0, maxPanelHeight - HEADER_HEIGHT);
+        int maxVisibleBody = Math.min(screenBody, layoutBody);
         return Math.min(bodyContentHeight, maxVisibleBody);
     }
 
@@ -609,6 +613,14 @@ final class ClickGuiCategoryPanel {
     void setPosition(int x, int y) {
         this.x = x;
         this.y = y;
+    }
+
+    void setMaxPanelHeight(int maxPanelHeight) {
+        this.maxPanelHeight = Math.max(HEADER_HEIGHT, maxPanelHeight);
+    }
+
+    void clearMaxPanelHeight() {
+        this.maxPanelHeight = Integer.MAX_VALUE;
     }
 
     boolean wasMovedByUser() {

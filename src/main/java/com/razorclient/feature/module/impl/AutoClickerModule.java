@@ -3,6 +3,7 @@ package com.razorclient.feature.module.impl;
 import com.razorclient.feature.module.Category;
 import com.razorclient.feature.module.Module;
 import com.razorclient.feature.setting.BooleanSetting;
+import com.razorclient.feature.setting.DecimalSetting;
 import com.razorclient.feature.setting.EnumSetting;
 import com.razorclient.feature.setting.NumberSetting;
 import com.razorclient.RazorClient;
@@ -33,9 +34,9 @@ public final class AutoClickerModule extends Module {
     private final BooleanSetting breakBlocks = new BooleanSetting("Break Blocks", true);
     private final BooleanSetting weaponOnly = new BooleanSetting("Weapon Only", false);
     private final BooleanSetting inventoryFill = new BooleanSetting("Inventory Fill", false);
-    private final NumberSetting minCps = new NumberSetting("Min CPS", 1, 25, 1, 17);
-    private final NumberSetting maxCps = new NumberSetting("Max CPS", 1, 25, 1, 22);
-    private final NumberSetting jitterStrength = new NumberSetting("Jitter", 0, 10, 1, 0);
+    private final DecimalSetting minCps = new DecimalSetting("Min CPS", 1.0D, 25.0D, 0.5D, 10.0D);
+    private final DecimalSetting maxCps = new DecimalSetting("Max CPS", 1.0D, 25.0D, 0.5D, 14.0D);
+    private final NumberSetting jitterStrength = new NumberSetting("Jitter", 0, 10, 1, 2);
     private final EnumSetting<ClickPattern> clickPattern = new EnumSetting<ClickPattern>("Click Pattern", ClickPattern.values(), ClickPattern.NORMAL);
     private final BooleanSetting randomizeSpeed = new BooleanSetting("Randomization", true);
     private final BooleanSetting simulateFatigue = new BooleanSetting("Simulated Fatigue", false);
@@ -103,7 +104,8 @@ public final class AutoClickerModule extends Module {
     }
 
     @Override
-    public void onRenderTick(TickEvent.RenderTickEvent event) {
+    public void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.START) return;
         Minecraft minecraft = Minecraft.getMinecraft();
         if (minecraft.thePlayer == null || minecraft.theWorld == null) {
             resetClickState();
@@ -297,9 +299,9 @@ public final class AutoClickerModule extends Module {
     }
 
     private long computeDelayNanos() {
-        int min = minCps.getValue();
-        int max = Math.max(min, maxCps.getValue());
-        double cps = min + (random.nextDouble() * (max - min + 1));
+        double min = minCps.getValue();
+        double max = Math.max(min, maxCps.getValue());
+        double cps = min + (random.nextDouble() * (max - min));
         if (burstTicks <= 0) {
             burstTicks = 3 + random.nextInt(9);
         }

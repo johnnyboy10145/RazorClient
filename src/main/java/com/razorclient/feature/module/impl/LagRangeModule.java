@@ -105,7 +105,6 @@ public final class LagRangeModule extends Module {
     @Override
     public int getOutboundPacketDelay(Packet<?> packet) {
         if (packet == flushTriggerPacket) {
-            flushTriggerPacket = null;
             return 1;
         }
         int delay = maximumDelay.getValue() <= 0
@@ -119,8 +118,20 @@ public final class LagRangeModule extends Module {
     }
 
     @Override
+    public boolean shouldFlushThenPassOutboundPacket(Packet<?> packet) {
+        if (packet != flushTriggerPacket) return false;
+        flushTriggerPacket = null;
+        return true;
+    }
+
+    @Override
     public int getOutboundPacketDelayPriority(Packet<?> packet) {
         return 90;
+    }
+
+    @Override
+    public boolean shouldBypassOutboundOrdering(Packet<?> packet) {
+        return LagModuleSupport.isKeepAliveOrTransactionPacket(packet);
     }
 
     @Override

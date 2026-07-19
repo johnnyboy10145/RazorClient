@@ -7,11 +7,15 @@ import com.razorclient.event.StrafeEvent;
 import com.razorclient.runtime.ResourceArbiter;
 import com.razorclient.runtime.OwnerToken;
 import com.razorclient.feature.module.Module;
+import java.lang.reflect.Field;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.entity.Entity;
 import net.minecraft.network.play.client.C03PacketPlayer;
 import net.minecraft.util.MathHelper;
 import net.minecraftforge.common.MinecraftForge;
+import net.minecraftforge.fml.common.eventhandler.Event;
+import net.minecraftforge.fml.common.eventhandler.EventPriority;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
 
 public final class ClientRotationHelper {
@@ -35,6 +39,16 @@ public final class ClientRotationHelper {
     private volatile OwnerToken requestedOwnerToken;
     private volatile int requestedPriority = Integer.MIN_VALUE;
     private ResourceArbiter.Lease rotationLease;
+    private ResourceArbiter.Lease modelRotationLease;
+    private EntityPlayerSP modelRotationPlayer;
+    private boolean modelSwapActive;
+    private float savedYawHead;
+    private float savedPrevYawHead;
+    private float savedYawOffset;
+    private float savedPrevYawOffset;
+    private float savedModelPitch;
+    private float savedPrevModelPitch;
+    private Field renderPlayerField;
     private boolean registered;
 
     private ClientRotationHelper() {
@@ -62,6 +76,10 @@ public final class ClientRotationHelper {
     }
 
     public void onRunTickStart() {
+        restoreModelSwap();
+        closeModelRotationLease();
+        ResourceArbiter.Lease previousRotationLease = rotationLease;
+        if (previousRotationLease != null && previousRotationLease.isValid()) previousRotationLease.close();
         if (minecraft.thePlayer != null && !Float.isFinite(KillAuraRotationUtils.serverRotations[0])) {
             KillAuraRotationUtils.serverRotations[0] = minecraft.thePlayer.rotationYaw;
             KillAuraRotationUtils.serverRotations[1] = minecraft.thePlayer.rotationPitch;
@@ -81,6 +99,8 @@ public final class ClientRotationHelper {
     }
 
     public void clearRequestedRotations() {
+        restoreModelSwap();
+        closeModelRotationLease();
         ResourceArbiter.Lease lease = rotationLease;
         if (lease != null) lease.close();
         serverYaw = null;
@@ -95,6 +115,8 @@ public final class ClientRotationHelper {
 
     public void clearRequestedRotations(String owner) {
         if (owner == null || !owner.equals(requestedOwner)) return;
+        restoreModelSwap();
+        closeModelRotationLease();
         ResourceArbiter arbiter = getArbiter();
         if (arbiter != null) arbiter.releaseOwner(requestedOwnerToken, ResourceArbiter.Resource.SERVER_ROTATION);
         serverYaw = null;
@@ -280,6 +302,84 @@ public final class ClientRotationHelper {
 
         endSwap(entity);
         swappedForWalkingUpdate = false;
+    }
+
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public void onRenderPlayerPre(Event event) {
+        if (event == null || !"net.minecraftforge.client.event.RenderPlayerEvent$Pre".equals(event.getClass().getName())) {
+            return;
+        }
+        restoreModelSwap();
+        RotationSnapshot snapshot = publishedRotation;
+        EntityPlayerSP player = minecraft.thePlayer;
+        if (player == null || !isActive(snapshot) || resolveRenderPlayer(event) != player) return;
+
+        ResourceArbiter arbiter = getArbiter();
+        if (arbiter != null) {
+            modelRotationLease = arbiter.acquire(ResourceArbiter.Resource.MODEL_ROTATION,
+                snapshot.owner, requestedPriority, 2, new Runnable() {
+                    @Override public void run() { restoreModelSwap(); }
+                });
+            if (modelRotationLease == null) return;
+        }
+
+        modelRotationPlayer = player;
+        savedYawHead = player.rotationYawHead;
+        savedPrevYawHead = player.prevRotationYawHead;
+        savedYawOffset = player.renderYawOffset;
+        savedPrevYawOffset = player.prevRenderYawOffset;
+        savedModelPitch = player.rotationPitch;
+        savedPrevModelPitch = player.prevRotationPitch;
+
+        float modelYaw = unwrapYaw(snapshot.yaw, player.rotationYawHead);
+        float previousModelYaw = unwrapYaw(player.prevRotationYawHead, modelYaw);
+        player.rotationYawHead = modelYaw;
+        player.prevRotationYawHead = previousModelYaw;
+        player.renderYawOffset = modelYaw;
+        player.prevRenderYawOffset = previousModelYaw;
+        player.rotationPitch = MathHelper.clamp_float(snapshot.pitch, -90.0F, 90.0F);
+        modelSwapActive = true;
+    }
+
+    @SubscribeEvent(priority = EventPriority.HIGHEST)
+    public void onRenderPlayerPost(Event event) {
+        if (event != null && "net.minecraftforge.client.event.RenderPlayerEvent$Post".equals(event.getClass().getName())
+                && resolveRenderPlayer(event) == modelRotationPlayer) {
+            restoreModelSwap();
+        }
+    }
+
+    private void restoreModelSwap() {
+        EntityPlayerSP player = modelRotationPlayer;
+        if (modelSwapActive && player != null) {
+            player.rotationYawHead = savedYawHead;
+            player.prevRotationYawHead = savedPrevYawHead;
+            player.renderYawOffset = savedYawOffset;
+            player.prevRenderYawOffset = savedPrevYawOffset;
+            player.rotationPitch = savedModelPitch;
+            player.prevRotationPitch = savedPrevModelPitch;
+        }
+        modelSwapActive = false;
+        modelRotationPlayer = null;
+    }
+
+    private void closeModelRotationLease() {
+        ResourceArbiter.Lease lease = modelRotationLease;
+        modelRotationLease = null;
+        if (lease != null && lease.isValid()) lease.close();
+    }
+
+    private Object resolveRenderPlayer(Event event) {
+        try {
+            if (renderPlayerField == null
+                    || !renderPlayerField.getDeclaringClass().isAssignableFrom(event.getClass())) {
+                renderPlayerField = event.getClass().getField("entityPlayer");
+                renderPlayerField.setAccessible(true);
+            }
+            return renderPlayerField.get(event);
+        } catch (ReflectiveOperationException ignored) {
+            return null;
+        }
     }
 
     public void fixMovementInputs() {

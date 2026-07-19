@@ -1,6 +1,8 @@
 package com.razorclient.feature.module.impl.clutch;
 
+import net.minecraft.block.Block;
 import net.minecraft.block.material.Material;
+import net.minecraft.block.state.IBlockState;
 import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.item.ItemStack;
 import net.minecraft.world.World;
@@ -42,8 +44,10 @@ public final class ClutchConfirmationTracker {
 
         ItemStack current = slot < 0 || slot > 8 ? null : player.inventory.getStackInSlot(slot);
         int currentCount = current == null ? 0 : current.stackSize;
-        boolean worldConfirmed = world.getBlockState(candidate.getTargetPos())
-            .getBlock().getMaterial() != Material.air;
+        IBlockState targetState = world.getBlockState(candidate.getTargetPos());
+        Block targetBlock = targetState.getBlock();
+        boolean worldConfirmed = targetBlock.getMaterial() != Material.air
+            && !targetBlock.isReplaceable(world, candidate.getTargetPos());
         if (worldConfirmed || currentCount < stackCount) return Result.CONFIRMED;
         ticksRemaining--;
         return ticksRemaining <= 0 ? Result.FAILED : Result.PENDING;

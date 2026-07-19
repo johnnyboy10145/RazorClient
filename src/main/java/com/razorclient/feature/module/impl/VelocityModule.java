@@ -19,11 +19,11 @@ import org.lwjgl.input.Keyboard;
 
 public final class VelocityModule extends Module {
     private static final int MAX_CACHED_DECISIONS = 128;
-    private static final long DECISION_TTL_MS = 30_000L;
+    private static final long DECISION_TTL_MS = 5_000L;
 
     private final EnumSetting<Mode> mode = new EnumSetting<Mode>("Mode", Mode.values(), Mode.REGULAR);
-    private final NumberSetting horizontal = new NumberSetting("Horizontal", 0, 100, 1, 90);
-    private final NumberSetting vertical = new NumberSetting("Vertical", 0, 100, 1, 100);
+    private final NumberSetting horizontal = new NumberSetting("Horizontal", 0, 100, 1, 70);
+    private final NumberSetting vertical = new NumberSetting("Vertical", 0, 100, 1, 80);
     private final NumberSetting chance = new NumberSetting("Chance", 0, 100, 1, 100);
     private final BooleanSetting explosions = new BooleanSetting("Explosions", true);
     private final NumberSetting fov = new NumberSetting("FOV", 15, 360, 1, 360);
@@ -246,7 +246,13 @@ public final class VelocityModule extends Module {
 
     private VelocityDecision createDecision(Packet<?> packet, PacketKind kind, GateSnapshot gates) {
         Mode selectedMode = mode.getValue();
-        boolean cancel = selectedMode != Mode.JUMP && horizontal.getValue() == 0 && vertical.getValue() == 0;
+        // S27 also carries explosion/world data. Cancelling the complete packet
+        // desynchronizes blocks and effects, so only local entity velocity may
+        // use transport cancellation; explosions are retained with zero impulse.
+        boolean cancel = kind == PacketKind.ENTITY
+            && selectedMode != Mode.JUMP
+            && horizontal.getValue() == 0
+            && vertical.getValue() == 0;
         int appliedHorizontal = horizontal.getValue();
         int appliedVertical = vertical.getValue();
         if (selectedMode == Mode.IGNORE) {

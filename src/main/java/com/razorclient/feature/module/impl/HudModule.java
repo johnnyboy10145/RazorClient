@@ -161,20 +161,21 @@ public final class HudModule extends Module {
                 continue;
             }
 
-            Bounds bounds = component.getBounds(resolution, true);
+            ResolvedPlacement placement = component.resolve(resolution);
+            Bounds bounds = placement.bounds();
             if (component.pinBounds(bounds).contains(mouseX, mouseY)) {
                 component.togglePinned();
                 return;
             }
 
-            if (component.handleEditorClick(mouseX, mouseY, bounds)) {
+            if (component.handleEditorClick(mouseX, mouseY, placement)) {
                 return;
             }
 
             if (bounds.contains(mouseX, mouseY)) {
                 draggingComponent = component;
-                dragOffsetX = mouseX - component.getX();
-                dragOffsetY = mouseY - component.getY();
+                dragOffsetX = mouseX - placement.x;
+                dragOffsetY = mouseY - placement.y;
                 return;
             }
         }
@@ -207,8 +208,9 @@ public final class HudModule extends Module {
                 continue;
             }
 
-            Bounds bounds = component.getBounds(resolution, editorOpen);
-            component.renderScaled(resolution, editorOpen);
+            ResolvedPlacement placement = component.resolve(resolution);
+            Bounds bounds = placement.bounds();
+            component.renderScaled(editorOpen, placement);
             if (editorOpen) {
                 drawEditorBox(component, bounds, mouseX, mouseY);
             }
@@ -459,12 +461,12 @@ public final class HudModule extends Module {
             return isEnabled() && (editorOpen || isPinned());
         }
 
-        private Bounds getBounds(ScaledResolution resolution, boolean editorOpen) {
+        private ResolvedPlacement resolve(ScaledResolution resolution) {
             int width = Math.max(24, Math.round(getLogicalWidth() * getScale()));
             int height = Math.max(14, Math.round(getLogicalHeight() * getScale()));
             int left = Math.max(0, Math.min(getX(), Math.max(0, resolution.getScaledWidth() - width)));
             int top = Math.max(0, Math.min(getY(), Math.max(0, resolution.getScaledHeight() - height)));
-            return new Bounds(left - COMPONENT_PADDING, top - COMPONENT_PADDING, left + width + COMPONENT_PADDING, top + height + COMPONENT_PADDING);
+            return new ResolvedPlacement(left, top, width, height);
         }
 
         private void setPosition(int x, int y, ScaledResolution resolution) {
@@ -474,12 +476,13 @@ public final class HudModule extends Module {
             setY(Math.max(0, Math.min(y, Math.max(0, resolution.getScaledHeight() - height))));
         }
 
-        private void renderScaled(ScaledResolution resolution, boolean editorOpen) {
+        private void renderScaled(boolean editorOpen, ResolvedPlacement placement) {
             float scale = getScale();
             GL11.glPushMatrix();
             try {
+                GL11.glTranslatef(placement.x, placement.y, 0.0F);
                 GL11.glScalef(scale, scale, 1.0F);
-                render((int) (getX() / scale), (int) (getY() / scale), editorOpen);
+                render(0, 0, editorOpen);
             } finally {
                 GL11.glColor4f(1.0F, 1.0F, 1.0F, 1.0F);
                 GL11.glPopMatrix();
@@ -490,7 +493,7 @@ public final class HudModule extends Module {
             return new Bounds(bounds.right - 16, bounds.top + 2, bounds.right - 3, bounds.top + 14);
         }
 
-        protected boolean handleEditorClick(int mouseX, int mouseY, Bounds bounds) {
+        protected boolean handleEditorClick(int mouseX, int mouseY, ResolvedPlacement placement) {
             return false;
         }
 
@@ -606,13 +609,13 @@ public final class HudModule extends Module {
         }
 
         @Override
-        protected boolean handleEditorClick(int mouseX, int mouseY, Bounds bounds) {
+        protected boolean handleEditorClick(int mouseX, int mouseY, ResolvedPlacement placement) {
             if (!clickDisable.isEnabled()) {
                 return false;
             }
 
             Minecraft minecraft = Minecraft.getMinecraft();
-            int logicalY = Math.round((mouseY - getY()) / getScale());
+            int logicalY = Math.round((mouseY - placement.y) / getScale());
             int lineHeight = minecraft.fontRendererObj.FONT_HEIGHT + 2;
             int index = logicalY / Math.max(1, lineHeight);
             if (watermark.isEnabled()) {
@@ -922,6 +925,25 @@ public final class HudModule extends Module {
 
         private boolean contains(int mouseX, int mouseY) {
             return mouseX >= left && mouseX <= right && mouseY >= top && mouseY <= bottom;
+        }
+    }
+
+    private static final class ResolvedPlacement {
+        private final int x;
+        private final int y;
+        private final int width;
+        private final int height;
+
+        private ResolvedPlacement(int x, int y, int width, int height) {
+            this.x = x;
+            this.y = y;
+            this.width = width;
+            this.height = height;
+        }
+
+        private Bounds bounds() {
+            return new Bounds(x - COMPONENT_PADDING, y - COMPONENT_PADDING,
+                x + width + COMPONENT_PADDING, y + height + COMPONENT_PADDING);
         }
     }
 

@@ -38,17 +38,17 @@ import net.minecraft.network.play.client.C03PacketPlayer;
  * ready packet never overtakes an earlier held packet.</p>
  */
 public final class PacketDelayManager {
-    private static final int MAX_OUTBOUND_RELEASES_PER_TICK = 40;
-    private static final int MAX_INBOUND_RELEASES_PER_TICK = 100;
-    private static final long MAX_INBOUND_RELEASE_NANOS = 3_000_000L;
+    private static final int MAX_OUTBOUND_RELEASES_PER_TICK = 8;
+    private static final int MAX_INBOUND_RELEASES_PER_TICK = 32;
+    private static final long MAX_INBOUND_RELEASE_NANOS = 2_000_000L;
     private static final int MAX_OUTBOUND_QUEUE_SIZE = 512;
     private static final int OUTBOUND_OVERFLOW_HIGH_WATER = 448;
+    private static final int OUTBOUND_RECOVERY_LOW_WATER = 256;
     private static final int MAX_INBOUND_QUEUE_SIZE = 4096;
     private static final int INBOUND_OVERFLOW_HIGH_WATER = 3584;
     private static final int INBOUND_RESUME_QUEUE_SIZE = 2048;
-    private static final int MAX_OUTBOUND_OWNER_QUEUE_SIZE = 256;
+    private static final int INBOUND_RECOVERY_LOW_WATER = 1024;
     private static final int OUTBOUND_OWNER_HIGH_WATER = 224;
-    private static final int MAX_INBOUND_OWNER_QUEUE_SIZE = 2048;
     private static final int INBOUND_OWNER_HIGH_WATER = 1792;
     private static final long FAST_TRACK_TTL_MS = 10_000L;
 
@@ -72,6 +72,8 @@ public final class PacketDelayManager {
     private String lastFlushReason = "None";
     private volatile Channel pausedInboundChannel;
     private volatile NetworkManager activeNetworkManager;
+    private volatile boolean outboundRecovery;
+    private volatile boolean inboundRecovery;
     private volatile boolean closed;
 
     public PacketDelayManager(ModuleManager moduleManager) {
@@ -197,20 +199,23 @@ public final class PacketDelayManager {
 
         boolean overflow = false;
         boolean rejected = false;
-        boolean overflowPassThrough = false;
+        boolean orderedBarrier = flushThenPass;
         Throwable rejectionFailure = null;
+        List<QueuedOutboundPacket> immediateRecovery = null;
         OutboundCompletion completion = new OutboundCompletion(listeners, originalPromise);
         synchronized (outboundQueue) {
             if (closed) {
                 rejected = true;
                 rejectionFailure = new ClosedChannelException();
             }
+            if (outboundRecovery && outboundQueue.size() <= OUTBOUND_RECOVERY_LOW_WATER) {
+                outboundRecovery = false;
+            }
             if (!rejected && flushThenPass && ownerToken != null) {
+                compactMovementRuns(owner, ownerToken);
                 markOwnerReady(outboundQueue, ownerToken);
                 lastFlushReason = "Flush then pass: " + owner.getName();
             }
-            // A ready transport barrier keeps later pass-through packets behind a
-            // partially drained lane without assigning them to another module.
             if (!rejected && !requestedDelay && outboundQueue.isEmpty()) return false;
             if (!rejected && !requestedDelay && !flushThenPass
                     && canBypassOutboundOrdering(outboundQueue, packet)) return false;
@@ -231,20 +236,36 @@ public final class PacketDelayManager {
             if (!rejected && owner != null && ownerQueueSize >= OUTBOUND_OWNER_HIGH_WATER) {
                 markOwnerReady(outboundQueue, ownerToken);
                 lastFlushReason = "Outbound owner overflow: " + owner.getName();
+                outboundRecovery = true;
                 overflow = true;
-            }
-            if (!rejected && owner != null && ownerQueueSize >= MAX_OUTBOUND_OWNER_QUEUE_SIZE) {
-                overflowPassThrough = true;
             }
             if (!rejected && outboundQueue.size() >= OUTBOUND_OVERFLOW_HIGH_WATER) {
                 markAllReadyLocked(outboundQueue);
                 lastFlushReason = "Outbound global overflow";
+                outboundRecovery = true;
                 overflow = true;
             }
-            if (!rejected && outboundQueue.size() >= MAX_OUTBOUND_QUEUE_SIZE) {
-                overflowPassThrough = true;
+            if (!rejected && outboundRecovery && requestedDelay) {
+                requestedDelay = false;
+                orderedBarrier = true;
             }
-            if (!rejected && !overflowPassThrough) {
+            if (!rejected && outboundQueue.size() >= MAX_OUTBOUND_QUEUE_SIZE) {
+                markAllReadyLocked(outboundQueue);
+                lastFlushReason = "Outbound hard-cap recovery";
+                outboundRecovery = true;
+                overflow = true;
+                immediateRecovery = new ArrayList<QueuedOutboundPacket>(MAX_OUTBOUND_RELEASES_PER_TICK);
+                pollReadyOutboundLocked(monotonicMillis(), MAX_OUTBOUND_RELEASES_PER_TICK, immediateRecovery);
+            }
+            if (!rejected && outboundQueue.size() >= MAX_OUTBOUND_QUEUE_SIZE) {
+                requestedDelay = false;
+                orderedBarrier = true;
+                if (!canBypassOutboundOrdering(outboundQueue, packet)) {
+                    rejected = true;
+                    rejectionFailure = new IllegalStateException("Outbound recovery queue saturated");
+                }
+            }
+            if (!rejected) {
                 long now = monotonicMillis();
                 outboundQueue.add(new QueuedOutboundPacket(
                     packet,
@@ -252,9 +273,10 @@ public final class PacketDelayManager {
                     ownerToken,
                     connection,
                     requestedDelay ? deadline(now, decision) : 0L,
-                    decision.getReleasePolicy() == PacketReleasePolicy.EXPLICIT_FLUSH,
+                    requestedDelay && decision.getReleasePolicy() == PacketReleasePolicy.EXPLICIT_FLUSH,
                     completion,
-                    decision.getLane()
+                    decision.getLane(),
+                    orderedBarrier || !requestedDelay
                 ));
             }
         }
@@ -263,10 +285,14 @@ public final class PacketDelayManager {
             logOverflow("outbound", ownerName);
             moduleManager.onPacketDelayOverflow(owner, true);
         }
-        if (overflowPassThrough) return false;
+        if (immediateRecovery != null) {
+            for (int index = 0; index < immediateRecovery.size(); index++) {
+                releaseOutbound(immediateRecovery.get(index));
+            }
+        }
         if (rejected) completion.fail(rejectionFailure == null
             ? new IllegalStateException("Outbound packet rejected") : rejectionFailure, connection);
-        return true;
+        return !rejected;
     }
 
     public boolean interceptInbound(Packet<?> packet, INetHandler listener) {
@@ -303,25 +329,49 @@ public final class PacketDelayManager {
 
         boolean overflow = false;
         boolean rejected = false;
+        boolean orderedBarrier = false;
+        List<QueuedInboundPacket> immediateRecovery = null;
         synchronized (inboundQueue) {
             if (closed) return true;
+            if (inboundRecovery && inboundQueue.size() <= INBOUND_RECOVERY_LOW_WATER) {
+                inboundRecovery = false;
+            }
             if (!requestedDelay && inboundQueue.isEmpty()) return false;
             int ownerQueueSize = owner == null ? 0 : countOwner(inboundQueue, ownerToken);
             if (owner != null && ownerQueueSize >= INBOUND_OWNER_HIGH_WATER) {
                 markOwnerReady(inboundQueue, ownerToken);
                 lastFlushReason = "Inbound owner overflow: " + owner.getName();
+                inboundRecovery = true;
                 overflow = true;
-            }
-            if (owner != null && ownerQueueSize >= MAX_INBOUND_OWNER_QUEUE_SIZE) {
-                rejected = true;
             }
             if (inboundQueue.size() >= INBOUND_OVERFLOW_HIGH_WATER) {
                 markAllReadyLocked(inboundQueue);
                 lastFlushReason = "Inbound global overflow";
+                inboundRecovery = true;
                 overflow = true;
                 pauseInbound(context);
             }
-            if (inboundQueue.size() >= MAX_INBOUND_QUEUE_SIZE) rejected = true;
+            if (inboundRecovery && requestedDelay) {
+                requestedDelay = false;
+                orderedBarrier = true;
+            }
+            if (inboundQueue.size() >= MAX_INBOUND_QUEUE_SIZE) {
+                markAllReadyLocked(inboundQueue);
+                lastFlushReason = "Inbound hard-cap recovery";
+                inboundRecovery = true;
+                overflow = true;
+                immediateRecovery = new ArrayList<QueuedInboundPacket>(MAX_INBOUND_RELEASES_PER_TICK);
+                for (int index = 0; index < MAX_INBOUND_RELEASES_PER_TICK; index++) {
+                    QueuedInboundPacket ready = pollReadyInboundLocked(monotonicMillis());
+                    if (ready == null) break;
+                    immediateRecovery.add(ready);
+                }
+            }
+            if (inboundQueue.size() >= MAX_INBOUND_QUEUE_SIZE) {
+                requestedDelay = false;
+                orderedBarrier = true;
+                if (!canBypassInboundOrdering(inboundQueue, decision.getLane())) rejected = true;
+            }
             if (!rejected) {
                 long now = monotonicMillis();
                 inboundQueue.add(new QueuedInboundPacket(
@@ -330,10 +380,11 @@ public final class PacketDelayManager {
                     ownerToken,
                     connection,
                     requestedDelay ? deadline(now, decision) : 0L,
-                    decision.getReleasePolicy() == PacketReleasePolicy.EXPLICIT_FLUSH,
+                    requestedDelay && decision.getReleasePolicy() == PacketReleasePolicy.EXPLICIT_FLUSH,
                     createInboundAction(packet, listener),
                     decision.shouldCancelOnRelease(),
-                    decision.getLane()
+                    decision.getLane(),
+                    orderedBarrier
                 ));
                 if (inboundQueue.size() >= INBOUND_RESUME_QUEUE_SIZE) pauseInbound(context);
             }
@@ -343,6 +394,11 @@ public final class PacketDelayManager {
             String ownerName = owner == null ? "Transport" : owner.getName();
             logOverflow("inbound", ownerName);
             moduleManager.onPacketDelayOverflow(owner, false);
+        }
+        if (immediateRecovery != null) {
+            for (int index = 0; index < immediateRecovery.size(); index++) {
+                releaseInbound(immediateRecovery.get(index));
+            }
         }
         return !rejected;
     }
@@ -357,7 +413,9 @@ public final class PacketDelayManager {
 
     private void resumeInboundIfDrained() {
         final Channel channel = pausedInboundChannel;
-        if (channel == null || inboundQueueSize() > INBOUND_RESUME_QUEUE_SIZE) return;
+        int queued = inboundQueueSize();
+        if (queued <= INBOUND_RECOVERY_LOW_WATER) inboundRecovery = false;
+        if (channel == null || queued > INBOUND_RESUME_QUEUE_SIZE) return;
         pausedInboundChannel = null;
         setAutoReadAsync(channel, true);
     }
@@ -370,7 +428,12 @@ public final class PacketDelayManager {
             boolean outbound = (requests & 2) != 0;
             boolean inbound = (requests & 4) != 0;
             OwnerToken token = module.getScope().getOwnerToken();
-            if (both || outbound) markOwnerReady(outboundQueue, token);
+            if (both || outbound) {
+                synchronized (outboundQueue) {
+                    compactMovementRuns(module, token);
+                    markOwnerReady(outboundQueue, token);
+                }
+            }
             if (both || inbound) markOwnerReady(inboundQueue, token);
             if (both || outbound || inbound) {
                 lastFlushReason = "Owner request: " + module.getName();
@@ -403,6 +466,7 @@ public final class PacketDelayManager {
         outboundReleaseBatch.clear();
         synchronized (outboundQueue) {
             pollReadyOutboundLocked(monotonicMillis(), limit, outboundReleaseBatch);
+            if (outboundQueue.size() <= OUTBOUND_RECOVERY_LOW_WATER) outboundRecovery = false;
         }
         for (int index = 0; index < outboundReleaseBatch.size(); index++) {
             releaseOutbound(outboundReleaseBatch.get(index));
@@ -412,13 +476,20 @@ public final class PacketDelayManager {
 
     private void pollReadyOutboundLocked(long now, int limit, List<QueuedOutboundPacket> ready) {
         blockedOutboundDomains.clear();
+        boolean unresolvedEarlier = false;
         java.util.Iterator<QueuedOutboundPacket> iterator = outboundQueue.iterator();
         while (iterator.hasNext() && ready.size() < limit) {
             QueuedOutboundPacket next = iterator.next();
+            if (next.orderedBarrier && unresolvedEarlier) break;
             String domain = next.lane.getDependencyDomain();
-            if (blockedOutboundDomains.contains(domain)) continue;
+            if (blockedOutboundDomains.contains(domain)) {
+                unresolvedEarlier = true;
+                continue;
+            }
             if (!next.isReady(now)) {
                 blockedOutboundDomains.add(domain);
+                unresolvedEarlier = true;
+                if (next.orderedBarrier) break;
                 continue;
             }
             iterator.remove();
@@ -443,13 +514,20 @@ public final class PacketDelayManager {
 
     private QueuedInboundPacket pollReadyInboundLocked(long now) {
         blockedInboundDomains.clear();
+        boolean unresolvedEarlier = false;
         java.util.Iterator<QueuedInboundPacket> iterator = inboundQueue.iterator();
         while (iterator.hasNext()) {
             QueuedInboundPacket next = iterator.next();
+            if (next.orderedBarrier && unresolvedEarlier) break;
             String domain = next.lane.getDependencyDomain();
-            if (blockedInboundDomains.contains(domain)) continue;
+            if (blockedInboundDomains.contains(domain)) {
+                unresolvedEarlier = true;
+                continue;
+            }
             if (!next.isReady(now)) {
                 blockedInboundDomains.add(domain);
+                unresolvedEarlier = true;
+                if (next.orderedBarrier) break;
                 continue;
             }
             iterator.remove();
@@ -532,9 +610,11 @@ public final class PacketDelayManager {
     private void clearQueues(Throwable failure) {
         synchronized (outboundQueue) {
             while (!outboundQueue.isEmpty()) outboundQueue.poll().fail(failure);
+            outboundRecovery = false;
         }
         synchronized (inboundQueue) {
             inboundQueue.clear();
+            inboundRecovery = false;
         }
         outboundFastTrack.clear();
         final Channel channel = pausedInboundChannel;
@@ -616,6 +696,7 @@ public final class PacketDelayManager {
         boolean onGround = false;
         long releaseAt = 0L;
         boolean indefinite = false;
+        boolean orderedBarrier = false;
         List<OutboundCompletion> completions = new ArrayList<OutboundCompletion>(run.size());
 
         for (QueuedOutboundPacket queued : run) {
@@ -634,6 +715,7 @@ public final class PacketDelayManager {
             onGround = movement.onGround;
             releaseAt = Math.max(releaseAt, queued.releaseAt);
             indefinite |= queued.indefinite;
+            orderedBarrier |= queued.orderedBarrier;
             completions.addAll(queued.completions);
         }
 
@@ -648,7 +730,7 @@ public final class PacketDelayManager {
             merged = new C03PacketPlayer(onGround);
         }
         destination.add(new QueuedOutboundPacket(merged, last.owner, last.ownerToken,
-            last.connection, releaseAt, indefinite, completions, last.lane));
+            last.connection, releaseAt, indefinite, completions, last.lane, orderedBarrier));
         run.clear();
     }
 
@@ -707,6 +789,14 @@ public final class PacketDelayManager {
             if (!moduleManager.shouldBypassOutboundOrdering(queued.owner, packet)) return false;
         }
         return ownedBacklog;
+    }
+
+    private boolean canBypassInboundOrdering(Queue<QueuedInboundPacket> queue, PacketLane lane) {
+        String domain = lane == null ? "transport" : lane.getDependencyDomain();
+        for (QueuedInboundPacket queued : queue) {
+            if (domain.equals(queued.lane.getDependencyDomain())) return false;
+        }
+        return true;
     }
 
     private static String join(Set<String> values) {
@@ -768,16 +858,18 @@ public final class PacketDelayManager {
         protected final OwnerToken ownerToken;
         protected final NetworkManager connection;
         protected final PacketLane lane;
+        protected final boolean orderedBarrier;
         protected long releaseAt;
         protected boolean indefinite;
 
         private OwnedQueuedPacket(Module owner, OwnerToken ownerToken, NetworkManager connection,
-                long releaseAt, boolean indefinite, PacketLane lane) {
+                long releaseAt, boolean indefinite, PacketLane lane, boolean orderedBarrier) {
             this.owner = owner;
             this.ownerToken = ownerToken;
             this.connection = connection;
             this.releaseAt = releaseAt;
             this.indefinite = indefinite;
+            this.orderedBarrier = orderedBarrier;
             this.lane = lane == null
                 ? new PacketLane(null, PacketLane.Direction.OUTBOUND, "transport") : lane;
         }
@@ -804,10 +896,11 @@ public final class PacketDelayManager {
             long releaseAt,
             boolean indefinite,
             OutboundCompletion completion,
-            PacketLane lane
+            PacketLane lane,
+            boolean orderedBarrier
         ) {
             this(packet, owner, ownerToken, connection, releaseAt, indefinite,
-                Collections.singletonList(completion), lane);
+                Collections.singletonList(completion), lane, orderedBarrier);
         }
 
         private QueuedOutboundPacket(
@@ -818,9 +911,10 @@ public final class PacketDelayManager {
             long releaseAt,
             boolean indefinite,
             List<OutboundCompletion> completions,
-            PacketLane lane
+            PacketLane lane,
+            boolean orderedBarrier
         ) {
-            super(owner, ownerToken, connection, releaseAt, indefinite, lane);
+            super(owner, ownerToken, connection, releaseAt, indefinite, lane, orderedBarrier);
             this.packet = packet;
             this.completions = completions;
         }
@@ -923,9 +1017,10 @@ public final class PacketDelayManager {
             boolean indefinite,
             Runnable action,
             boolean cancelOnRelease,
-            PacketLane lane
+            PacketLane lane,
+            boolean orderedBarrier
         ) {
-            super(owner, ownerToken, connection, releaseAt, indefinite, lane);
+            super(owner, ownerToken, connection, releaseAt, indefinite, lane, orderedBarrier);
             this.packet = packet;
             this.action = action;
             this.cancelOnRelease = cancelOnRelease;

@@ -437,18 +437,21 @@ public final class ConfigManager {
         File bedwarsLegit = getConfigFile("bedwars-legit");
         File bedwarsAggressive = getConfigFile("bedwars-aggressive");
         File bedwarsAggressiveV2 = getConfigFile("bedwars-aggressive-v2");
+        File bedwarsSmoothV2 = getConfigFile("bedwars-smooth-v2");
         boolean createSurvival = !survival.isFile();
         boolean createBedwarsSurvival = !bedwarsSurvival.isFile();
         boolean createBedwarsLegit = !bedwarsLegit.isFile();
         boolean createBedwarsAggressive = !bedwarsAggressive.isFile();
         boolean createBedwarsAggressiveV2 = !bedwarsAggressiveV2.isFile();
+        boolean createBedwarsSmoothV2 = !bedwarsSmoothV2.isFile();
         if (!createSurvival && !createBedwarsSurvival && !createBedwarsLegit
-                && !createBedwarsAggressive && !createBedwarsAggressiveV2) {
+                && !createBedwarsAggressive && !createBedwarsAggressiveV2 && !createBedwarsSmoothV2) {
             ensureUtilityProfileEntries(survival);
             ensureUtilityProfileEntries(bedwarsSurvival);
             ensureUtilityProfileEntries(bedwarsLegit);
             ensureUtilityProfileEntries(bedwarsAggressive);
             ensureUtilityProfileEntries(bedwarsAggressiveV2);
+            ensureUtilityProfileEntries(bedwarsSmoothV2);
             return;
         }
 
@@ -562,23 +565,26 @@ public final class ConfigManager {
 
         addModule(modules, "LegitScaffold", true, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("Pitch Check", false),
-            setting("Sneak Delay", 85)
+            setting("Sneak Delay", 60),
+            setting("Range", 4.2D),
+            setting("Sneak Assist", true),
+            setting("Edge Only", true)
         );
         addModule(modules, "Clutch", true, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("Trigger", "PREDICTED_DANGER"),
             setting("Blocks", 6.0D),
-            setting("Silent Aim", false),
+            setting("Silent Aim", true),
             setting("Rotate Back", true),
             setting("Return To Slot", true),
             setting("Clutch Move Delay", 0),
-            setting("Max Blocks", 16),
-            setting("Rotation Speed", 72.0D),
+            setting("Max Blocks", 8),
+            setting("Rotation Speed", 90.0D),
             setting("Filter Mode", "NONE"),
             setting("Range", 4),
-            setting("FOV", 160),
-            setting("Minimum Height", 2),
-            setting("Click Speed", 14),
-            setting("Randomization", 8),
+            setting("FOV", 180),
+            setting("Minimum Height", 1),
+            setting("Click Speed", 12),
+            setting("Randomization", 0),
             setting("Select Blocks", "ALWAYS"),
             setting("Only Place Sideways", false),
             setting("Aim Acceleration", 35),
@@ -588,12 +594,16 @@ public final class ConfigManager {
             setting("Snap Back Duration", 4),
             setting("Keep Jump Direction", true),
             setting("Disable Afterwards", false),
-            setting("Only Mid-Air", true),
+            setting("Only Mid-Air", false),
             setting("Recently Damaged", false),
             setting("Moving Backwards", false),
             setting("Recovery Mode", "EMERGENCY_BRIDGE"),
-            setting("Prediction Ticks", 4),
-            setting("Confirmation Ticks", 2)
+            setting("Prediction Ticks", 5),
+            setting("Confirmation Ticks", 4),
+            setting("Telly Assist", false),
+            setting("Telly CPS", 20.0D),
+            setting("Telly Flick Speed", 3),
+            setting("Telly Overshoot", 2.0D)
         );
         addModule(modules, "AntiFireball", false, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("FOV", 180),
@@ -607,8 +617,13 @@ public final class ConfigManager {
         addModule(modules, "AimAssist", false, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("Rotation Speed", 3),
             setting("Randomization", 4),
-            setting("FOV", 80),
+            setting("FOV", 90),
             setting("Distance", 4.0D),
+            setting("Horizontal Speed", 6),
+            setting("Vertical Speed", 6),
+            setting("Prediction Ticks", 3),
+            setting("Target Lock Grace", 150),
+            setting("Rotation Acceleration", 60),
             setting("Target Type", "MOBS"),
             setting("Click Aim", true),
             setting("Weapon Only", false),
@@ -620,6 +635,9 @@ public final class ConfigManager {
             setting("Range (Attack)", 3.0D),
             setting("Range (Swing)", 4.0D),
             setting("Range (Aim)", 4.0D),
+            setting("Rotation Speed", 10),
+            setting("Rotation Mode", "SILENT"),
+            setting("Target Priority", "HEALTH"),
             setting("Switch Delay", 250),
             setting("Targets", 1),
             setting("Target Type", "MOBS"),
@@ -635,9 +653,9 @@ public final class ConfigManager {
             setting("Break Blocks", true),
             setting("Weapon Only", false),
             setting("Inventory Fill", false),
-            setting("Min CPS", 8),
-            setting("Max CPS", 12),
-            setting("Jitter", 0)
+            setting("Min CPS", 10.0D),
+            setting("Max CPS", 14.0D),
+            setting("Jitter", 2)
         );
         addModule(modules, "RightClicker", false, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("Mode", "NORMAL"),
@@ -658,8 +676,8 @@ public final class ConfigManager {
 
         addModule(modules, "Velocity", false, org.lwjgl.input.Keyboard.KEY_NONE,
             setting("Mode", "REGULAR"),
-            setting("Horizontal", 90),
-            setting("Vertical", 100),
+            setting("Horizontal", 70),
+            setting("Vertical", 80),
             setting("Chance", 100),
             setting("Explosions", true),
             setting("FOV", 360),
@@ -762,6 +780,7 @@ public final class ConfigManager {
         JsonObject legitRoot = createBedwarsProfile(root, false);
         JsonObject aggressiveRoot = createBedwarsProfile(root, true);
         JsonObject aggressiveV2Root = createBedwarsAggressiveV2(aggressiveRoot);
+        JsonObject smoothV2Root = createBedwarsSmoothV2(root);
         if (createSurvival) {
             writeConfigJson(survival, root);
         } else {
@@ -787,6 +806,34 @@ public final class ConfigManager {
         } else {
             ensureUtilityProfileEntries(bedwarsAggressiveV2);
         }
+        if (createBedwarsSmoothV2) {
+            writeConfigJson(bedwarsSmoothV2, smoothV2Root);
+        } else {
+            ensureUtilityProfileEntries(bedwarsSmoothV2);
+        }
+    }
+
+    private JsonObject createBedwarsSmoothV2(JsonObject base) {
+        JsonObject profile = createBedwarsProfile(base, false);
+        setModuleEnabled(profile, "Clutch", true);
+        setModuleSetting(profile, "Clutch", "Trigger", "PREDICTED_DANGER");
+        setModuleSetting(profile, "Clutch", "Silent Aim", true);
+        setModuleSetting(profile, "Clutch", "Prediction Ticks", 5);
+        setModuleSetting(profile, "Clutch", "Confirmation Ticks", 4);
+        setModuleSetting(profile, "Clutch", "Minimum Height", 1);
+        setModuleSetting(profile, "Clutch", "Rotation Speed", 90.0D);
+        setModuleSetting(profile, "Clutch", "Multipoint", true);
+        setModuleEnabled(profile, "LegitScaffold", true);
+        setModuleSetting(profile, "LegitScaffold", "Placement Assist", false);
+        setModuleEnabled(profile, "KillAura", false);
+        setModuleEnabled(profile, "Reach", false);
+        setModuleEnabled(profile, "Velocity", false);
+        setModuleEnabled(profile, "Hit Select", false);
+        setModuleEnabled(profile, "Criticals", false);
+        for (String lagModule : new String[] {"Fake Lag", "Blink", "Backtrack", "Lag Range", "Knockback Delay"}) {
+            setModuleEnabled(profile, lagModule, false);
+        }
+        return profile;
     }
 
     private JsonObject createBedwarsAggressiveV2(JsonObject base) {
@@ -797,6 +844,9 @@ public final class ConfigManager {
         setModuleSetting(profile, "KillAura", "Range (Attack)", 3.2D);
         setModuleSetting(profile, "KillAura", "Range (Swing)", 4.5D);
         setModuleSetting(profile, "KillAura", "Range (Aim)", 4.5D);
+        setModuleSetting(profile, "KillAura", "Rotation Speed", 12);
+        setModuleSetting(profile, "KillAura", "Rotation Mode", "SILENT");
+        setModuleSetting(profile, "KillAura", "Target Priority", "DISTANCE");
 
         setModuleEnabled(profile, "AimAssist", true);
         setModuleSetting(profile, "AimAssist", "Aim Mode", "SILENT");
@@ -882,6 +932,9 @@ public final class ConfigManager {
         setModuleSetting(profile, "KillAura", "Range (Attack)", aggressive ? 3.2D : 3.0D);
         setModuleSetting(profile, "KillAura", "Range (Swing)", aggressive ? 4.2D : 4.0D);
         setModuleSetting(profile, "KillAura", "Range (Aim)", aggressive ? 4.5D : 4.0D);
+        setModuleSetting(profile, "KillAura", "Rotation Speed", aggressive ? 12 : 8);
+        setModuleSetting(profile, "KillAura", "Rotation Mode", "SILENT");
+        setModuleSetting(profile, "KillAura", "Target Priority", "DISTANCE");
         setModuleSetting(profile, "KillAura", "Weapon Only", true);
 
         setModuleEnabled(profile, "Reach", aggressive);

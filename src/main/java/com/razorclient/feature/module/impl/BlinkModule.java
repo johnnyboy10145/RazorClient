@@ -141,12 +141,14 @@ public final class BlinkModule extends Module {
 
     @Override
     public boolean shouldBypassOutboundOrdering(Packet<?> packet) {
-        return isEnabled() && !disablePending && activeDirection.outbound && bypassesProtocolPacket(packet);
+        return bypassesProtocolPacket(packet);
     }
 
     @Override
     public boolean shouldHoldInboundPacket(Packet<?> packet) {
-        if (!activeDirection.inbound) return false;
+        if (!activeDirection.inbound
+                || (allowKeepAlives.isEnabled()
+                    && LagModuleSupport.isInboundKeepAliveOrTransactionPacket(packet))) return false;
         heldInboundPackets = true;
         if (statusUntil == 0L) status = Status.HOLDING;
         return true;

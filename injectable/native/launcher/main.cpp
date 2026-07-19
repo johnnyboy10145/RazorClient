@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
@@ -24,6 +25,15 @@
 #include "resource.h"
 #include "compat_public_key.h"
 #include "payload_hashes.h"
+#include "payload_key.h"
+#include "app_config.hpp"
+#include "data_crypto.hpp"
+#include "event_logger.hpp"
+#include "module_loader.hpp"
+#include "process_info.hpp"
+#include "process_watcher.hpp"
+#include "resource_guard.hpp"
+#include "string_protect.hpp"
 
 namespace {
 std::wstring status = L"Launch Lunar 1.8.9 first, then press Inject.";
@@ -33,6 +43,7 @@ HWND injectButton{};
 HWND diagnosticsButton{};
 HWND passwordEdit{};
 HWND unlockButton{};
+HWND detailsEdit{};
 HINSTANCE appInstance{};
 HFONT titleFont{};
 HFONT bodyFont{};
@@ -42,20 +53,29 @@ int injectionExitCode = 1;
 std::string fingerprintDetail;
 DWORD lastInjectError = 0;
 bool passwordAccepted = false;
+bool configLoaded = false;
+bool diagnosticsInProgress = false;
+std::wstring configuredPassword = L"NERVE";
+std::wstring effectiveManifestUrl = L"https://joisthegayest.com/razorclient/compat.json";
+DWORD configuredTimeoutMs = 30000;
 std::string remoteCompatStatus = "not checked";
 std::atomic<bool> injectionInProgress{false};
 std::mutex statusMutex;
+std::mutex detailsMutex;
+std::wstring details = L"Ready.";
+ProcessWatcher targetWatcher;
+ThreadGuard injectionWorkerHandle;
+ThreadGuard diagnosticsWorkerHandle;
 
 constexpr DWORD WM_INJECTION_FINISHED = WM_APP + 1;
+constexpr DWORD WM_DIAGNOSTICS_FINISHED = WM_APP + 2;
+constexpr DWORD WM_TARGET_EXITED = WM_APP + 3;
 constexpr size_t MAX_MANIFEST_ENVELOPE_BYTES = 1024 * 1024;
 constexpr size_t MAX_MANIFEST_PAYLOAD_BYTES = 512 * 1024;
 constexpr unsigned long long MAX_MANIFEST_LIFETIME_SECONDS = 30ULL * 24ULL * 60ULL * 60ULL;
 constexpr unsigned long long MANIFEST_CLOCK_SKEW_SECONDS = 5ULL * 60ULL;
 
-bool processHasJvm(HANDLE process);
 std::wstring jvmModulePath(HANDLE process);
-
-const wchar_t* COMPAT_MANIFEST_URL = L"https://joisthegayest.com/razorclient/compat.json";
 
 #ifdef RAZORCLIENT_RELEASE
 constexpr bool REQUIRE_SIGNED_COMPAT = true;
@@ -193,14 +213,10 @@ std::filesystem::path currentExePath() {
     return std::filesystem::path(path);
 }
 
-bool commandLineHasPassword() {
-    const wchar_t* commandLine = GetCommandLineW();
-    return wcsstr(commandLine, L"--password=NERVE") || wcsstr(commandLine, L"--password NERVE");
-}
-
 void writeLauncherLogLine(const std::wstring& line) {
     auto directory=localRazorDirectory(); std::filesystem::create_directories(directory);
     std::wofstream out(directory/L"launcher.log",std::ios::app); out<<timestamp()<<L" "<<line<<L'\n';
+    LOG_INFO(narrow(line));
 }
 
 std::wstring currentStatus() {
@@ -214,6 +230,52 @@ void setStatus(std::wstring value) {
         status = std::move(value);
     }
     if (windowHandle) PostMessageW(windowHandle, WM_APP, 0, 0);
+}
+
+std::wstring currentDetails() {
+    std::lock_guard<std::mutex> lock(detailsMutex);
+    return details;
+}
+
+void setDetails(std::wstring value) {
+    {
+        std::lock_guard<std::mutex> lock(detailsMutex);
+        details = std::move(value);
+    }
+    if (windowHandle) PostMessageW(windowHandle, WM_APP, 0, 0);
+}
+
+bool isHttpsUrl(const std::wstring& value) {
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
+    components.dwSchemeLength = static_cast<DWORD>(-1);
+    return !value.empty() && WinHttpCrackUrl(value.c_str(), 0, 0, &components) &&
+        components.nScheme == INTERNET_SCHEME_HTTPS;
+}
+
+LogLevel parseLogLevel(const std::string& value) {
+    if (_stricmp(value.c_str(), "DEBUG") == 0) return LogLevel::DEBUG;
+    if (_stricmp(value.c_str(), "WARNING") == 0 || _stricmp(value.c_str(), "WARN") == 0) return LogLevel::WARNING;
+    if (_stricmp(value.c_str(), "ERROR") == 0) return LogLevel::ERROR;
+    if (_stricmp(value.c_str(), "FATAL") == 0) return LogLevel::FATAL;
+    return LogLevel::INFO;
+}
+
+void initializeSharedSystems() {
+    Config& config = Config::Instance();
+    configLoaded = config.Load();
+    EventLogger::Instance().SetMinLevel(parseLogLevel(config.Get<std::string>("log_level", "INFO")));
+    configuredPassword = widen(config.Get<std::string>("password", "NERVE"));
+    if (configuredPassword.empty()) configuredPassword = L"NERVE";
+    const std::wstring requestedUrl = widen(config.Get<std::string>(
+        "manifest_url", "https://joisthegayest.com/razorclient/compat.json"));
+    effectiveManifestUrl = isHttpsUrl(requestedUrl)
+        ? requestedUrl
+        : L"https://joisthegayest.com/razorclient/compat.json";
+    const int timeout = config.Get<int>("timeout_ms", 30000);
+    configuredTimeoutMs = static_cast<DWORD>((std::max)(5000, (std::min)(120000, timeout)));
+    writeLauncherLogLine(L"Configuration " + std::wstring(configLoaded ? L"loaded" : L"using defaults") +
+        L" manifest=" + effectiveManifestUrl + L" timeoutMs=" + std::to_wstring(configuredTimeoutMs));
 }
 
 void writeLauncherLog() {
@@ -380,6 +442,17 @@ bool embeddedPayloadAvailable() {
     return embeddedResourceExists(IDR_BOOTSTRAP) && embeddedResourceExists(IDR_AGENT);
 }
 
+bool embeddedResourceHasPlaintextMagic(WORD id) {
+    HMODULE module = appInstance ? appInstance : GetModuleHandleW(nullptr);
+    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(id), RT_RCDATA);
+    if (!resource || SizeofResource(module, resource) < 2u) return false;
+    HGLOBAL loaded = LoadResource(module, resource);
+    const auto* bytes = loaded ? static_cast<const unsigned char*>(LockResource(loaded)) : nullptr;
+    if (!bytes) return false;
+    return (id == IDR_BOOTSTRAP && bytes[0] == 'M' && bytes[1] == 'Z') ||
+        (id == IDR_AGENT && bytes[0] == 'P' && bytes[1] == 'K');
+}
+
 std::string readTextFileBounded(const std::filesystem::path& path, size_t maximumBytes) {
     std::error_code ec;
     const auto size = std::filesystem::file_size(path, ec);
@@ -437,7 +510,7 @@ bool fetchRemoteCompatManifest(std::string& manifest) {
     parts.dwHostNameLength = 256;
     parts.lpszUrlPath = path;
     parts.dwUrlPathLength = 2048;
-    if (!WinHttpCrackUrl(COMPAT_MANIFEST_URL, 0, 0, &parts)) {
+    if (!WinHttpCrackUrl(effectiveManifestUrl.c_str(), 0, 0, &parts)) {
         remoteCompatStatus = "invalid manifest URL";
         return false;
     }
@@ -917,23 +990,25 @@ LunarBuildDetection detectLunarBuild(const ProcessCandidate* target = nullptr) {
 
 std::vector<ProcessCandidate> lunarProcesses() {
     std::vector<ProcessCandidate> result;
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return result;
-    PROCESSENTRY32W entry{sizeof(entry)};
-    for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
-        if (_wcsicmp(entry.szExeFile, L"javaw.exe") != 0 && _wcsicmp(entry.szExeFile, L"java.exe") != 0) continue;
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, entry.th32ProcessID);
-        wchar_t path[32768]{}; DWORD size = 32768;
-        if (process && QueryFullProcessImageNameW(process, 0, path, &size)) {
-            std::wstring value(path);
-            std::wstring jvmPath = jvmModulePath(process);
-            if (value.find(L"\\.lunarclient\\jre\\") != std::wstring::npos && !jvmPath.empty()) {
+    for (const ProcessInfo& info : ProcessUtils::GetProcesses()) {
+        if (_wcsicmp(info.name.c_str(), L"javaw.exe") != 0 &&
+                _wcsicmp(info.name.c_str(), L"java.exe") != 0) continue;
+        HandleGuard process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION |
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, info.pid));
+        if (process) {
+            const std::vector<ModuleInfo> modules = ProcessUtils::GetModules(info.pid);
+            const bool hasJvm = std::any_of(modules.begin(), modules.end(), [](const ModuleInfo& module) {
+                return _wcsicmp(module.name.c_str(), L"jvm.dll") == 0;
+            });
+            const std::wstring value = info.exePath;
+            std::wstring jvmPath = hasJvm ? jvmModulePath(process.get()) : std::wstring{};
+            if (value.find(L"\\.lunarclient\\jre\\") != std::wstring::npos && hasJvm && !jvmPath.empty()) {
                 FILETIME created{}, exited{}, kernel{}, user{};
                 BOOL wow64 = TRUE;
-                const bool hasCreationTime = GetProcessTimes(process, &created, &exited, &kernel, &user) != FALSE;
-                const bool architectureKnown = IsWow64Process(process, &wow64) != FALSE;
+                const bool hasCreationTime = GetProcessTimes(process.get(), &created, &exited, &kernel, &user) != FALSE;
+                const bool architectureKnown = IsWow64Process(process.get(), &wow64) != FALSE;
                 result.push_back(ProcessCandidate{
-                    entry.th32ProcessID,
+                    info.pid,
                     value,
                     jvmPath,
                     hasCreationTime ? fileTimeValue(created) : 0,
@@ -942,17 +1017,11 @@ std::vector<ProcessCandidate> lunarProcesses() {
             } else if (!jvmPath.empty() && (value.find(L"\\.minecraft\\") != std::wstring::npos ||
                        value.find(L"Microsoft.4297127D64EC6") != std::wstring::npos ||
                        value.find(L"\\java-runtime-") != std::wstring::npos)) {
-                writeLauncherLogLine(L"Ignored non-Lunar Minecraft JVM pid=" + std::to_wstring(entry.th32ProcessID) + L" exe=" + value + L" jvm=" + jvmPath);
+                writeLauncherLogLine(L"Ignored non-Lunar Minecraft JVM pid=" + std::to_wstring(info.pid) + L" exe=" + value + L" jvm=" + jvmPath);
             }
         }
-        if (process) CloseHandle(process);
     }
-    CloseHandle(snapshot);
     return result;
-}
-
-bool processHasJvm(HANDLE process) {
-    return !jvmModulePath(process).empty();
 }
 
 std::wstring jvmModulePath(HANDLE process) {
@@ -975,31 +1044,17 @@ std::wstring jvmModulePath(HANDLE process) {
     return {};
 }
 
-std::filesystem::path exeDirectory() {
-    wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW(appInstance ? appInstance : GetModuleHandleW(nullptr), path, MAX_PATH);
-    return std::filesystem::path(path).parent_path();
-}
-
-bool copyAdjacentPayload(const wchar_t* name, const std::filesystem::path& target) {
-    auto source = exeDirectory() / name;
-    if (!std::filesystem::exists(source)) return false;
-    std::error_code ec;
-    std::filesystem::copy_file(source, target, std::filesystem::copy_options::overwrite_existing, ec);
-    return !ec && std::filesystem::exists(target) && std::filesystem::file_size(target) > 0;
-}
-
-bool extract(WORD id, const wchar_t* adjacentName, const std::filesystem::path& target) {
-    HMODULE module = appInstance ? appInstance : GetModuleHandleW(nullptr);
-    HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(id), RT_RCDATA);
-    if (!resource) return copyAdjacentPayload(adjacentName, target) && verifyExpectedPayloadHash(id, target) && (id != IDR_BOOTSTRAP || verifyAuthenticode(target));
-    HGLOBAL loaded = LoadResource(module, resource);
-    DWORD size = SizeofResource(module, resource);
-    void* bytes = LockResource(loaded);
-    if (!loaded || !bytes || size == 0) return copyAdjacentPayload(adjacentName, target) && verifyExpectedPayloadHash(id, target) && (id != IDR_BOOTSTRAP || verifyAuthenticode(target));
+bool extract(WORD id, const wchar_t*, const std::filesystem::path& target) {
+    const std::string payloadKey = OBFUSCATE(RAZORCLIENT_PAYLOAD_KEY_LITERAL).decrypt();
+    std::vector<std::uint8_t> plaintext;
+    if (!DataCrypto::DecryptResource(id, payloadKey, plaintext) || plaintext.empty()) {
+        writeLauncherLogLine(L"Encrypted resource decryption failed for id=" + std::to_wstring(id));
+        return false;
+    }
     const std::filesystem::path temporary = target.wstring() + L".tmp";
     std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-    out.write(static_cast<const char*>(bytes), size);
+    out.write(reinterpret_cast<const char*>(plaintext.data()),
+        static_cast<std::streamsize>(plaintext.size()));
     out.flush();
     const bool written = out.good();
     out.close();
@@ -1011,82 +1066,7 @@ bool extract(WORD id, const wchar_t* adjacentName, const std::filesystem::path& 
     }
     std::error_code cleanupError;
     std::filesystem::remove(temporary, cleanupError);
-    return copyAdjacentPayload(adjacentName, target) && verifyExpectedPayloadHash(id, target) && (id != IDR_BOOTSTRAP || verifyAuthenticode(target));
-}
-
-class UniqueHandle {
-public:
-    explicit UniqueHandle(HANDLE value = nullptr) : value_(value) {}
-    ~UniqueHandle() { if (value_ && value_ != INVALID_HANDLE_VALUE) CloseHandle(value_); }
-    UniqueHandle(const UniqueHandle&) = delete;
-    UniqueHandle& operator=(const UniqueHandle&) = delete;
-    HANDLE get() const { return value_; }
-    explicit operator bool() const { return value_ && value_ != INVALID_HANDLE_VALUE; }
-private:
-    HANDLE value_;
-};
-
-class UniqueModule {
-public:
-    explicit UniqueModule(HMODULE value = nullptr) : value_(value) {}
-    ~UniqueModule() { if (value_) FreeLibrary(value_); }
-    UniqueModule(const UniqueModule&) = delete;
-    UniqueModule& operator=(const UniqueModule&) = delete;
-    HMODULE get() const { return value_; }
-    explicit operator bool() const { return value_ != nullptr; }
-private:
-    HMODULE value_;
-};
-
-class RemoteAllocation {
-public:
-    RemoteAllocation(HANDLE process, size_t size) : process_(process) {
-        address_ = VirtualAllocEx(process_, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    }
-    ~RemoteAllocation() { if (address_) VirtualFreeEx(process_, address_, 0, MEM_RELEASE); }
-    RemoteAllocation(const RemoteAllocation&) = delete;
-    RemoteAllocation& operator=(const RemoteAllocation&) = delete;
-    void* get() const { return address_; }
-    void abandon() { address_ = nullptr; }
-    explicit operator bool() const { return address_ != nullptr; }
-private:
-    HANDLE process_{};
-    void* address_{};
-};
-
-void* remoteFunctionAddress(HANDLE process, const char* functionName) {
-    HMODULE localKernel = GetModuleHandleW(L"kernel32.dll");
-    FARPROC localFunction = localKernel ? GetProcAddress(localKernel, functionName) : nullptr;
-    if (!localFunction) return nullptr;
-
-    HMODULE localOwner = nullptr;
-    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(localFunction), &localOwner) || !localOwner) return nullptr;
-    wchar_t ownerName[MAX_PATH]{};
-    if (!GetModuleBaseNameW(GetCurrentProcess(), localOwner, ownerName, MAX_PATH)) return nullptr;
-
-    const auto base = reinterpret_cast<const unsigned char*>(localOwner);
-    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
-    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
-    const auto rva = reinterpret_cast<const unsigned char*>(localFunction) - base;
-    if (rva < 0 || static_cast<size_t>(rva) >= nt->OptionalHeader.SizeOfImage) return nullptr;
-
-    DWORD needed = 0;
-    if (!EnumProcessModulesEx(process, nullptr, 0, &needed, LIST_MODULES_64BIT) || needed == 0) return nullptr;
-    std::vector<HMODULE> modules((needed + sizeof(HMODULE) - 1) / sizeof(HMODULE));
-    if (!EnumProcessModulesEx(process, modules.data(), static_cast<DWORD>(modules.size() * sizeof(HMODULE)),
-            &needed, LIST_MODULES_64BIT)) return nullptr;
-    const size_t count = std::min(modules.size(), static_cast<size_t>(needed / sizeof(HMODULE)));
-    for (size_t index = 0; index < count; ++index) {
-        wchar_t candidateName[MAX_PATH]{};
-        if (GetModuleBaseNameW(process, modules[index], candidateName, MAX_PATH) &&
-                _wcsicmp(candidateName, ownerName) == 0) {
-            return reinterpret_cast<unsigned char*>(modules[index]) + rva;
-        }
-    }
-    return nullptr;
+    return false;
 }
 
 struct ReusableBootstrap {
@@ -1145,18 +1125,29 @@ bool findReusableBootstrap(HANDLE process, const std::filesystem::path& currentD
 }
 
 void* remoteBootstrapExport(const ReusableBootstrap& bootstrap, const char* exportName) {
-    UniqueModule local(LoadLibraryExW(bootstrap.dllPath.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES));
-    FARPROC exported = local ? GetProcAddress(local.get(), exportName) : nullptr;
-    if (!exported) return nullptr;
+    HMODULE local = LoadLibraryExW(bootstrap.dllPath.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+    if (!local) return nullptr;
+    FARPROC exported = GetProcAddress(local, exportName);
+    if (!exported) {
+        FreeLibrary(local);
+        return nullptr;
+    }
 
-    const auto base = reinterpret_cast<const unsigned char*>(local.get());
+    const auto base = reinterpret_cast<const unsigned char*>(local);
     const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        FreeLibrary(local);
+        return nullptr;
+    }
     const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        FreeLibrary(local);
+        return nullptr;
+    }
     const auto rva = reinterpret_cast<const unsigned char*>(exported) - base;
-    if (rva < 0 || static_cast<size_t>(rva) >= nt->OptionalHeader.SizeOfImage) return nullptr;
-    return reinterpret_cast<unsigned char*>(bootstrap.remoteBase) + rva;
+    const bool valid = rva >= 0 && static_cast<size_t>(rva) < nt->OptionalHeader.SizeOfImage;
+    FreeLibrary(local);
+    return valid ? reinterpret_cast<unsigned char*>(bootstrap.remoteBase) + rva : nullptr;
 }
 
 enum class BootstrapReuseResult { NotFound, Restarted, Failed };
@@ -1174,7 +1165,7 @@ BootstrapReuseResult restartReusableBootstrap(HANDLE process, const std::filesys
 
     const std::wstring path = statusPath.wstring();
     const size_t bytes = (path.size() + 1) * sizeof(wchar_t);
-    RemoteAllocation remoteStatus(process, bytes);
+    RemoteMemoryGuard remoteStatus(process, bytes);
     SIZE_T written = 0;
     if (!remoteStatus || !WriteProcessMemory(process, remoteStatus.get(), path.c_str(), bytes, &written) ||
             written != bytes) {
@@ -1182,7 +1173,7 @@ BootstrapReuseResult restartReusableBootstrap(HANDLE process, const std::filesys
         return BootstrapReuseResult::Failed;
     }
 
-    UniqueHandle thread(CreateRemoteThread(process, nullptr, 0,
+    ThreadGuard thread(CreateRemoteThread(process, nullptr, 0,
         reinterpret_cast<LPTHREAD_START_ROUTINE>(restartAddress), remoteStatus.get(), 0, nullptr));
     if (!thread) {
         lastInjectError = GetLastError();
@@ -1194,7 +1185,7 @@ BootstrapReuseResult restartReusableBootstrap(HANDLE process, const std::filesys
     if (!restarted) {
         if (wait == WAIT_TIMEOUT) {
             lastInjectError = WAIT_TIMEOUT;
-            remoteStatus.abandon();
+            static_cast<void>(remoteStatus.release());
         } else {
             lastInjectError = code ? code : GetLastError();
         }
@@ -1208,44 +1199,42 @@ bool inject(DWORD pid, const std::filesystem::path& dll, const std::filesystem::
         const std::filesystem::path& statusPath, bool& reusedBootstrap) {
     lastInjectError = 0;
     reusedBootstrap = false;
-    UniqueHandle process(OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+    const std::wstring eventName = L"Local\\RazorClient_Bootstrap_Loaded_" + std::to_wstring(pid);
+    HandleGuard bootstrapEvent(CreateEventW(nullptr, TRUE, FALSE, eventName.c_str()));
+    if (!bootstrapEvent) {
+        lastInjectError = GetLastError();
+        return false;
+    }
+    ResetEvent(bootstrapEvent.get());
+    HandleGuard process(OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
         PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid));
     if (!process) { lastInjectError = GetLastError(); return false; }
 
     const BootstrapReuseResult reuse = restartReusableBootstrap(process.get(), dll, jar, statusPath);
     if (reuse == BootstrapReuseResult::Restarted) {
         reusedBootstrap = true;
+        const DWORD eventWait = WaitForSingleObject(bootstrapEvent.get(), configuredTimeoutMs);
+        if (eventWait != WAIT_OBJECT_0) {
+            lastInjectError = eventWait == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+            return false;
+        }
+        writeLauncherLogLine(L"Bootstrap event confirmed " + eventName);
         return true;
     }
     if (reuse == BootstrapReuseResult::Failed) return false;
 
-    void* remoteLoadLibrary = remoteFunctionAddress(process.get(), "LoadLibraryW");
-    if (!remoteLoadLibrary) { lastInjectError = ERROR_PROC_NOT_FOUND; return false; }
-    std::wstring path = dll.wstring();
-    size_t bytes = (path.size() + 1) * sizeof(wchar_t);
-    RemoteAllocation remote(process.get(), bytes);
-    SIZE_T written = 0;
-    bool ok = remote && WriteProcessMemory(process.get(), remote.get(), path.c_str(), bytes, &written) && written == bytes;
-    if (!ok) lastInjectError = GetLastError();
-    UniqueHandle thread(ok ? CreateRemoteThread(process.get(), nullptr, 0,
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(remoteLoadLibrary), remote.get(), 0, nullptr) : nullptr);
-    DWORD wait = WAIT_FAILED;
-    if (thread) {
-        wait = WaitForSingleObject(thread.get(), 15000);
-        DWORD code = 0;
-        ok = wait == WAIT_OBJECT_0 && GetExitCodeThread(thread.get(), &code) && code != 0;
-        if (!ok) {
-            if (wait == WAIT_TIMEOUT) lastInjectError = WAIT_TIMEOUT;
-            else if (wait == WAIT_OBJECT_0 && code == 0) lastInjectError = ERROR_DLL_INIT_FAILED;
-            else lastInjectError = GetLastError();
-        }
-    } else {
-        lastInjectError = GetLastError();
-        ok = false;
+    ModuleLoader loader(pid);
+    if (!loader.IsValid() || !loader.Load(dll.wstring())) {
+        lastInjectError = loader.LastError();
+        return false;
     }
-    // A thread that did not signal completion may still be reading this path.
-    if (thread && wait != WAIT_OBJECT_0) remote.abandon();
-    return ok;
+    const DWORD eventWait = WaitForSingleObject(bootstrapEvent.get(), configuredTimeoutMs);
+    if (eventWait != WAIT_OBJECT_0) {
+        lastInjectError = eventWait == WAIT_TIMEOUT ? WAIT_TIMEOUT : GetLastError();
+        return false;
+    }
+    writeLauncherLogLine(L"Bootstrap event confirmed " + eventName);
+    return true;
 }
 
 int selfCheck() {
@@ -1254,20 +1243,36 @@ int selfCheck() {
         writeLauncherLogLine(L"Self-check failed: launcher signature verification failed");
         return 1;
     }
+    if (Config::Instance().Path().empty()) {
+        writeLauncherLogLine(L"Self-check failed: configuration path unavailable");
+        return 2;
+    }
+    if (!isHttpsUrl(effectiveManifestUrl)) {
+        writeLauncherLogLine(L"Self-check failed: manifest URL is not HTTPS");
+        return 3;
+    }
+    if (!cryptoSelfCheck()) {
+        writeLauncherLogLine(L"Self-check failed: compatibility manifest verifier vector failed");
+        return 4;
+    }
     HMODULE module = appInstance ? appInstance : GetModuleHandleW(nullptr);
     if (!FindResourceW(module, MAKEINTRESOURCEW(IDR_BOOTSTRAP), RT_RCDATA)) {
         writeLauncherLogLine(L"Self-check failed: embedded bootstrap resource missing");
-        return 2;
+        return 5;
     }
     if (!FindResourceW(module, MAKEINTRESOURCEW(IDR_AGENT), RT_RCDATA)) {
         writeLauncherLogLine(L"Self-check failed: embedded agent resource missing");
-        return 3;
+        return 6;
+    }
+    if (embeddedResourceHasPlaintextMagic(IDR_BOOTSTRAP) || embeddedResourceHasPlaintextMagic(IDR_AGENT)) {
+        writeLauncherLogLine(L"Self-check failed: payload resource was embedded without encryption");
+        return 7;
     }
 
     wchar_t local[MAX_PATH]{};
     if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) {
         writeLauncherLogLine(L"Self-check failed: LOCALAPPDATA unavailable");
-        return 4;
+        return 8;
     }
 
     std::filesystem::path directory = std::filesystem::path(local) / L"RazorClient" / L"self-check";
@@ -1276,7 +1281,7 @@ int selfCheck() {
     std::filesystem::create_directories(directory, ec);
     if (ec) {
         writeLauncherLogLine(L"Self-check failed: cannot create " + directory.wstring());
-        return 5;
+        return 9;
     }
 
     auto dll = directory / L"razorclient-bootstrap-self-check.dll";
@@ -1290,14 +1295,15 @@ int selfCheck() {
         && !sha256(dll).empty()
         && !sha256(jar).empty();
     if (ok) {
-        UniqueModule bootstrap(LoadLibraryExW(dll.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES));
-        ok = bootstrap && GetProcAddress(bootstrap.get(), "RazorClientRestart") != nullptr;
+        HMODULE bootstrap = LoadLibraryExW(dll.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+        ok = bootstrap && GetProcAddress(bootstrap, "RazorClientRestart") != nullptr;
+        if (bootstrap) FreeLibrary(bootstrap);
     }
     writeLauncherLogLine(payloadSummary(L"Self-check bootstrap", dll));
     writeLauncherLogLine(payloadSummary(L"Self-check agent", jar));
     std::filesystem::remove_all(directory, ec);
     writeLauncherLogLine(ok ? L"Self-check passed" : L"Self-check failed: embedded payload or restart export invalid");
-    return ok ? 0 : 6;
+    return ok ? 0 : 10;
 }
 
 std::filesystem::path latestStatusFile() {
@@ -1374,7 +1380,7 @@ void copyToClipboard(HWND owner, const std::wstring& text) {
     CloseClipboard();
 }
 
-int writeDiagnostics(bool showMessage) {
+int writeDiagnostics() {
     auto directory = localRazorDirectory();
     std::filesystem::create_directories(directory);
     auto checkDirectory = directory / L"diagnostics-check";
@@ -1390,18 +1396,39 @@ int writeDiagnostics(bool showMessage) {
     bool fingerprintOk = lunarBuild.isSupported();
     auto statusPath = latestStatusFile();
     std::string lastPhase = lastPhaseFromStatus(statusPath);
+    const std::vector<ProcessInfo> processInventory = ProcessUtils::GetProcesses();
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    GlobalMemoryStatusEx(&memory);
+    SYSTEM_INFO systemInfo{};
+    GetNativeSystemInfo(&systemInfo);
 
     std::wstringstream report;
     report << L"RazorClient diagnostics\n";
     report << L"Time: " << timestamp() << L"\n";
     report << L"EXE: " << currentExePath().wstring() << L"\n";
     report << L"EXE SHA-256: " << widen(sha256(currentExePath())) << L"\n";
+    report << L"Config: " << Config::Instance().Path().wstring() << L" ("
+           << (configLoaded ? L"loaded" : L"defaults") << L")\n";
+    report << L"Effective manifest URL: " << effectiveManifestUrl << L"\n";
+    report << L"Timeout: " << configuredTimeoutMs << L" ms\n";
+    report << L"Architecture: " << (systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? L"x64" : L"other") << L"\n";
+    report << L"Physical memory: " << (memory.ullTotalPhys / (1024ULL * 1024ULL)) << L" MiB\n";
     report << L"Password accepted: " << (passwordAccepted ? L"yes" : L"no") << L"\n";
     report << L"Payload resources: " << (embeddedPayloadAvailable() ? L"embedded OK" : L"embedded payload missing") << L"\n";
     report << L"Bootstrap extracted: " << (bootstrapOk ? L"yes" : L"no") << L"\n";
     report << L"Bootstrap SHA-256: " << widen(sha256(dll)) << L"\n";
     report << L"Agent extracted: " << (agentOk ? L"yes" : L"no") << L"\n";
     report << L"Agent SHA-256: " << widen(sha256(jar)) << L"\n";
+    report << L"Expected bootstrap SHA-256: " << widen(RAZORCLIENT_EXPECTED_BOOTSTRAP_SHA256) << L"\n";
+    report << L"Expected agent SHA-256: " << widen(RAZORCLIENT_EXPECTED_AGENT_SHA256) << L"\n";
+    report << L"Process inventory count: " << processInventory.size() << L"\n";
+    for (const ProcessInfo& info : processInventory) {
+        if (_wcsicmp(info.name.c_str(), L"java.exe") == 0 || _wcsicmp(info.name.c_str(), L"javaw.exe") == 0) {
+            report << L"  Java PID " << info.pid << L" parent=" << info.parentPid
+                   << L" exe=" << info.exePath << L" modules=" << ProcessUtils::GetModules(info.pid).size() << L"\n";
+        }
+    }
     report << L"Lunar JVM count: " << processes.size() << L"\n";
     for (const auto& process : processes) {
         report << L"  PID " << process.pid << L" created=" << process.creationTime
@@ -1410,7 +1437,7 @@ int writeDiagnostics(bool showMessage) {
     }
     report << L"Fingerprint: " << (fingerprintOk ? L"OK" : L"unsupported or missing") << L"\n";
     report << L"Fingerprint detail: " << widen(fingerprintDetail) << L"\n";
-    report << L"Remote manifest URL: " << COMPAT_MANIFEST_URL << L"\n";
+    report << L"Remote manifest URL: " << effectiveManifestUrl << L"\n";
     report << L"Remote manifest status: " << widen(remoteCompatStatus) << L"\n";
     report << L"Remote manifest cache: " << compatCachePath().wstring() << L"\n";
     report << L"Detected bake path: " << (lunarBuild.bakePath.empty() ? L"(none)" : lunarBuild.bakePath.wstring()) << L"\n";
@@ -1426,6 +1453,9 @@ int writeDiagnostics(bool showMessage) {
     }
     report << L"Last status file: " << (statusPath.empty() ? L"(none)" : statusPath.wstring()) << L"\n";
     report << L"Last phase: " << (lastPhase.empty() ? L"(none)" : widen(lastPhase)) << L"\n";
+    report << L"Bootstrap event: " << (processes.size() == 1
+        ? L"Local\\RazorClient_Bootstrap_Loaded_" + std::to_wstring(processes.front().pid)
+        : L"(none)") << L"\n";
     report << L"Launcher status: " << currentStatus() << L"\n";
 
     auto output = directory / L"diagnostics.txt";
@@ -1434,11 +1464,9 @@ int writeDiagnostics(bool showMessage) {
         out << report.str();
     }
     std::filesystem::remove_all(checkDirectory, ec);
+    setDetails(report.str());
     copyToClipboard(windowHandle, report.str());
     writeLauncherLogLine(L"Wrote diagnostics to " + output.wstring());
-    if (showMessage) {
-        MessageBoxW(windowHandle, (L"Diagnostics copied and saved to:\n" + output.wstring()).c_str(), L"RazorClient Diagnostics", MB_OK | MB_ICONINFORMATION);
-    }
     return embeddedPayloadAvailable() && bootstrapOk && agentOk ? 0 : 7;
 }
 
@@ -1447,7 +1475,7 @@ enum class AckStatus { Success, AlreadyInjected, Failed, Timeout };
 AckStatus waitForAck(const std::filesystem::path& statusPath, std::wstring& detail) {
     const ULONGLONG start = GetTickCount64();
     std::string lastPhase;
-    while (GetTickCount64() - start < 20000) {
+    while (GetTickCount64() - start < configuredTimeoutMs) {
         std::ifstream input(statusPath);
         std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         if (!text.empty()) {
@@ -1484,7 +1512,7 @@ AckStatus waitForAck(const std::filesystem::path& statusPath, std::wstring& deta
 void performInjection() {
     injectionExitCode = 1;
     if (!passwordAccepted) {
-        setStatus(L"Enter password NERVE to enable injection.");
+        setStatus(L"Enter the configured password to enable injection.");
         injectionExitCode = 10;
         writeLauncherLog();
         redraw();
@@ -1494,8 +1522,13 @@ void performInjection() {
     if (processes.size() != 1) { setStatus(processes.empty() ? L"Launch Lunar 1.8.9 first, then press Inject." : L"Multiple Lunar JVMs found; close extra instances."); writeLauncherLog(); redraw(); return; }
     ProcessCandidate target = processes.front();
     DWORD pid = target.pid;
+    targetWatcher.Stop();
+    const HWND watcherWindow = windowHandle;
+    static_cast<void>(targetWatcher.Start(pid, [watcherWindow] {
+        if (watcherWindow) PostMessageW(watcherWindow, WM_TARGET_EXITED, 0, 0);
+    }));
     const std::wstring injectionMutexName = L"Local\\RazorClient.Inject." + std::to_wstring(pid);
-    UniqueHandle injectionMutex(CreateMutexW(nullptr, FALSE, injectionMutexName.c_str()));
+    HandleGuard injectionMutex(CreateMutexW(nullptr, FALSE, injectionMutexName.c_str()));
     const DWORD mutexWait = injectionMutex ? WaitForSingleObject(injectionMutex.get(), 0) : WAIT_FAILED;
     if (mutexWait != WAIT_OBJECT_0 && mutexWait != WAIT_ABANDONED) {
         setStatus(L"Another RazorClient injection is already in progress for this Lunar instance.");
@@ -1510,6 +1543,8 @@ void performInjection() {
     } injectionMutexGuard{injectionMutex.get()};
 
     writeLauncherLogLine(L"Selected Lunar JVM pid=" + std::to_wstring(pid) + L" exe=" + target.exePath + L" jvm=" + target.jvmPath);
+    setDetails(L"Selected Lunar JVM\r\nPID: " + std::to_wstring(pid) +
+        L"\r\nExecutable: " + target.exePath + L"\r\nJVM: " + target.jvmPath);
     LunarBuildDetection lunarBuild = detectLunarBuild(&target);
     if (!lunarBuild.isSupported()) {
         writeLauncherLogLine(L"Unsupported Lunar build fingerprint " + widen(fingerprintDetail));
@@ -1519,6 +1554,8 @@ void performInjection() {
         return;
     }
     writeLauncherLogLine(L"Fingerprint OK build=" + widen(lunarBuild.buildName()) + L" adapter=" + widen(lunarBuild.adapterVersion()) + L" " + widen(fingerprintDetail) + L" remote=" + widen(remoteCompatStatus));
+    setDetails(currentDetails() + L"\r\nBuild: " + widen(lunarBuild.buildName()) +
+        L"\r\nAdapter: " + widen(lunarBuild.adapterVersion()));
     wchar_t local[MAX_PATH]{}; GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
     std::filesystem::path directory = std::filesystem::path(local) / L"RazorClient";
     std::filesystem::create_directories(directory);
@@ -1537,6 +1574,8 @@ void performInjection() {
     } else {
         writeLauncherLogLine(payloadSummary(L"Extracted bootstrap", dll));
         writeLauncherLogLine(payloadSummary(L"Extracted agent", jar));
+        setDetails(currentDetails() + L"\r\nBootstrap: " + dll.wstring() +
+            L"\r\nAgent: " + jar.wstring() + L"\r\nStatus: " + statusPath.wstring());
         writeLauncherLogLine(L"Status file " + statusPath.wstring());
         {
             std::ofstream metadata(metadataPath, std::ios::trunc);
@@ -1557,6 +1596,7 @@ void performInjection() {
             redraw();
             std::wstring ackDetail;
             AckStatus ack = waitForAck(statusPath, ackDetail);
+            setDetails(currentDetails() + L"\r\nAcknowledgement: " + ackDetail);
             if (ack == AckStatus::Success) {
                 setStatus(L"Injected. Press Right Shift in game.");
                 injectionExitCode = 0;
@@ -1644,7 +1684,7 @@ void drawButton(const DRAWITEMSTRUCT* item, const wchar_t* text, bool primary) {
 }
 
 void refreshInjectButton() {
-    const bool busy = injectionInProgress.load(std::memory_order_acquire);
+    const bool busy = injectionInProgress.load(std::memory_order_acquire) || diagnosticsInProgress;
     if (injectButton) {
         EnableWindow(injectButton, !busy && passwordAccepted && embeddedPayloadAvailable());
         InvalidateRect(injectButton, nullptr, TRUE);
@@ -1657,7 +1697,7 @@ void refreshInjectButton() {
 void unlockPasswordFromUi() {
     wchar_t value[128]{};
     GetWindowTextW(passwordEdit, value, 128);
-    if (wcscmp(value, L"NERVE") == 0) {
+    if (configuredPassword == value) {
         passwordAccepted = true;
         setStatus(L"Password accepted. Launch Lunar 1.8.9 first, then press Inject.");
     } else {
@@ -1667,6 +1707,27 @@ void unlockPasswordFromUi() {
     refreshInjectButton();
     writeLauncherLog();
     redraw();
+}
+
+DWORD WINAPI diagnosticsWorker(void*) {
+    const int result = writeDiagnostics();
+    if (windowHandle) PostMessageW(windowHandle, WM_DIAGNOSTICS_FINISHED,
+        static_cast<WPARAM>(result), 0);
+    return 0;
+}
+
+void beginDiagnostics() {
+    if (diagnosticsInProgress || injectionInProgress.load(std::memory_order_acquire)) return;
+    diagnosticsInProgress = true;
+    setStatus(L"Collecting diagnostics...");
+    setDetails(L"Inspecting configuration, payload resources, processes, JVM modules, fingerprints, and compatibility manifest...");
+    refreshInjectButton();
+    diagnosticsWorkerHandle = ThreadGuard(CreateThread(nullptr, 0, diagnosticsWorker, nullptr, 0, nullptr));
+    if (!diagnosticsWorkerHandle) {
+        diagnosticsInProgress = false;
+        setStatus(L"Unable to start diagnostics worker. Error " + std::to_wstring(GetLastError()) + L".");
+        refreshInjectButton();
+    }
 }
 
 DWORD WINAPI injectionWorker(void*) {
@@ -1680,14 +1741,13 @@ void beginInjection() {
     if (!injectionInProgress.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
     setStatus(L"Discovering Lunar 1.8.9 runtime...");
     refreshInjectButton();
-    HANDLE thread = CreateThread(nullptr, 0, injectionWorker, nullptr, 0, nullptr);
-    if (!thread) {
+    injectionWorkerHandle = ThreadGuard(CreateThread(nullptr, 0, injectionWorker, nullptr, 0, nullptr));
+    if (!injectionWorkerHandle) {
         injectionInProgress.store(false, std::memory_order_release);
         setStatus(L"Unable to start injection worker. Error " + std::to_wstring(GetLastError()) + L".");
         refreshInjectButton();
         return;
     }
-    CloseHandle(thread);
 }
 
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1696,7 +1756,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         bodyFont = makeFont(10, FW_NORMAL);
         buttonFont = makeFont(11, FW_SEMIBOLD);
         editBrush = solidBrush(rgb(8, 16, 10));
-        payloadStatus = embeddedPayloadAvailable() ? L"Payload: embedded OK" : L"Invalid release build: embedded payload missing";
+        payloadStatus = embeddedPayloadAvailable() ? L"Payload: encrypted resources embedded" : L"Invalid release build: embedded payload missing";
         if (!embeddedPayloadAvailable()) {
             setStatus(L"Invalid release build: embedded payload missing.");
         }
@@ -1708,18 +1768,23 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             95, 224, 140, 42, hwnd, reinterpret_cast<HMENU>(1), nullptr, nullptr);
         diagnosticsButton = CreateWindowW(L"BUTTON", L"Diagnostics", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             255, 224, 150, 42, hwnd, reinterpret_cast<HMENU>(2), nullptr, nullptr);
+        detailsEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"Ready.",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_LEFT | ES_MULTILINE |
+            ES_AUTOVSCROLL | ES_READONLY,
+            46, 282, 408, 116, hwnd, reinterpret_cast<HMENU>(5), nullptr, nullptr);
         SendMessageW(passwordEdit, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont), TRUE);
         SendMessageW(passwordEdit, EM_SETPASSWORDCHAR, static_cast<WPARAM>(0x25CF), 0);
         SendMessageW(injectButton, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont), TRUE);
         SendMessageW(diagnosticsButton, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont), TRUE);
         SendMessageW(unlockButton, WM_SETFONT, reinterpret_cast<WPARAM>(buttonFont), TRUE);
+        SendMessageW(detailsEdit, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont), TRUE);
         refreshInjectButton();
         BOOL dark = TRUE;
         DwmSetWindowAttribute(hwnd, 20, &dark, sizeof(dark));
         return 0;
     }
     if (message == WM_COMMAND && LOWORD(wParam) == 1) { beginInjection(); return 0; }
-    if (message == WM_COMMAND && LOWORD(wParam) == 2) { writeDiagnostics(true); return 0; }
+    if (message == WM_COMMAND && LOWORD(wParam) == 2) { beginDiagnostics(); return 0; }
     if (message == WM_COMMAND && LOWORD(wParam) == 3) { unlockPasswordFromUi(); return 0; }
     if (message == WM_DRAWITEM && wParam == 1) { drawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam), L"Inject", true); return TRUE; }
     if (message == WM_DRAWITEM && wParam == 2) { drawButton(reinterpret_cast<DRAWITEMSTRUCT*>(lParam), L"Diagnostics", false); return TRUE; }
@@ -1731,12 +1796,32 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         return reinterpret_cast<LRESULT>(editBrush ? editBrush : GetStockObject(BLACK_BRUSH));
     }
     if (message == WM_CTLCOLORBTN) { return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH)); }
-    if (message == WM_APP) { redraw(); return 0; }
+    if (message == WM_APP) {
+        if (detailsEdit) SetWindowTextW(detailsEdit, currentDetails().c_str());
+        redraw();
+        return 0;
+    }
     if (message == WM_INJECTION_FINISHED) {
+        injectionWorkerHandle = ThreadGuard{};
         injectionInProgress.store(false, std::memory_order_release);
         refreshInjectButton();
         writeLauncherLog();
         redraw();
+        return 0;
+    }
+    if (message == WM_DIAGNOSTICS_FINISHED) {
+        diagnosticsWorkerHandle = ThreadGuard{};
+        diagnosticsInProgress = false;
+        const bool ok = static_cast<int>(wParam) == 0;
+        setStatus(ok ? L"Diagnostics complete. Report copied and saved." : L"Diagnostics completed with validation failures.");
+        refreshInjectButton();
+        MessageBoxW(hwnd, L"Diagnostics copied and saved to %LOCALAPPDATA%\\RazorClient\\diagnostics.txt",
+            L"RazorClient Diagnostics", MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONWARNING));
+        return 0;
+    }
+    if (message == WM_TARGET_EXITED) {
+        setStatus(L"Lunar exited. Launch Lunar 1.8.9 before injecting again.");
+        setDetails(L"The selected Lunar JVM exited. Runtime monitoring stopped.");
         return 0;
     }
     if (message == WM_ERASEBKGND) { return TRUE; }
@@ -1749,6 +1834,11 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     if (message == WM_DESTROY) {
         windowHandle = nullptr;
+        targetWatcher.Stop();
+        if (injectionWorkerHandle) static_cast<void>(injectionWorkerHandle.wait(INFINITE));
+        if (diagnosticsWorkerHandle) static_cast<void>(diagnosticsWorkerHandle.wait(INFINITE));
+        injectionWorkerHandle = ThreadGuard{};
+        diagnosticsWorkerHandle = ThreadGuard{};
         if (titleFont) DeleteObject(titleFont);
         if (bodyFont) DeleteObject(bodyFont);
         if (buttonFont) DeleteObject(buttonFont);
@@ -1758,16 +1848,57 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     }
     return DefWindowProcW(hwnd,message,wParam,lParam);
 }
+
+struct CommandLineOptions {
+    bool selfCheck{};
+    bool cryptoSelfCheck{};
+    bool diagnose{};
+    bool inject{};
+    bool malformed{};
+    std::wstring password;
+    bool passwordSubmitted{};
+};
+
+CommandLineOptions parseCommandLine() {
+    CommandLineOptions result;
+    int count = 0;
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &count);
+    if (!arguments) {
+        result.malformed = true;
+        return result;
+    }
+    for (int index = 1; index < count; ++index) {
+        const std::wstring argument(arguments[index]);
+        if (argument == L"--self-check") result.selfCheck = true;
+        else if (argument == L"--crypto-self-check") result.cryptoSelfCheck = true;
+        else if (argument == L"--diagnose") result.diagnose = true;
+        else if (argument == L"--inject") result.inject = true;
+        else if (argument.rfind(L"--password=", 0) == 0) {
+            result.passwordSubmitted = true;
+            result.password = argument.substr(11);
+        } else {
+            result.malformed = true;
+        }
+    }
+    LocalFree(arguments);
+    return result;
+}
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     appInstance = instance;
-    passwordAccepted = commandLineHasPassword();
-    if (wcsstr(GetCommandLineW(), L"--inject")) { performInjection(); writeLauncherLog(); return injectionExitCode; }
-    if (wcsstr(GetCommandLineW(), L"--crypto-self-check")) { return cryptoSelfCheck() ? 0 : 20; }
-    if (wcsstr(GetCommandLineW(), L"--self-check")) { return selfCheck(); }
-    if (wcsstr(GetCommandLineW(), L"--diagnose")) { return writeDiagnostics(false); }
+    initializeSharedSystems();
+    const CommandLineOptions options = parseCommandLine();
+    if (options.malformed) {
+        writeLauncherLogLine(L"Malformed or unsupported command-line argument");
+        return 64;
+    }
+    passwordAccepted = options.passwordSubmitted && options.password == configuredPassword;
+    if (options.cryptoSelfCheck) { return cryptoSelfCheck() ? 0 : 20; }
+    if (options.selfCheck) { return selfCheck(); }
+    if (options.diagnose) { return writeDiagnostics(); }
+    if (options.inject) { performInjection(); writeLauncherLog(); return injectionExitCode; }
     WNDCLASSW type{}; type.lpfnWndProc=windowProc; type.hInstance=instance; type.lpszClassName=L"RazorClientLauncher"; type.hCursor=LoadCursor(nullptr,IDC_ARROW); type.hbrBackground=solidBrush(rgb(5,8,5)); RegisterClassW(&type);
-    windowHandle=CreateWindowW(type.lpszClassName,L"\x00AE" L"\xFE0F" L"azorClient",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,CW_USEDEFAULT,CW_USEDEFAULT,500,345,nullptr,nullptr,instance,nullptr);
+    windowHandle=CreateWindowW(type.lpszClassName,L"\x00AE" L"\xFE0F" L"azorClient",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,CW_USEDEFAULT,CW_USEDEFAULT,500,455,nullptr,nullptr,instance,nullptr);
     ShowWindow(windowHandle,show); UpdateWindow(windowHandle); MSG message{}; while(GetMessageW(&message,nullptr,0,0)){TranslateMessage(&message);DispatchMessageW(&message);} return static_cast<int>(message.wParam);
 }

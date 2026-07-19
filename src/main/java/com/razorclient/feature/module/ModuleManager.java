@@ -308,7 +308,9 @@ public final class ModuleManager {
         runtimeCore.getTargetPublications().clearAll();
         CombatActionCoordinator.clear();
         MouseButtonHelper.releaseAllSynthetic();
-        for (Module module : packetPolicySubscribers) {
+        // Every enabled module owns timers, leases and cached decisions through
+        // its scope, not only modules that participate in packet policy.
+        for (Module module : modules) {
             if (module.isEnabled()) module.resetScope(reason);
         }
         for (Module module : sessionResetSubscribers) {

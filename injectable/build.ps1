@@ -1,10 +1,14 @@
 param(
     [ValidateSet('Debug', 'Release')]
-    [string]$Mode = 'Debug'
+    [string]$Mode = 'Debug',
+
+    [ValidateSet('MSVC', 'LLVM')]
+    [string]$Toolchain = 'MSVC'
 )
 
 $ErrorActionPreference = 'Stop'
 $releaseBuild = $Mode -eq 'Release'
+$msvcBuild = $Toolchain -eq 'MSVC'
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $project = Split-Path -Parent $root
@@ -17,6 +21,7 @@ $release = Join-Path $stageRoot 'release'
 $classes = Join-Path $stageRoot 'classes'
 $deps = Join-Path $root 'tools\deps'
 $llvm = Join-Path $root 'tools\llvm-mingw'
+$minimumWindowsSdk = [Version]'10.0.20348.0'
 $api = Join-Path $project 'build\lunar\lunar-runtime-api.jar'
 $obfuscatorBase = Join-Path $deps 'proguard-base-7.8.1.jar'
 $obfuscatorCore = Join-Path $deps 'proguard-core-9.2.0.jar'
@@ -25,6 +30,8 @@ $gson = Join-Path $deps 'gson-2.11.0.jar'
 $log4jApi = Join-Path $deps 'log4j-api-2.24.2.jar'
 $log4jCore = Join-Path $deps 'log4j-core-2.24.2.jar'
 $json = Join-Path $deps 'json-20231013.jar'
+$nlohmannInclude = Join-Path $deps 'nlohmann-json-3.11.3\single_include'
+$nlohmannHeader = Join-Path $nlohmannInclude 'nlohmann\json.hpp'
 $compatPublicKey = Join-Path $root 'config\compat-public-key.b64'
 
 function Assert-Sha256([string]$path, [string]$expected) {
@@ -37,6 +44,11 @@ Assert-Sha256 $api 'C4C05056FB035665CBE3128E64A8A6E3EC0A1BDF791A4B8A4BB9816B1296
 Assert-Sha256 (Join-Path $deps 'asm-9.7.1.jar') '8CADD43AC5EB6D09DE05FAECCA38B917A040BB9139C7EDEB4CC81C740B713281'
 Assert-Sha256 (Join-Path $deps 'asm-tree-9.7.1.jar') '9929881F59EB6B840E86D54570C77B59CE721D104E6DFD7A40978991C2D3B41F'
 Assert-Sha256 (Join-Path $deps 'asm-commons-9.7.1.jar') '9A579B54D292AD9BE171D4313FD4739C635592C2B5AC3A459BBD1049CDDEC6A0'
+if (Test-Path -LiteralPath $nlohmannHeader -PathType Leaf) {
+    Assert-Sha256 $nlohmannHeader '9BEA4C8066EF4A1C206B2BE5A36302F8926F7FDC6087AF5D20B417D0CF103EA6'
+} elseif (!$msvcBuild) {
+    throw "Missing checksum-pinned nlohmann/json fallback: $nlohmannHeader"
+}
 
 if ($releaseBuild) {
     Assert-Sha256 $obfuscatorBase '72928B9C43DD1D4ABDB906F612BC53E57521CC629FD05A6543EDC21F89A5F340'
@@ -61,11 +73,50 @@ $archiveTimestamp = '2020-01-01T00:00:00Z'
 
 $clang = Join-Path $llvm 'bin\x86_64-w64-mingw32-clang++.exe'
 $windres = Join-Path $llvm 'bin\x86_64-w64-mingw32-windres.exe'
-if (!(Test-Path $clang)) { throw "Missing native compiler: $clang" }
-if (!(Test-Path $windres)) { throw "Missing windres: $windres" }
 if (!(Test-Path $api)) { throw "Missing Lunar API jar: $api" }
-$clangVersion = (& $clang --version | Select-Object -First 1)
-if ($clangVersion -notmatch '^clang version 22\.1\.8\b') { throw "Unexpected LLVM toolchain: $clangVersion" }
+$cmake = $null
+$visualStudioPath = $null
+if ($msvcBuild) {
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (!(Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+        throw 'Visual Studio Installer vswhere.exe is required for the MSVC build.'
+    }
+    $visualStudioPath = [string](& $vswhere -latest -version '[17.0,)' -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath | Select-Object -First 1)
+    $visualStudioPath = $visualStudioPath.Trim()
+    if ([string]::IsNullOrWhiteSpace($visualStudioPath)) {
+        throw 'Visual Studio 2022 with the Desktop development with C++ workload is required.'
+    }
+    $visualStudioVersion = (Get-Item -LiteralPath (Join-Path $visualStudioPath 'Common7\IDE\devenv.exe') `
+        -ErrorAction SilentlyContinue).VersionInfo.ProductMajorPart
+    if ($visualStudioVersion -and $visualStudioVersion -lt 17) {
+        throw 'Visual Studio 2022 or newer is required.'
+    }
+
+    $cmakeCandidates = @(
+        (Join-Path $visualStudioPath 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'),
+        (Get-Command cmake.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1)
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }
+    $cmake = $cmakeCandidates | Select-Object -First 1
+    if (!$cmake) { throw 'CMake 3.21 or newer is required. Install CMake tools for Windows in Visual Studio.' }
+    $cmakeVersionText = (& $cmake --version | Select-Object -First 1)
+    if ($cmakeVersionText -notmatch 'cmake version\s+(\d+\.\d+\.\d+)') { throw "Unable to determine CMake version: $cmakeVersionText" }
+    if ([Version]$Matches[1] -lt [Version]'3.21.0') { throw "CMake 3.21 or newer is required; found $($Matches[1])." }
+
+    $sdkIncludeRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+    $installedSdks = @(Get-ChildItem -LiteralPath $sdkIncludeRoot -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { try { [Version]$_.Name } catch { $null } } |
+        Where-Object { $_ -ne $null } | Sort-Object -Descending)
+    if (!$installedSdks -or $installedSdks[0] -lt $minimumWindowsSdk) {
+        throw "Windows SDK $minimumWindowsSdk or newer is required."
+    }
+} else {
+    if (!(Test-Path $clang)) { throw "Missing native compiler: $clang" }
+    if (!(Test-Path $windres)) { throw "Missing windres: $windres" }
+    $clangVersion = (& $clang --version | Select-Object -First 1)
+    if ($clangVersion -notmatch '^clang version 22\.1\.8\b') { throw "Unexpected LLVM toolchain: $clangVersion" }
+}
 
 if ($releaseBuild) {
     & (Join-Path $root 'sign-release.ps1') -ArtifactType Jar -Preflight
@@ -211,14 +262,41 @@ if ($releaseBuild -and $jarSignerHash -notmatch '^[0-9A-F]{64}$') { throw 'JAR s
     ('static constexpr const char* RAZORCLIENT_EXPECTED_JAR_SIGNER_SHA256 = "' + $jarSignerHash + '";')
 ) | Set-Content -LiteralPath (Join-Path $nativeBuild 'payload_security.h') -Encoding ASCII
 
-& $clang -std=c++17 -O2 -ffunction-sections -fdata-sections -shared -static -DUNICODE -D_UNICODE `
-    $(if ($releaseBuild) { '-DRAZORCLIENT_RELEASE' } else { '' }) `
-    -I $jniInclude -I $jniWin -I $nativeBuild `
-    -o (Join-Path $dist 'razorclient-bootstrap.dll') `
-    (Join-Path $root 'native\bootstrap\bootstrap.cpp') `
-    '-Wl,--gc-sections,--no-insert-timestamp' $(if ($releaseBuild) { '-s' } else { '' }) `
-    -ladvapi32 -luser32 -lgdi32 -lopengl32 -lbcrypt
-if ($LASTEXITCODE) { throw 'Bootstrap DLL build failed.' }
+$cmakeBuild = Join-Path $stageRoot 'native-cmake'
+if ($msvcBuild) {
+    $cmakeArguments = @(
+        '-S', $root,
+        '-B', $cmakeBuild,
+        '-G', 'Visual Studio 17 2022',
+        '-A', 'x64',
+        "-DRAZORCLIENT_GENERATED_DIR=$nativeBuild",
+        "-DRAZORCLIENT_OUTPUT_DIR=$dist",
+        "-DRAZORCLIENT_TOOL_OUTPUT_DIR=$nativeBuild",
+        "-DRAZORCLIENT_JNI_INCLUDE=$jniInclude",
+        "-DRAZORCLIENT_JNI_PLATFORM_INCLUDE=$jniWin",
+        "-DRAZORCLIENT_NLOHMANN_FALLBACK=$nlohmannInclude"
+    )
+    $vcpkgToolchain = if ($env:VCPKG_ROOT) {
+        Join-Path $env:VCPKG_ROOT 'scripts\buildsystems\vcpkg.cmake'
+    } else { $null }
+    if ($vcpkgToolchain -and (Test-Path -LiteralPath $vcpkgToolchain -PathType Leaf)) {
+        $cmakeArguments += "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchain"
+        $cmakeArguments += '-DVCPKG_TARGET_TRIPLET=x64-windows-static'
+    }
+    & $cmake @cmakeArguments
+    if ($LASTEXITCODE) { throw 'Visual Studio CMake configuration failed.' }
+    & $cmake --build $cmakeBuild --config $Mode --target razorclient-bootstrap --parallel
+    if ($LASTEXITCODE) { throw 'Bootstrap DLL MSVC build failed.' }
+} else {
+    & $clang -std=c++17 -O2 -ffunction-sections -fdata-sections -shared -static -DUNICODE -D_UNICODE `
+        $(if ($releaseBuild) { '-DRAZORCLIENT_RELEASE' } else { '' }) `
+        -I $jniInclude -I $jniWin -I $nativeBuild `
+        -o (Join-Path $dist 'razorclient-bootstrap.dll') `
+        (Join-Path $root 'native\bootstrap\bootstrap.cpp') `
+        '-Wl,--gc-sections,--no-insert-timestamp' $(if ($releaseBuild) { '-s' } else { '' }) `
+        -ladvapi32 -luser32 -lgdi32 -lopengl32 -lbcrypt
+    if ($LASTEXITCODE) { throw 'Bootstrap DLL LLVM build failed.' }
+}
 if ($releaseBuild) {
     & (Join-Path $root 'sign-release.ps1') -ArtifactType Authenticode -Path (Join-Path $dist 'razorclient-bootstrap.dll')
     if ($LASTEXITCODE) { throw 'Signed bootstrap DLL creation failed.' }
@@ -231,26 +309,70 @@ $hashHeader = @(
 )
 $hashHeader | Set-Content -LiteralPath (Join-Path $nativeBuild 'payload_hashes.h') -Encoding ASCII
 
+$payloadKeyMaterial = [Text.Encoding]::UTF8.GetBytes("RazorClientPayload:v1:$bootstrapHash`:$agentHash")
+$payloadKeySha = [Security.Cryptography.SHA256]::Create()
+try {
+    $payloadKey = -join ($payloadKeySha.ComputeHash($payloadKeyMaterial) | ForEach-Object { $_.ToString('x2') })
+} finally {
+    $payloadKeySha.Dispose()
+}
+@(
+    '#pragma once',
+    ('#define RAZORCLIENT_PAYLOAD_KEY_LITERAL "' + $payloadKey + '"')
+) | Set-Content -LiteralPath (Join-Path $nativeBuild 'payload_key.h') -Encoding ASCII
+
+$payloadEncryptor = Join-Path $nativeBuild 'payload-encrypt.exe'
+if ($msvcBuild) {
+    & $cmake --build $cmakeBuild --config $Mode --target payload_encrypt --parallel
+    if ($LASTEXITCODE) { throw 'Payload encryption helper MSVC build failed.' }
+} else {
+    & $clang -std=c++17 -O2 -static -DUNICODE -D_UNICODE `
+        -I (Join-Path $root 'native') `
+        -o $payloadEncryptor `
+        (Join-Path $root 'native\tools\payload_encrypt.cpp') `
+        '-Wl,--gc-sections,--no-insert-timestamp' -ladvapi32
+    if ($LASTEXITCODE) { throw 'Payload encryption helper LLVM build failed.' }
+}
+
+$encryptedBootstrap = Join-Path $nativeBuild 'razorclient-bootstrap.enc'
+$encryptedAgent = Join-Path $nativeBuild 'razorclient-agent.enc'
+& $payloadEncryptor (Join-Path $dist 'razorclient-bootstrap.dll') $encryptedBootstrap $payloadKey
+if ($LASTEXITCODE) { throw 'Bootstrap resource encryption failed.' }
+& $payloadEncryptor $agent $encryptedAgent $payloadKey
+if ($LASTEXITCODE) { throw 'Agent resource encryption failed.' }
+if ((Get-Item -LiteralPath $encryptedBootstrap).Length -ne (Get-Item -LiteralPath (Join-Path $dist 'razorclient-bootstrap.dll')).Length) {
+    throw 'Encrypted bootstrap size mismatch.'
+}
+if ((Get-Item -LiteralPath $encryptedAgent).Length -ne (Get-Item -LiteralPath $agent).Length) {
+    throw 'Encrypted agent size mismatch.'
+}
+
 $rcTemplate = Get-Content -LiteralPath (Join-Path $root 'native\launcher\resources.rc.in') -Raw
 $rc = $rcTemplate.
-    Replace('@BOOTSTRAP_DLL@', (Join-Path $dist 'razorclient-bootstrap.dll').Replace('\','\\')).
-    Replace('@AGENT_JAR@', (Join-Path $dist 'razorclient-agent.jar').Replace('\','\\'))
+    Replace('@BOOTSTRAP_DLL@', $encryptedBootstrap.Replace('\','\\')).
+    Replace('@AGENT_JAR@', $encryptedAgent.Replace('\','\\'))
 $rcPath = Join-Path $nativeBuild 'resources.rc'
 $resPath = Join-Path $nativeBuild 'resources.o'
 New-Item (Split-Path -Parent $rcPath) -ItemType Directory -Force | Out-Null
 Set-Content -LiteralPath $rcPath -Value $rc -Encoding ASCII
 
-& $windres -I (Join-Path $root 'native\launcher') $rcPath -O coff -o $resPath
-if ($LASTEXITCODE) { throw 'Resource compilation failed.' }
+if ($msvcBuild) {
+    & $cmake --build $cmakeBuild --config $Mode --target RazorClient --parallel
+    if ($LASTEXITCODE) { throw 'Launcher MSVC build failed.' }
+} else {
+    & $windres -I (Join-Path $root 'native\launcher') $rcPath -O coff -o $resPath
+    if ($LASTEXITCODE) { throw 'Resource compilation failed.' }
 
-& $clang -std=c++17 -O2 -ffunction-sections -fdata-sections -static -mwindows -municode -DUNICODE -D_UNICODE `
-    $(if ($releaseBuild) { '-DRAZORCLIENT_RELEASE' } else { '' }) `
-    -I $nativeBuild `
-    -o (Join-Path $dist 'RazorClient.exe') `
-    (Join-Path $root 'native\launcher\main.cpp') $resPath `
-    '-Wl,--gc-sections,--no-insert-timestamp' $(if ($releaseBuild) { '-s' } else { '' }) `
-    -luser32 -lshell32 -lshlwapi -lpsapi -lbcrypt -lcrypt32 -lwintrust -ladvapi32 -ldwmapi -lwinhttp
-if ($LASTEXITCODE) { throw 'Launcher build failed.' }
+    & $clang -std=c++17 -O2 -ffunction-sections -fdata-sections -static -mwindows -municode -DUNICODE -D_UNICODE `
+        $(if ($releaseBuild) { '-DRAZORCLIENT_RELEASE' } else { '' }) `
+        -I $nativeBuild -I (Join-Path $root 'native') -I $nlohmannInclude `
+        -o (Join-Path $dist 'RazorClient.exe') `
+        (Join-Path $root 'native\launcher\main.cpp') $resPath `
+        '-Wl,--gc-sections,--no-insert-timestamp' $(if ($releaseBuild) { '-s' } else { '' }) `
+        -luser32 -lkernel32 -lgdi32 -lshell32 -lshlwapi -lpsapi -lbcrypt -lcrypt32 `
+        -lwintrust -ladvapi32 -ldwmapi -lwinhttp
+    if ($LASTEXITCODE) { throw 'Launcher LLVM build failed.' }
+}
 
 if ($releaseBuild) {
     & (Join-Path $root 'sign-release.ps1') -ArtifactType Authenticode -Path (Join-Path $dist 'RazorClient.exe')
@@ -262,10 +384,14 @@ Copy-Item -LiteralPath (Join-Path $dist 'RazorClient.exe') -Destination (Join-Pa
 @(
     "schemaVersion=1",
     "buildMode=$Mode",
+    "nativeToolchain=$Toolchain",
     "obfuscatorVersion=$(if ($releaseBuild) { 'proguard-7.8.1' } else { 'none' })",
     "launcherHash=$((Get-FileHash -Algorithm SHA256 (Join-Path $dist 'RazorClient.exe')).Hash)",
     "bootstrapHash=$((Get-FileHash -Algorithm SHA256 (Join-Path $dist 'razorclient-bootstrap.dll')).Hash)",
     "agentHash=$((Get-FileHash -Algorithm SHA256 $agent).Hash)",
+    "encryptedBootstrapHash=$((Get-FileHash -Algorithm SHA256 $encryptedBootstrap).Hash)",
+    "encryptedAgentHash=$((Get-FileHash -Algorithm SHA256 $encryptedAgent).Hash)",
+    "payloadEncryption=CryptoAPI-MD5-RC4-v1",
     "jarSignerHash=$jarSignerHash"
 ) | Set-Content -LiteralPath (Join-Path $dist 'build-metadata.properties') -Encoding ASCII
 

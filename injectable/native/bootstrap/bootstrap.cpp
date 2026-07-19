@@ -274,6 +274,19 @@ void writeStatus(const std::string& phase, const std::string& detail = "") {
     }
 }
 
+void signalBootstrapLoaded() {
+    const std::wstring eventName = L"Local\\RazorClient_Bootstrap_Loaded_" +
+        std::to_wstring(GetCurrentProcessId());
+    HANDLE eventHandle = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName.c_str());
+    if (!eventHandle) {
+        eventHandle = CreateEventW(nullptr, TRUE, FALSE, eventName.c_str());
+    }
+    if (eventHandle) {
+        SetEvent(eventHandle);
+        CloseHandle(eventHandle);
+    }
+}
+
 std::string sha256File(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) return {};
@@ -544,6 +557,7 @@ DWORD WINAPI initialize(void* parameter) {
             : resolveStatusFile();
     }
     writeStatus("BOOTSTRAP_LOADED", "Bootstrap DLL loaded");
+    signalBootstrapLoaded();
     HMODULE jvm = nullptr;
     for (int i = 0; i < 300 && !(jvm = GetModuleHandleW(L"jvm.dll")); ++i) {
         Sleep(100);

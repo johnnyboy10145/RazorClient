@@ -21,7 +21,7 @@ public final class KnockbackDelayModule extends Module {
     private final AtomicBoolean inboundFlushRequested = new AtomicBoolean();
 
     public KnockbackDelayModule() {
-        super("Knockback Delay", "Buffers all incoming packets when hit, freezing the world until the delay expires", Category.COMBAT, Keyboard.KEY_NONE);
+        super("Knockback Delay", "Delays local velocity packets without freezing unrelated world updates.", Category.COMBAT, Keyboard.KEY_NONE);
         addSetting(airDelay);
         addSetting(chance);
     }
@@ -35,6 +35,7 @@ public final class KnockbackDelayModule extends Module {
     @Override
     protected void onDisable() {
         holdPacketsUntil = 0L;
+        cachedPlayerId = -1;
         inboundFlushRequested.set(true);
     }
 
@@ -75,7 +76,11 @@ public final class KnockbackDelayModule extends Module {
     @Override
     public int getInboundPacketDelay(Packet<?> packet) {
         long remaining = holdPacketsUntil - monotonicMillis();
-        if (!isEnabled() || remaining <= 0L) {
+        if (!isEnabled()
+                || remaining <= 0L
+                || !(packet instanceof S12PacketEntityVelocity)
+                || cachedPlayerId < 0
+                || ((S12PacketEntityVelocity) packet).getEntityID() != cachedPlayerId) {
             return 0;
         }
         return remaining >= Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) remaining;

@@ -21,7 +21,8 @@ if (!(Test-Path $exe) -or !(Test-Path $agent) -or !(Test-Path $bootstrap)) { thr
 $metadata = Join-Path $dist 'build-metadata.properties'
 if (!(Test-Path $metadata)) { throw 'Build metadata is missing.' }
 $metadataText = Get-Content $metadata -Raw
-foreach ($field in @('schemaVersion=', 'launcherHash=', 'bootstrapHash=', 'agentHash=', 'jarSignerHash=')) {
+foreach ($field in @('schemaVersion=', 'buildMode=', 'nativeToolchain=', 'launcherHash=', 'bootstrapHash=', 'agentHash=',
+        'encryptedBootstrapHash=', 'encryptedAgentHash=', 'payloadEncryption=', 'jarSignerHash=')) {
     if ($metadataText -notmatch [regex]::Escape($field)) { throw "Build metadata field is missing: $field" }
 }
 $metadataValues = @{}
@@ -53,7 +54,8 @@ foreach ($forbidden in @('razorclient-agent.jar', 'razorclient-bootstrap.dll', '
 $launcherSource = Get-Content (Join-Path $root 'native\launcher\main.cpp') -Raw
 foreach ($marker in @('verifyManifestEnvelope', 'BCryptVerifySignature', 'sha256Bytes', 'digest.data()',
     'MAX_MANIFEST_ENVELOPE_BYTES', 'writeTextFileAtomic', 'manifestVersion', 'processCreationTime',
-    'executableHash', 'jvmHash', 'remoteFunctionAddress', 'WM_INJECTION_FINISHED',
+    'executableHash', 'jvmHash', 'ModuleLoader loader', 'RemoteMemoryGuard remoteStatus',
+    'DataCrypto::DecryptResource', 'RazorClient_Bootstrap_Loaded_', 'WM_INJECTION_FINISHED',
     'findReusableBootstrap', 'RazorClientRestart', 'RazorClient.Inject.')) {
     if ($launcherSource -notmatch [regex]::Escape($marker)) { throw "Launcher security marker is missing: $marker" }
 }
@@ -63,7 +65,7 @@ if ($launcherSource -match 'ManualMap|manual.?mapping|ProxyDll|DriverEntry|NtMap
 $bootstrapSource = Get-Content (Join-Path $root 'native\bootstrap\bootstrap.cpp') -Raw
 $jarVerifierSource = Get-Content (Join-Path $root 'payload\src\com\razorclient\inject\JarSignatureVerifier.java') -Raw
 foreach ($marker in @('RAZORCLIENT_EXPECTED_AGENT_SHA256', 'sha256File', 'RAZORCLIENT_EXPECTED_JAR_SIGNER_SHA256',
-        'RazorClientRestart', 'initializationRunning', 'AGENT_SEARCH_REUSED')) {
+        'RazorClientRestart', 'initializationRunning', 'AGENT_SEARCH_REUSED', 'signalBootstrapLoaded')) {
     if ($bootstrapSource -notmatch $marker) { throw "Bootstrap payload integrity marker is missing: $marker" }
 }
 foreach ($marker in @('getCodeSigners', 'containsExpectedSigner', 'SHA-256', 'META-INF/')) {
@@ -72,6 +74,10 @@ foreach ($marker in @('getCodeSigners', 'containsExpectedSigner', 'SHA-256', 'ME
 $buildSource = Get-Content (Join-Path $root 'build.ps1') -Raw
 if ($buildSource -notmatch '-Preflight' -or $buildSource -notmatch 'staging-' -or $buildSource -notmatch 'Promote-Directory') {
     throw 'Release preflight or staged artifact promotion is missing.'
+}
+foreach ($marker in @('payload-encrypt.exe', 'razorclient-bootstrap.enc', 'razorclient-agent.enc',
+        'RAZORCLIENT_PAYLOAD_KEY_LITERAL', 'nlohmann-json-3.11.3')) {
+    if ($buildSource -notmatch [regex]::Escape($marker)) { throw "Encrypted resource build marker is missing: $marker" }
 }
 
 if (!$jar) { throw 'jar.exe is required for payload inventory checks.' }

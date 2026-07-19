@@ -11,10 +11,10 @@ import net.minecraft.world.World;
 public final class ClutchPredictor {
     private final BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
 
-    public boolean isDangerPredicted(World world, EntityPlayerSP player, int predictionTicks,
+    public DangerPrediction predict(World world, EntityPlayerSP player, int predictionTicks,
             int minimumHeight) {
-        if (world == null || player == null || player.onGround || player.motionY >= -0.02D) {
-            return false;
+        if (world == null || player == null) {
+            return DangerPrediction.safe();
         }
 
         int ticks = Math.max(1, predictionTicks);
@@ -25,27 +25,64 @@ public final class ClutchPredictor {
         double motionY = player.motionY;
         double motionZ = player.motionZ;
         AxisAlignedBB original = player.getEntityBoundingBox();
+        boolean supportLost = !hasCollisionSupport(world, player, original);
+        if (supportLost && motionY >= -0.02D) return DangerPrediction.safe();
 
         for (int tick = 0; tick < ticks; tick++) {
             x += motionX;
-            y += motionY;
+            if (supportLost) y += motionY;
             z += motionZ;
-            motionY = (motionY - 0.08D) * 0.98D;
             motionX *= 0.91D;
             motionZ *= 0.91D;
             AxisAlignedBB projected = original.offset(
                 x - player.posX, y - player.posY, z - player.posZ);
-            if (hasCollisionSupport(world, player, projected)) return false;
+            boolean supported = hasCollisionSupport(world, player, projected);
+            if (!supportLost) {
+                if (!supported) supportLost = true;
+            } else if (supported) {
+                return DangerPrediction.safe();
+            }
+            if (supportLost) motionY = (motionY - 0.08D) * 0.98D;
         }
 
+        if (!supportLost) return DangerPrediction.safe();
+
         int required = Math.max(1, minimumHeight);
-        return countAirBelow(world, x, y, z, required) >= required;
+        int unsupportedDepth = countUnsupportedLayers(world, player,
+            original.offset(x - player.posX, y - player.posY, z - player.posZ), required);
+        return unsupportedDepth >= required
+            ? DangerPrediction.dangerous(x, y, z,
+                original.offset(x - player.posX, y - player.posY, z - player.posZ),
+                ticks, unsupportedDepth)
+            : DangerPrediction.safe();
+    }
+
+    public boolean isDangerPredicted(World world, EntityPlayerSP player, int predictionTicks,
+            int minimumHeight) {
+        return predict(world, player, predictionTicks, minimumHeight).isDangerous();
     }
 
     public boolean hasCollisionSupport(World world, EntityPlayerSP player, AxisAlignedBB box) {
         if (world == null || player == null || box == null) return false;
-        AxisAlignedBB probe = box.offset(0.0D, -0.12D, 0.0D).contract(0.02D, 0.0D, 0.02D);
-        return !world.getCollidingBoundingBoxes(player, probe).isEmpty();
+        AxisAlignedBB probe = new AxisAlignedBB(
+            box.minX + 0.02D, box.minY - 0.13D, box.minZ + 0.02D,
+            box.maxX - 0.02D, box.minY + 0.01D, box.maxZ - 0.02D);
+        for (AxisAlignedBB collision : world.getCollidingBoundingBoxes(player, probe)) {
+            if (collision != null && collision.maxY <= box.minY + 0.02D
+                    && collision.maxY >= box.minY - 0.14D) return true;
+        }
+        return false;
+    }
+
+    private int countUnsupportedLayers(World world, EntityPlayerSP player, AxisAlignedBB box,
+            int limit) {
+        int count = 0;
+        for (int layer = 0; layer < Math.max(0, limit); layer++) {
+            AxisAlignedBB shifted = box.offset(0.0D, -layer, 0.0D);
+            if (hasCollisionSupport(world, player, shifted)) break;
+            count++;
+        }
+        return count;
     }
 
     public int countAirBelow(World world, EntityPlayerSP player, int limit) {

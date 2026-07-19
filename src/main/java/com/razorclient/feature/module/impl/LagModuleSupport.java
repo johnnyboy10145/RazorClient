@@ -18,11 +18,13 @@ import net.minecraft.network.play.client.C0BPacketEntityAction;
 import net.minecraft.network.play.client.C07PacketPlayerDigging;
 import net.minecraft.network.play.client.C08PacketPlayerBlockPlacement;
 import net.minecraft.network.play.client.C0FPacketConfirmTransaction;
+import net.minecraft.network.play.server.S00PacketKeepAlive;
 import net.minecraft.network.play.server.S12PacketEntityVelocity;
 import net.minecraft.network.play.server.S14PacketEntity;
 import net.minecraft.network.play.server.S18PacketEntityTeleport;
 import net.minecraft.network.play.server.S19PacketEntityStatus;
 import net.minecraft.network.play.server.S27PacketExplosion;
+import net.minecraft.network.play.server.S32PacketConfirmTransaction;
 import net.minecraft.util.AxisAlignedBB;
 import net.minecraft.util.MathHelper;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
@@ -84,6 +86,10 @@ final class LagModuleSupport {
 
     static boolean isKeepAliveOrTransactionPacket(Packet<?> packet) {
         return packet instanceof C00PacketKeepAlive || packet instanceof C0FPacketConfirmTransaction;
+    }
+
+    static boolean isInboundKeepAliveOrTransactionPacket(Packet<?> packet) {
+        return packet instanceof S00PacketKeepAlive || packet instanceof S32PacketConfirmTransaction;
     }
 
     static boolean isVelocityPacket(Packet<?> packet) {

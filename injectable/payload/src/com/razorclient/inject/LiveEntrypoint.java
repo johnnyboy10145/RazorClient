@@ -35,6 +35,7 @@ public final class LiveEntrypoint {
     private static volatile NetworkManager pendingManager;
     private static final Set<Integer> downKeys = new HashSet<Integer>();
     private static final boolean[] downMouseButtons = new boolean[8];
+    private static boolean gameplayKeyPollingAvailable;
     private static boolean supportLogged;
     private static boolean firstPulseLogged;
     private static boolean renderBridgeLogged;
@@ -161,6 +162,7 @@ public final class LiveEntrypoint {
                     RazorClient.shutdownForUnload();
                     ClientHooks.stop();
                     downKeys.clear();
+                    gameplayKeyPollingAvailable = false;
                     for (int i = 0; i < downMouseButtons.length; i++) {
                         downMouseButtons[i] = false;
                     }
@@ -173,6 +175,7 @@ public final class LiveEntrypoint {
             RazorClient.shutdownForUnload();
             ClientHooks.stop();
             downKeys.clear();
+            gameplayKeyPollingAvailable = false;
             for (int i = 0; i < downMouseButtons.length; i++) downMouseButtons[i] = false;
             SCHEDULED.set(false);
             InjectionStatus.write("UNLOADED", "client shutdown completed without Minecraft instance");
@@ -220,7 +223,7 @@ public final class LiveEntrypoint {
         }
         logLiveSupport(client);
         installPacketHandler(mc);
-        pollKeybinds(client);
+        pollKeybinds(client, mc);
         pollMouseButtons(client);
         ClientHooks.runTickHead();
         if (mc.theWorld == null || mc.thePlayer == null) {
@@ -277,7 +280,24 @@ public final class LiveEntrypoint {
         return rendered;
     }
 
-    private static void pollKeybinds(RazorClient client) {
+    private static void pollKeybinds(RazorClient client, Minecraft minecraft) {
+        boolean available = minecraft != null
+            && minecraft.inGameHasFocus
+            && minecraft.currentScreen == null;
+        if (!available) {
+            downKeys.clear();
+            gameplayKeyPollingAvailable = false;
+            return;
+        }
+
+        // Prime the edge state when gameplay input becomes available. A key held while
+        // closing a GUI or restoring focus must be released before it can toggle a module.
+        if (!gameplayKeyPollingAvailable) {
+            gameplayKeyPollingAvailable = true;
+            primeDownKeys(client);
+            return;
+        }
+
         for (Module module : client.getModuleManager().getModules()) {
             int key = module.getKeyCode();
             if (key == Keyboard.KEY_NONE) continue;
@@ -292,6 +312,19 @@ public final class LiveEntrypoint {
                 client.onKey(key);
             } else if (!isDown) {
                 downKeys.remove(Integer.valueOf(key));
+            }
+        }
+    }
+
+    private static void primeDownKeys(RazorClient client) {
+        downKeys.clear();
+        for (Module module : client.getModuleManager().getModules()) {
+            int key = module.getKeyCode();
+            if (key == Keyboard.KEY_NONE || downKeys.contains(Integer.valueOf(key))) continue;
+            try {
+                if (Keyboard.isKeyDown(key)) downKeys.add(Integer.valueOf(key));
+            } catch (Throwable ignored) {
+                // LWJGL input may be unavailable briefly while the display regains focus.
             }
         }
     }

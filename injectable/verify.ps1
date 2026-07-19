@@ -80,7 +80,7 @@ foreach ($decision in @('PASS', 'MUTATE', 'CANCEL', 'HOLD', 'FLUSH_THEN_PASS', '
 foreach ($laneMarker in @('OwnerToken', 'Direction', 'dependencyDomain', 'equals', 'hashCode')) {
     if ($packetLaneSource -notmatch $laneMarker) { throw "Packet-lane isolation marker is missing: $laneMarker" }
 }
-foreach ($packetCoreMarker in @('OwnedQueuedPacket', 'OwnerToken ownerToken', 'markOwnerReady', 'MAX_OUTBOUND_RELEASES_PER_TICK', 'MAX_INBOUND_RELEASE_NANOS', 'OUTBOUND_OVERFLOW_HIGH_WATER', 'INBOUND_OVERFLOW_HIGH_WATER', 'ChannelPromise', 'onInboundPacketProcessed', 'blockedOutboundDomains', 'blockedInboundDomains', 'overflowPassThrough', 'shouldCancelOnRelease')) {
+foreach ($packetCoreMarker in @('OwnedQueuedPacket', 'OwnerToken ownerToken', 'markOwnerReady', 'MAX_OUTBOUND_RELEASES_PER_TICK', 'MAX_INBOUND_RELEASE_NANOS', 'OUTBOUND_OVERFLOW_HIGH_WATER', 'INBOUND_OVERFLOW_HIGH_WATER', 'OUTBOUND_RECOVERY_LOW_WATER', 'INBOUND_RECOVERY_LOW_WATER', 'outboundRecovery', 'inboundRecovery', 'ChannelPromise', 'onInboundPacketProcessed', 'blockedOutboundDomains', 'blockedInboundDomains', 'orderedBarrier', 'shouldCancelOnRelease')) {
     if ($packetDelayManager -notmatch $packetCoreMarker) { throw "Packet-delay core marker is missing: $packetCoreMarker" }
 }
 if ($packetDelayManager -notmatch 'closeForUnload' -or $packetDelayManager -notmatch 'closed = true' -or $packetDelayManager -notmatch 'instance == this') { throw 'Packet transport unload detachment is missing.' }
@@ -97,12 +97,64 @@ $aimAssist = Get-Content (Join-Path $project 'src\main\java\com\razorclient\feat
 $killAura = Get-Content (Join-Path $project 'src\main\java\com\razorclient\feature\module\impl\KillAuraModule.java') -Raw
 $rotationHelper = Get-Content (Join-Path $project 'src\main\java\com\razorclient\combat\ClientRotationHelper.java') -Raw
 $autoClicker = Get-Content (Join-Path $project 'src\main\java\com\razorclient\feature\module\impl\AutoClickerModule.java') -Raw
+$rightClicker = Get-Content (Join-Path $project 'src\main\java\com\razorclient\feature\module\impl\RightClickerModule.java') -Raw
 if ($targetService -notmatch 'isValid' -or $aimAssist -notmatch 'CombatTargetService' -or $aimAssist -notmatch 'SILENT') { throw 'Combat target or silent-aim integration is missing.' }
+foreach ($killAuraMarker in @('Target Priority', 'Rotation Speed', 'Rotation Mode', 'TargetPriority', 'RotationMode', 'CombatActionCoordinator', 'ClientRotationHelper')) {
+    if ($killAura -notmatch [regex]::Escape($killAuraMarker)) { throw "KillAura integration marker is missing: $killAuraMarker" }
+}
+if ($killAura -notmatch 'selectedRotationMode == RotationMode\.VISIBLE' -or
+    $killAura -notmatch 'applyVisibleRotation\(minecraft, smooth\[0\], smooth\[1\]\)' -or
+    $killAura -notmatch 'requestRotations\("KillAura", 100, smooth\[0\], smooth\[1\]\)') {
+    throw 'KillAura visible/silent rotation arbitration is incomplete.'
+}
+if ($killAura -notmatch 'CombatActionCoordinator\.tryAcquire\("KillAura", target\)' -or
+    $killAura -notmatch 'nextClickTime = now \+ \(nextDelay\(\) \* 1000000L\)' -or
+    $killAura -notmatch 'applyVisibleRotation' -or $killAura -notmatch 'prevRotationYawHead') {
+    throw 'KillAura successful-action cadence or visible model synchronization is incomplete.'
+}
+if (Test-Path (Join-Path $project 'src\main\java\com\razorclient\util\RotationManager.java')) {
+    throw 'Duplicate RotationManager must not be introduced.'
+}
+if (Test-Path (Join-Path $project 'src\main\java\com\razorclient\util\RandomizationHelper.java')) {
+    throw 'Global RandomizationHelper must not be introduced.'
+}
+foreach ($timingSource in @($killAura, $aimAssist, $autoClicker)) {
+    if ($timingSource -match 'System\.currentTimeMillis|getDynamicDelay|GC spikes') {
+        throw 'Combat action timing must remain monotonic and free of synthetic runtime-spike delays.'
+    }
+}
 if ($targetPublicationSource -notmatch 'Map<OwnerToken, Publication>' -or $targetPublicationSource -notmatch 'sessionGeneration' -or
     $aimAssist -notmatch 'getTargetPublications\(\)\.publish' -or $killAura -notmatch 'getTargetPublications\(\)\.publish') {
     throw 'Owner-scoped, generation-safe target publication is missing.'
 }
 if ($rotationHelper -notmatch 'requestRotations' -or $autoClicker -notmatch 'Click Pattern' -or $autoClicker -notmatch 'System.nanoTime') { throw 'Combat rotation or monotonic click scheduling is missing.' }
+foreach ($portedDefault in @(
+        @{ Source = $aimAssist; Pattern = 'new DecimalSetting\("Distance", 1\.0D, 10\.0D, 0\.5D, 4\.0D\)' },
+        @{ Source = $aimAssist; Pattern = 'new NumberSetting\("Horizontal Speed", 1, 360, 1, 6\)' },
+        @{ Source = $aimAssist; Pattern = 'new NumberSetting\("Vertical Speed", 1, 360, 1, 6\)' },
+        @{ Source = $autoClicker; Pattern = 'new DecimalSetting\("Min CPS", 1\.0D, 25\.0D, 0\.5D, 10\.0D\)' },
+        @{ Source = $autoClicker; Pattern = 'new DecimalSetting\("Max CPS", 1\.0D, 25\.0D, 0\.5D, 14\.0D\)' })) {
+    if ($portedDefault.Source -notmatch $portedDefault.Pattern) { throw "Compatible module default port is missing: $($portedDefault.Pattern)" }
+}
+$velocitySource = Get-Content (Join-Path $project 'src\main\java\com\razorclient\feature\module\impl\VelocityModule.java') -Raw
+$scaffoldSource = Get-Content (Join-Path $project 'src\main\java\com\razorclient\feature\module\impl\LegitScaffoldModule.java') -Raw
+if ($velocitySource -notmatch 'new NumberSetting\("Horizontal", 0, 100, 1, 70\)' -or
+    $velocitySource -notmatch 'new NumberSetting\("Vertical", 0, 100, 1, 80\)' -or
+    $velocitySource -notmatch 'DECISION_TTL_MS = 5_000L' -or
+    $scaffoldSource -notmatch 'new DecimalSetting\("Range", 3\.0D, 5\.0D, 0\.1D, 4\.2D\)' -or
+    $scaffoldSource -notmatch 'Sneak Assist' -or $scaffoldSource -notmatch 'Edge Only' -or
+    $scaffoldSource -notmatch 'squareDistanceTo\(hit\.hitVec\)') {
+    throw 'Velocity decision cleanup or LegitScaffold controls/range guard is missing.'
+}
+foreach ($aimMarker in @('Prediction Ticks', 'Target Lock Grace', 'Rotation Acceleration',
+        'snapshotIgnoringFov', 'lockedTargetGraceDeadline', 'yawVelocity', 'pitchVelocity')) {
+    if ($aimAssist -notmatch [regex]::Escape($aimMarker)) { throw "AimAssist smoothing marker is missing: $aimMarker" }
+}
+if ($autoClicker -notmatch 'onClientTick\(TickEvent\.ClientTickEvent' -or
+    $rightClicker -notmatch 'onClientTick\(TickEvent\.ClientTickEvent' -or
+    $autoClicker -match 'onRenderTick\(' -or $rightClicker -match 'onRenderTick\(') {
+    throw 'Clickers must execute from the real client-tick action phase, not render FPS.'
+}
 $clickGuiScreen = Get-Content (Join-Path $project 'src\main\java\com\razorclient\gui\ClickGuiScreen.java') -Raw
 if ($clickGuiScreen -notmatch 'GuiTextField' -or $clickGuiScreen -notmatch 'updatePanelFilters' -or $clickGuiScreen -notmatch 'drawProfileDropdown') { throw 'Vape-style ClickGUI search/profile controls are missing.' }
 $guiDirectory = Join-Path $project 'src\main\java\com\razorclient\gui'
@@ -133,6 +185,11 @@ $ownerTokenSource = Get-Content (Join-Path $project 'src\main\java\com\razorclie
 if ($runtimeCoreSource -notmatch 'beginRealTick' -or $runtimeCoreSource -notmatch 'beginFrame' -or
     $runtimeCoreSource -notmatch 'ClientSession' -or $clientSessionSource -notmatch 'ClientThreadScheduler') {
     throw 'Instance-owned session, scheduler, or tick/frame context is missing.'
+}
+if ($resourceArbiterSource -notmatch 'consumedActionTicks' -or
+    $resourceArbiterSource -notmatch 'isOneShotAction' -or
+    $resourceArbiterSource -notmatch 'Math\.max\(current\.expiresAt') {
+    throw 'One-action-per-tick arbitration or non-shortening lease renewal is missing.'
 }
 if ($clientSessionSource -notmatch 'sessionGeneration' -or $clientSessionSource -notmatch 'shutdown' -or
     $schedulerSource -notmatch 'discardOwner' -or $schedulerSource -notmatch 'advanceSession') {
@@ -166,7 +223,7 @@ if ($snapshotServiceSource -notmatch 'EntityRecord\.Kind\.FIREBALL' -or
 }
 $frameContextSource = Get-Content (Join-Path $project 'src\main\java\com\razorclient\runtime\FrameContext.java') -Raw
 if ($frameContextSource -notmatch 'ProjectionBacking' -or $frameContextSource -notmatch 'isProjectionValid' -or $frameContextSource -notmatch 'sessionGeneration') { throw 'Immutable validated frame projection capture is missing.' }
-foreach ($resource in @('SERVER_ROTATION', 'MODEL_ROTATION', 'ATTACK_ACTION', 'USE_ACTION', 'SNEAK_INPUT', 'SPRINT_INPUT', 'HOTBAR_SLOT', 'CLIENT_TIMER')) {
+foreach ($resource in @('SERVER_ROTATION', 'MODEL_ROTATION', 'ATTACK_ACTION', 'USE_ACTION', 'FORWARD_INPUT', 'JUMP_INPUT', 'SNEAK_INPUT', 'SPRINT_INPUT', 'HOTBAR_SLOT', 'CLIENT_TIMER')) {
     if ($resourceArbiterSource -notmatch $resource) { throw "Resource lease type is missing: $resource" }
 }
 foreach ($utility in @('FastPlaceModule', 'AutoToolModule', 'ItemPhysicsModule', 'FullbrightModule')) {
@@ -195,9 +252,17 @@ $launcherSource = Get-Content (Join-Path $root 'native\launcher\main.cpp') -Raw
 if ($launcherSource -notmatch 'genericLunar189Compatible' -or $launcherSource -notmatch '#ifndef RAZORCLIENT_RELEASE' -or
     $launcherSource -notmatch 'executableHash' -or $launcherSource -notmatch 'jvmHash' -or
     $launcherSource -notmatch 'processCreationTime') { throw 'PID-bound Lunar compatibility validation or Debug-only generic fallback is missing.' }
-if ($launcherSource -notmatch 'class RemoteAllocation' -or $launcherSource -notmatch 'remoteFunctionAddress' -or
-    $launcherSource -notmatch 'wait != WAIT_OBJECT_0\) remote\.abandon') {
-    throw 'Remote LoadLibrary address resolution or timeout memory guard is missing.'
+if ($launcherSource -notmatch 'ModuleLoader loader' -or $launcherSource -notmatch 'RemoteMemoryGuard remoteStatus' -or
+    $launcherSource -notmatch 'remoteStatus\.release' -or $launcherSource -notmatch 'RazorClient_Bootstrap_Loaded_') {
+    throw 'Shared module loading, timeout-safe remote memory, or bootstrap event acknowledgement is missing.'
+}
+foreach ($nativeHeader in @('resource_guard.hpp', 'event_logger.hpp', 'app_config.hpp', 'string_protect.hpp',
+        'data_crypto.hpp', 'process_info.hpp', 'module_loader.hpp', 'process_watcher.hpp')) {
+    if (!(Test-Path (Join-Path $root "native\$nativeHeader"))) { throw "Integrated native header is missing: $nativeHeader" }
+}
+if ($launcherSource -notmatch 'DataCrypto::DecryptResource' -or $launcherSource -notmatch 'RAZORCLIENT_PAYLOAD_KEY_LITERAL' -or
+    $launcherSource -notmatch 'ProcessUtils::GetProcesses' -or $launcherSource -notmatch 'ProcessWatcher targetWatcher') {
+    throw 'Encrypted resources, shared process discovery, or process monitoring integration is missing.'
 }
 if ($launcherSource -notmatch 'findReusableBootstrap' -or $launcherSource -notmatch 'RazorClientRestart' -or
     $launcherSource -notmatch 'currentDllHash' -or $launcherSource -notmatch 'currentJarHash' -or
@@ -221,7 +286,7 @@ foreach ($blinkKey in @('Direction', 'Maximum Duration', 'Allow Keep Alives', 'D
 }
 $clutchSource = Get-Content (Join-Path $project 'src\main\java\com\razorclient\feature\module\impl\ClutchModule.java') -Raw
 $clutchDirectory = Join-Path $project 'src\main\java\com\razorclient\feature\module\impl\clutch'
-foreach ($clutchHelper in @('ClutchPhase.java', 'ClutchSession.java', 'ClutchPredictor.java', 'ClutchCandidate.java',
+foreach ($clutchHelper in @('ClutchPhase.java', 'ClutchSession.java', 'DangerPrediction.java', 'ClutchPredictor.java', 'ClutchCandidate.java',
         'ClutchCandidateScanner.java', 'ClutchConfirmationTracker.java', 'ClutchPlacementExecutor.java',
         'ClutchBridgePlanner.java', 'ClutchSilentRotationController.java')) {
     if (!(Test-Path (Join-Path $clutchDirectory $clutchHelper))) { throw "Split Clutch component is missing: $clutchHelper" }
@@ -231,14 +296,16 @@ $clutchSessionSource = Get-Content (Join-Path $clutchDirectory 'ClutchSession.ja
 $clutchExecutorSource = Get-Content (Join-Path $clutchDirectory 'ClutchPlacementExecutor.java') -Raw
 $clutchRotationSource = Get-Content (Join-Path $clutchDirectory 'ClutchSilentRotationController.java') -Raw
 if ($clutchRotationSource -notmatch 'requestRotations\("Clutch", 95' -or
-    $clutchRotationSource -notmatch 'ResourceArbiter\.Resource\.MODEL_ROTATION' -or
-    $clutchRotationSource -notmatch 'restoreRenderSwap' -or $clutchRotationSource -notmatch 'rotationYawHead' -or
-    $clutchRotationSource -notmatch 'renderYawOffset') { throw 'Clutch silent model rotation ownership or cleanup is incomplete.' }
+    $rotationHelper -notmatch 'ResourceArbiter\.Resource\.MODEL_ROTATION' -or
+    $rotationHelper -notmatch 'onRenderPlayerPre' -or $rotationHelper -notmatch 'restoreModelSwap' -or
+    $rotationHelper -notmatch 'rotationYawHead' -or $rotationHelper -notmatch 'renderYawOffset') {
+    throw 'Shared silent model rotation ownership or cleanup is incomplete.'
+}
 if ($clutchSource -match 'static final ClutchModule INSTANCE' -or $manager -notmatch 'new ClutchModule\(\)') { throw 'Clutch must be recreated per client lifecycle.' }
 foreach ($phase in @('IDLE', 'ARMED', 'AIMING', 'PLACING', 'CONFIRMING', 'BRIDGING', 'CLEANUP')) {
     if ($clutchPhaseSource -notmatch "\b$phase\b") { throw "Clutch recovery phase is missing: $phase" }
 }
-foreach ($settingName in @('Recovery Mode', 'Prediction Ticks', 'Confirmation Ticks')) {
+foreach ($settingName in @('Recovery Mode', 'Prediction Ticks', 'Confirmation Ticks', 'Telly Assist', 'Telly CPS', 'Telly Flick Speed', 'Telly Overshoot')) {
     if ($clutchSource -notmatch [regex]::Escape($settingName)) { throw "Clutch recovery setting is missing: $settingName" }
 }
 if ($clutchSource -notmatch 'PREDICTED_DANGER' -or $clutchSource -notmatch 'processConfirmation' -or
@@ -246,7 +313,12 @@ if ($clutchSource -notmatch 'PREDICTED_DANGER' -or $clutchSource -notmatch 'proc
     $clutchSessionSource -notmatch 'NO_BLOCK_TIMEOUT_NANOS' -or $clutchSessionSource -notmatch 'SUPPRESSED_TIMEOUT_NANOS') {
     throw 'Clutch prediction, bounded aborts, placement confirmation, or action arbitration is missing.'
 }
-if ($clutchSource -match 'PrePlayerInputEvent|moveForward\s*=|moveStrafing\s*=') { throw 'Clutch must not modify player movement input.' }
+if ($clutchSource -match 'PrePlayerInputEvent|moveForward\s*=|moveStrafing\s*=') { throw 'Clutch must not mutate movementInput fields directly.' }
+foreach ($tellyMarker in @('TellyPhase', 'isPhysicalKeyDown', 'FORWARD_INPUT', 'JUMP_INPUT', 'tellyAirTicks > 4',
+        'tellyAirTicks < 1', 'ClutchPlacementExecutor', 'pollTellyConfirmation', 'TellyConfirmationResult.CONFIRMED',
+        'if (!ClientRotationHelper.get().requestRotations', 'duration - 1.0F')) {
+    if ($clutchSource -notmatch [regex]::Escape($tellyMarker)) { throw "Clutch Telly integration marker is missing: $tellyMarker" }
+}
 if ($clutchExecutorSource -notmatch 'catch \(NoSuchMethodError \| AbstractMethodError unavailable\)' -or
     $clutchExecutorSource -notmatch 'confirmation decides success' -or
     $clutchExecutorSource -match 'if \(!accepted\).*fallback') { throw 'Clutch fallback placement policy is unsafe.' }
@@ -279,6 +351,32 @@ if ($buildSource -notmatch 'C4C05056FB035665CBE3128E64A8A6E3EC0A1BDF791A4B8A4BB9
     $buildSource -notmatch 'Pinned JDK 21\.0\.10' -or
     $buildSource -notmatch [regex]::Escape('clang version 22\.1\.8')) {
     throw 'Pinned Lunar API, JDK, or LLVM build input validation is missing.'
+}
+$cmakeSourcePath = Join-Path $root 'CMakeLists.txt'
+$cmakePresetsPath = Join-Path $root 'CMakePresets.json'
+$buildingPath = Join-Path $project 'BUILDING.md'
+if (!(Test-Path $cmakeSourcePath) -or !(Test-Path $cmakePresetsPath) -or !(Test-Path $buildingPath)) {
+    throw 'Visual Studio CMake build files or compilation documentation are missing.'
+}
+$cmakeSource = Get-Content $cmakeSourcePath -Raw
+$cmakePresets = Get-Content $cmakePresetsPath -Raw
+$buildingSource = Get-Content $buildingPath -Raw
+foreach ($target in @('payload_encrypt', 'razorclient-bootstrap', 'RazorClient')) {
+    if ($cmakeSource -notmatch [regex]::Escape($target)) { throw "MSVC CMake target is missing: $target" }
+}
+foreach ($library in @('user32', 'kernel32', 'gdi32', 'winhttp', 'psapi', 'crypt32', 'advapi32',
+        'shell32', 'shlwapi', 'bcrypt', 'wintrust', 'dwmapi', 'opengl32')) {
+    if ($cmakeSource -notmatch "\b$library\b") { throw "MSVC link library is missing: $library" }
+}
+if ($buildSource -notmatch "ValidateSet\('MSVC', 'LLVM'\)" -or
+    $buildSource -notmatch "\[string\]\`$Toolchain = 'MSVC'" -or
+    $cmakeSource -notmatch 'CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded"' -or
+    $cmakeSource -notmatch 'cxx_std_17' -or $cmakeSource -notmatch '10\.0\.20348\.0') {
+    throw 'MSVC default selection, C++17, /MT, or minimum Windows SDK enforcement is missing.'
+}
+if ($cmakePresets -notmatch 'vs2022-debug' -or $cmakePresets -notmatch 'vs2022-release' -or
+    $buildingSource -notmatch 'nlohmann-json:x64-windows-static' -or $buildingSource -notmatch '-Toolchain MSVC') {
+    throw 'Visual Studio presets or build instructions are incomplete.'
 }
 if (!(Test-Path (Join-Path $root 'sign-release.ps1')) -or !(Test-Path (Join-Path $root 'security-verify.ps1'))) { throw 'Release signing or security verifier script is missing.' }
 $launcherSecuritySource = Get-Content (Join-Path $root 'native\launcher\main.cpp') -Raw

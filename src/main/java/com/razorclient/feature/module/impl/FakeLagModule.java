@@ -85,12 +85,14 @@ public final class FakeLagModule extends Module {
 
     @Override
     public int getOutboundPacketDelay(Packet<?> packet) {
+        if (LagModuleSupport.isKeepAliveOrTransactionPacket(packet)) return 0;
         return shouldDelay(false, packet) && mode.getValue() == Mode.STATIC ? outboundDelay.getValue() : 0;
     }
 
     @Override
     public int getInboundPacketDelay(Packet<?> packet) {
-        if (realtimeDamage.isEnabled() && LagModuleSupport.isDamageStatus(packet)) {
+        if (LagModuleSupport.isInboundKeepAliveOrTransactionPacket(packet)
+                || (realtimeDamage.isEnabled() && LagModuleSupport.isDamageStatus(packet))) {
             return 0;
         }
         return shouldDelay(true, packet) && mode.getValue() == Mode.STATIC ? inboundDelay.getValue() : 0;
@@ -98,7 +100,15 @@ public final class FakeLagModule extends Module {
 
     @Override
     public boolean shouldHoldOutboundPacket(Packet<?> packet) {
-        return mode.getValue() == Mode.PULSE && pulseHoldActive && outboundDelay.getValue() > 0;
+        return !LagModuleSupport.isKeepAliveOrTransactionPacket(packet)
+            && mode.getValue() == Mode.PULSE
+            && pulseHoldActive
+            && outboundDelay.getValue() > 0;
+    }
+
+    @Override
+    public boolean shouldBypassOutboundOrdering(Packet<?> packet) {
+        return LagModuleSupport.isKeepAliveOrTransactionPacket(packet);
     }
 
     @Override
@@ -106,6 +116,7 @@ public final class FakeLagModule extends Module {
         return mode.getValue() == Mode.PULSE
             && pulseHoldActive
             && inboundDelay.getValue() > 0
+            && !LagModuleSupport.isInboundKeepAliveOrTransactionPacket(packet)
             && !(realtimeDamage.isEnabled() && LagModuleSupport.isDamageStatus(packet));
     }
 

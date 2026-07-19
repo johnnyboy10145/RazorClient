@@ -4,7 +4,13 @@ Windows x64 injector and Java instrumentation payload for the pinned Lunar Clien
 
 ## Build
 
-Run `powershell -ExecutionPolicy Bypass -File .\build.ps1`. The script compiles the Java 17 payload against the pinned generated Lunar API JAR and builds the native launcher plus bootstrap DLL with the portable compiler under `tools/`.
+Visual Studio 2022/MSVC is the default native toolchain:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Mode Debug -Toolchain MSVC
+```
+
+Use `-Toolchain LLVM` for the pinned LLVM-MinGW fallback. The script compiles the Java 17 payload against the pinned generated Lunar API JAR, builds the bootstrap and launcher, encrypts and embeds the payloads, and atomically publishes the one-file release. See `../BUILDING.md` for prerequisites, Release signing, and verification commands.
 
 ## Runtime
 

@@ -30,7 +30,7 @@ public final class ClutchBridgePlanner {
         int distance = Math.max(1, Math.abs(edge.getTargetPos().getX() - playerX)
             + Math.abs(edge.getTargetPos().getZ() - playerZ));
         int bridgeY = Math.min(MathHelper.floor_double(predictY(player, distance)) - 1,
-            edge.getNeighbor().getY());
+            edge.getTargetPos().getY());
         int x = edge.getTargetPos().getX();
         int z = edge.getTargetPos().getZ();
         add(x, bridgeY, z, limit);
@@ -56,8 +56,8 @@ public final class ClutchBridgePlanner {
 
         startCandidate = scanner.findPlacementInfo(world, player, path.get(0), sidewaysOnly, multipoint);
         if (startCandidate == null) {
-            startCandidate = new ClutchCandidate(path.get(0), edge.getNeighbor(), edge.getFace(),
-                edge.getHitX(), edge.getHitY(), edge.getHitZ(), edge.getScore());
+            clear();
+            return false;
         }
         return true;
     }

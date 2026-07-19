@@ -11,11 +11,15 @@
   ],
   "builtInProfiles": [
     "survival", "bedwars-survival", "bedwars-legit", "bedwars-aggressive",
-    "bedwars-aggressive-v2"
+    "bedwars-aggressive-v2", "bedwars-smooth-v2"
   ],
   "protectedSettings": {
-    "Clutch": ["Trigger", "Silent Aim", "Recovery Mode", "Prediction Ticks", "Confirmation Ticks"],
+    "Clutch": ["Trigger", "Silent Aim", "Recovery Mode", "Prediction Ticks", "Confirmation Ticks", "Telly Assist", "Telly CPS", "Telly Flick Speed", "Telly Overshoot"],
+    "KillAura": ["Target CPS", "Range (Attack)", "Rotation Speed", "Rotation Mode", "Target Priority"],
     "Velocity": ["Mode", "Horizontal", "Vertical", "Chance", "Explosions"],
+    "LegitScaffold": ["Pitch Check", "Sneak Delay", "Range", "Sneak Assist", "Edge Only", "Diagonal Assist", "Placement Assist"],
+    "AimAssist": ["Distance", "FOV", "Horizontal Speed", "Vertical Speed", "Prediction Ticks", "Target Lock Grace", "Rotation Acceleration", "Aim Mode"],
+    "LeftClicker": ["Min CPS", "Max CPS", "Jitter", "Click Pattern", "Randomization"],
     "Blink": ["Direction", "Maximum Duration", "Allow Keep Alives"],
     "ClickGUI": ["Color Preset", "GUI Effects", "Glow Intensity", "Sweep Animation"],
     "PlayerESP": ["Projection Mode", "Target Type", "Render Mode", "Max Distance"]

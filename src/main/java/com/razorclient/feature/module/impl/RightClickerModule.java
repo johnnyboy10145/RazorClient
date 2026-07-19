@@ -85,7 +85,8 @@ public final class RightClickerModule extends Module {
     }
 
     @Override
-    public void onRenderTick(TickEvent.RenderTickEvent event) {
+    public void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase != TickEvent.Phase.START) return;
         Minecraft minecraft = Minecraft.getMinecraft();
         if (minecraft.thePlayer == null || minecraft.theWorld == null) {
             resetClickState();

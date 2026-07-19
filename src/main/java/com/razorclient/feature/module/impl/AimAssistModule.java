@@ -30,7 +30,7 @@ public final class AimAssistModule extends Module {
     private final NumberSetting rotationSpeed = new NumberSetting("Rotation Speed", 1, 20, 1, 4);
     private final NumberSetting randomization = new NumberSetting("Randomization", 0, 30, 1, 0);
     private final NumberSetting fov = new NumberSetting("FOV", 15, 360, 1, 90);
-    private final DecimalSetting distance = new DecimalSetting("Distance", 1.0D, 10.0D, 0.5D, 4.5D);
+    private final DecimalSetting distance = new DecimalSetting("Distance", 1.0D, 10.0D, 0.5D, 4.0D);
     private final DecimalSetting minimumRange = new DecimalSetting("Minimum Range", 0.0D, 9.5D, 0.5D, 0.0D);
     private final EnumSetting<TargetType> targetType = new EnumSetting<TargetType>("Target Type", TargetType.values(), TargetType.PLAYERS);
     private final BooleanSetting clickAim = new BooleanSetting("Click Aim", true);
@@ -41,11 +41,14 @@ public final class AimAssistModule extends Module {
     private final EnumSetting<AimMode> aimMode = new EnumSetting<AimMode>("Aim Mode", AimMode.values(), AimMode.REGULAR);
     private final EnumSetting<TargetMode> targetMode = new EnumSetting<TargetMode>("Target Mode", TargetMode.values(), TargetMode.SINGLE);
     private final EnumSetting<SortMode> sortMode = new EnumSetting<SortMode>("Sort Mode", SortMode.values(), SortMode.AIM_ANGLE);
-    private final NumberSetting horizontalSpeed = new NumberSetting("Horizontal Speed", 10, 360, 1, 70);
-    private final NumberSetting verticalSpeed = new NumberSetting("Vertical Speed", 10, 360, 1, 50);
+    private final NumberSetting horizontalSpeed = new NumberSetting("Horizontal Speed", 1, 360, 1, 6);
+    private final NumberSetting verticalSpeed = new NumberSetting("Vertical Speed", 1, 360, 1, 6);
     private final NumberSetting horizontalMultipoint = new NumberSetting("Horizontal Multipoint", 0, 100, 1, 50);
     private final NumberSetting verticalMultipoint = new NumberSetting("Vertical Multipoint", 0, 100, 1, 50);
     private final NumberSetting prediction = new NumberSetting("Prediction", 0, 100, 1, 25);
+    private final NumberSetting predictionTicks = new NumberSetting("Prediction Ticks", 1, 10, 1, 3);
+    private final NumberSetting targetLockGrace = new NumberSetting("Target Lock Grace", 0, 500, 25, 150);
+    private final NumberSetting rotationAcceleration = new NumberSetting("Rotation Acceleration", 1, 100, 1, 60);
     private final NumberSetting minimumFov = new NumberSetting("Minimum FOV", 0, 180, 1, 0);
     private final DecimalSetting lockedFovMultiplier = new DecimalSetting("Locked FOV Multiplier", 1.0D, 3.0D, 0.1D, 1.5D);
     private final BooleanSetting requireMouseMovement = new BooleanSetting("Require Mouse Movement", false);
@@ -57,6 +60,7 @@ public final class AimAssistModule extends Module {
 
     private final Random random = getScope().getRandom();
     private EntityLivingBase lockedTarget;
+    private long lockedTargetGraceDeadline;
     private long lastRenderUpdateNanos = -1L;
     private float lastObservedYaw;
     private float lastObservedPitch;
@@ -68,6 +72,8 @@ public final class AimAssistModule extends Module {
     private volatile float desiredSilentPitch;
     private volatile long desiredSilentAtNanos;
     private volatile boolean desiredSilentRotation;
+    private float yawVelocity;
+    private float pitchVelocity;
     private String status = "Ready";
 
     public AimAssistModule() {
@@ -90,6 +96,9 @@ public final class AimAssistModule extends Module {
         addSetting(horizontalMultipoint);
         addSetting(verticalMultipoint);
         addSetting(prediction);
+        addSetting(predictionTicks);
+        addSetting(targetLockGrace);
+        addSetting(rotationAcceleration);
         addSetting(minimumFov);
         addSetting(lockedFovMultiplier);
         addSetting(requireMouseMovement);
@@ -171,8 +180,7 @@ public final class AimAssistModule extends Module {
 
         TargetSnapshot target = selectTarget(minecraft, currentYaw, currentPitch);
         if (target == null) {
-            lockedTarget = null;
-            clearSilentRotation();
+            resetTargetTiming();
             status = "No target";
             return;
         }
@@ -207,7 +215,12 @@ public final class AimAssistModule extends Module {
         EntityLivingBase preferred = targetMode.getValue() == TargetMode.SINGLE ? lockedTarget : null;
         TargetSnapshot lockedSnapshot = preferred == null ? null : snapshotFor(minecraft, preferred, baseYaw, basePitch, maximumDistance, true);
         if (lockedSnapshot != null) {
+            lockedTargetGraceDeadline = System.nanoTime() + targetLockGrace.getValue() * 1000000L;
             return lockedSnapshot;
+        }
+        if (preferred != null && System.nanoTime() <= lockedTargetGraceDeadline) {
+            TargetSnapshot graceSnapshot = snapshotIgnoringFov(minecraft, preferred, baseYaw, basePitch, maximumDistance);
+            if (graceSnapshot != null) return graceSnapshot;
         }
 
         TargetSnapshot best = null;
@@ -219,7 +232,21 @@ public final class AimAssistModule extends Module {
         }
 
         lockedTarget = targetMode.getValue() == TargetMode.SINGLE && best != null ? best.entity : null;
+        lockedTargetGraceDeadline = lockedTarget == null ? 0L
+            : System.nanoTime() + targetLockGrace.getValue() * 1000000L;
         return best;
+    }
+
+    private TargetSnapshot snapshotIgnoringFov(Minecraft minecraft, EntityLivingBase candidate, float baseYaw,
+            float basePitch, double maximumDistance) {
+        if (!isValidTarget(minecraft, candidate, maximumDistance)) return null;
+        Vec3 aimPoint = createAimPoint(minecraft, candidate);
+        double eyeDistance = minecraft.thePlayer.getPositionEyes(1.0F).distanceTo(aimPoint);
+        if (eyeDistance < minimumRange.getValue() || eyeDistance > maximumDistance) return null;
+        Rotation rotation = rotationsTo(minecraft, aimPoint);
+        float yawDifference = Math.abs(MathHelper.wrapAngleTo180_float(rotation.yaw - baseYaw));
+        float pitchDifference = Math.abs(rotation.pitch - basePitch);
+        return new TargetSnapshot(candidate, rotation.yaw, rotation.pitch, eyeDistance, yawDifference, pitchDifference);
     }
 
     private TargetSnapshot snapshotFor(Minecraft minecraft, EntityLivingBase candidate, float baseYaw, float basePitch,
@@ -277,7 +304,7 @@ public final class AimAssistModule extends Module {
         double centerZ = (box.minZ + box.maxZ) * 0.5D;
         double horizontal = horizontalMultipoint.getValue() / 100.0D;
         double vertical = verticalMultipoint.getValue() / 100.0D;
-        double predictionFactor = prediction.getValue() / 100.0D;
+        double predictionFactor = prediction.getValue() / 100.0D * predictionTicks.getValue();
         double velocityX = entity.posX - entity.prevPosX;
         double velocityY = entity.posY - entity.prevPosY;
         double velocityZ = entity.posZ - entity.prevPosZ;
@@ -325,10 +352,19 @@ public final class AimAssistModule extends Module {
             default:
                 break;
         }
-        return new Rotation(
-            currentYaw + clamp(yawDelta, -horizontalStep, horizontalStep),
-            clampPitch(currentPitch + clamp(pitchDelta, -verticalStep, verticalStep))
-        );
+        float secondsSafe = Math.max(1.0F / 240.0F, seconds);
+        float desiredYawVelocity = clamp(yawDelta / secondsSafe,
+            -horizontalStep / secondsSafe, horizontalStep / secondsSafe);
+        float desiredPitchVelocity = clamp(pitchDelta / secondsSafe,
+            -verticalStep / secondsSafe, verticalStep / secondsSafe);
+        float acceleration = rotationAcceleration.getValue() * 40.0F;
+        yawVelocity = approach(yawVelocity, desiredYawVelocity, acceleration * secondsSafe);
+        pitchVelocity = approach(pitchVelocity, desiredPitchVelocity, acceleration * 0.75F * secondsSafe);
+        float yawStep = clamp(yawVelocity * secondsSafe, -Math.abs(yawDelta), Math.abs(yawDelta));
+        float pitchStep = clamp(pitchVelocity * secondsSafe, -Math.abs(pitchDelta), Math.abs(pitchDelta));
+        if (Math.signum(yawStep) != Math.signum(yawDelta)) yawStep = 0.0F;
+        if (Math.signum(pitchStep) != Math.signum(pitchDelta)) pitchStep = 0.0F;
+        return new Rotation(currentYaw + yawStep, clampPitch(currentPitch + pitchStep));
     }
 
     private boolean canAim(Minecraft minecraft) {
@@ -385,7 +421,10 @@ public final class AimAssistModule extends Module {
 
     private void resetTargetTiming() {
         lockedTarget = null;
+        lockedTargetGraceDeadline = 0L;
         lastRenderUpdateNanos = -1L;
+        yawVelocity = 0.0F;
+        pitchVelocity = 0.0F;
         clearSilentRotation();
     }
 
@@ -422,6 +461,11 @@ public final class AimAssistModule extends Module {
 
     private static float clamp(float value, float minimum, float maximum) {
         return Math.max(minimum, Math.min(maximum, value));
+    }
+
+    private static float approach(float current, float target, float maximumDelta) {
+        if (current < target) return Math.min(target, current + maximumDelta);
+        return Math.max(target, current - maximumDelta);
     }
 
     private static double lerp(double from, double to, double amount) {
