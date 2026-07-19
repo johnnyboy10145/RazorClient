@@ -93,6 +93,18 @@ foreach ($required in @(
 if ($Mode -eq 'Release') {
     if ($metadataValues['jarSignerHash'] -notmatch '^[0-9A-Fa-f]{64}$') { throw 'Release JAR signer pin is missing or invalid.' }
     if (Get-ChildItem $dist, $release -Filter '*.map' -File -ErrorAction SilentlyContinue) { throw 'Release mapping must not be shipped beside release artifacts.' }
+    foreach ($debugName in @(
+        'com/razorclient/feature/module/impl/KillAuraModule.class',
+        'com/razorclient/feature/module/impl/ClutchModule.class',
+        'com/razorclient/feature/module/impl/VelocityModule.class',
+        'com/razorclient/feature/module/impl/BlinkModule.class',
+        'com/razorclient/feature/module/impl/LegitScaffoldModule.class',
+        'com/razorclient/network/PacketDelayManager.class',
+        'com/razorclient/runtime/ResourceArbiter.class',
+        'com/razorclient/combat/ClientRotationHelper.class'
+    )) {
+        if ($entries -contains $debugName) { throw "Release payload still exposes debug class name: $debugName" }
+    }
     $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
     if (!$signtool) {
         $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -File -ErrorAction SilentlyContinue |

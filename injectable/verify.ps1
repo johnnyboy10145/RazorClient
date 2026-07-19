@@ -347,6 +347,14 @@ if ($bootstrapSource -notmatch 'RazorClientRestart' -or $bootstrapSource -notmat
 $buildSource = Get-Content (Join-Path $root 'build.ps1') -Raw
 if ($buildSource -notmatch '-lopengl32') { throw 'Native render bridge OpenGL linkage is missing.' }
 if ($buildSource -notmatch "ValidateSet\('Debug', 'Release'\)" -or $buildSource -notmatch 'proguard-base-7\.8\.1' -or $buildSource -notmatch 'Assert-Sha256') { throw 'Reproducible release obfuscation configuration is missing.' }
+foreach ($obfuscationMarker in @('-flattenpackagehierarchy r', '-overloadaggressively',
+        '-allowaccessmodification', '-renamesourcefileattribute SourceFile')) {
+    if ($buildSource -notmatch [regex]::Escape($obfuscationMarker)) { throw "Release obfuscation marker is missing: $obfuscationMarker" }
+}
+foreach ($leakyKeepRule in @('-keepnames class com.razorclient.feature.module.impl.**',
+        '-keepnames class com.razorclient.runtime.**')) {
+    if ($buildSource -match [regex]::Escape($leakyKeepRule)) { throw "Overbroad release keep rule is present: $leakyKeepRule" }
+}
 if ($buildSource -notmatch 'C4C05056FB035665CBE3128E64A8A6E3EC0A1BDF791A4B8A4BB9816B1296754F' -or
     $buildSource -notmatch 'Pinned JDK 21\.0\.10' -or
     $buildSource -notmatch [regex]::Escape('clang version 22\.1\.8')) {
