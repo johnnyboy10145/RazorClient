@@ -7,6 +7,7 @@ import com.razorclient.gui.HudEditorScreen;
 import com.razorclient.input.KeybindHandler;
 import com.razorclient.network.KnockbackDelayBuffer;
 import com.razorclient.network.PacketDelayManager;
+import com.razorclient.util.RotationManager;   // <-- NEW IMPORT
 import net.minecraft.client.Minecraft;
 import net.minecraftforge.client.event.MouseEvent;
 import net.minecraftforge.client.event.RenderGameOverlayEvent;
@@ -90,6 +91,7 @@ public final class RazorClient {
         moduleManager.onClientTick();
         knockbackDelayBuffer.onClientTick();
         packetDelayManager.onClientTick();
+        RotationManager.getInstance().update();  // <-- ADDED THIS LINE
     }
 
     @SubscribeEvent
